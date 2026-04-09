@@ -1,0 +1,18 @@
+# GraphBuilder Core Dependencies
+neo4j>=5.0.0
+langchain>=0.1.0
+openai>=1.0.0
+beautifulsoup4>=4.11.0
+requests>=2.28.0
+aiohttp>=3.8.0
+click>=8.0.0
+rich>=12.0.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+aiofiles>=23.0.0
+
+# Optional dependencies for enhanced functionality
+PyPDF2>=3.0.0  # PDF processing
+python-docx>=0.8.11  # DOCX processing
+pillow>=10.0.0  # Image processing
+sentence-transformers>=2.2.0  # Text embeddings

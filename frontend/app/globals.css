@@ -2,32 +2,165 @@
 @tailwind components;
 @tailwind utilities;
 
-* {
-  box-sizing: border-box;
+:root {
+  --bg-app: #f8f9fb;
+  --bg-card: #ffffff;
+  --bg-sidebar: #111119;
+  --bg-sidebar-hover: rgba(255,255,255,0.06);
+  --bg-sidebar-active: rgba(99,102,241,0.15);
+  --bg-input: #ffffff;
+  --bg-muted: #f3f4f6;
+  --border-default: #e2e5ea;
+  --border-subtle: #eef0f3;
+  --border-input: #d1d5dc;
+  --text-primary: #111827;
+  --text-secondary: #6b7280;
+  --text-muted: #9ca3af;
+  --text-sidebar: #a1a1aa;
+  --text-sidebar-active: #ffffff;
+  --accent: #6366f1;
+  --accent-hover: #4f46e5;
+  --accent-muted: rgba(99,102,241,0.1);
+  --success: #10b981;
+  --success-muted: #ecfdf5;
+  --danger: #ef4444;
+  --danger-muted: #fef2f2;
+  --warning: #f59e0b;
+  --warning-muted: #fffbeb;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-card: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
 }
 
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
 html {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   scroll-behavior: smooth;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
 }
 
 body {
-  margin: 0;
-  padding: 0;
-  color: #24292f;
-  background: #f6f8fa;
+  color: var(--text-primary);
+  background: var(--bg-app);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-.surface {
-  background: #ffffff;
-  border: 1px solid #d0d7de;
-  border-radius: 6px;
-  box-shadow: 0 1px 0 rgba(27, 31, 36, 0.04);
+/* ── Card surface ──────────────────────────────────────────────── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
 }
 
-::-webkit-scrollbar { width: 8px; height: 8px; }
+/* ── Form inputs ───────────────────────────────────────────────── */
+.input {
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-md);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.input::placeholder { color: var(--text-muted); }
+.input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-muted);
+}
+
+/* Textarea inherits .input */
+textarea.input { resize: vertical; }
+
+/* ── Primary button ────────────────────────────────────────────── */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:active { transform: scale(0.98); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Outline / ghost button ────────────────────────────────────── */
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-ghost:hover { background: var(--bg-muted); color: var(--text-primary); }
+.btn-ghost.active {
+  background: var(--accent-muted);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ── Badge / chip ──────────────────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+}
+.badge-success { background: var(--success-muted); color: #065f46; }
+.badge-danger  { background: var(--danger-muted);  color: #991b1b; }
+.badge-warning { background: var(--warning-muted); color: #92400e; }
+.badge-neutral { background: var(--bg-muted);      color: var(--text-secondary); }
+
+/* ── Label ─────────────────────────────────────────────────────── */
+.field-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* ── Page header ───────────────────────────────────────────────── */
+.page-title {
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  color: var(--text-primary);
+}
+.page-desc {
+  font-size: 0.9375rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* ── Scrollbars ────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #d0d7de; border-radius: 999px; }
-::-webkit-scrollbar-thumb:hover { background: #afb8c1; }
+::-webkit-scrollbar-thumb { background: #d1d5dc; border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }

@@ -10,7 +10,7 @@ router = APIRouter(prefix="/verification", tags=["verification"])
 
 
 @router.post("/run", response_model=VerificationReportResponse)
-def run_verification(
+async def run_verification(
     request: VerificationRunRequest,
     config=Depends(get_app_config),
     graph_repo=Depends(get_graph_repo),
@@ -24,45 +24,69 @@ def run_verification(
     from graphbuilder.core.verification.cascading import CascadingVerifierConfig
 
     cascading_cfg = CascadingVerifierConfig(
-        use_text_match=request.use_text_match,
-        use_embedding=request.use_embedding,
-        use_llm=request.use_llm,
-        confidence_threshold=request.confidence_threshold,
-        early_exit_on_accept=True,
+        enable_text_match=True,
+        enable_embedding=request.enable_embedding,
+        enable_llm=request.enable_llm,
+        early_exit_on_pass=request.early_exit_on_pass,
+        early_exit_on_fail=request.early_exit_on_fail,
     )
     ver_cfg = VerificationConfig(
-        cascading_config=cascading_cfg,
-        relationship_ids=request.relationship_ids or None,
+        cascading=cascading_cfg,
+        context_map=request.context_map,
     )
-    use_case = RelationshipVerificationUseCase(graph_repo, config)
+
+    # Build a KnowledgeGraph containing only the requested relationships
+    from graphbuilder.domain.models.graph_models import KnowledgeGraph
+    requested = set(request.relationship_ids)
+    kg = KnowledgeGraph()
+
+    all_rels = await graph_repo.get_all_relationships()
+    for rel in all_rels.values():
+
+        if rel.id in requested:
+            kg.relationships[rel.id] = rel
+
+    all_entities = await graph_repo.get_all_entities()
+    needed_ids = set()
+    for rel in kg.relationships.values():
+        needed_ids.add(rel.source_entity_id)
+        needed_ids.add(rel.target_entity_id)
+    for ent in all_entities.values():
+        if ent.id in needed_ids:
+            kg.entities[ent.id] = ent
+
+    use_case = RelationshipVerificationUseCase(kg)
     result = use_case.execute(ver_cfg)
 
     entries: list[VerificationEntryResponse] = []
     if result.success and result.data:
-        for item in result.data.get("results", []):
+        for item in result.data.get("report", []):
             stages = [
                 VerificationStageResult(
                     stage=s["stage"],
                     status=s["status"],
-                    confidence=s.get("confidence"),
-                    reason=s.get("reason"),
+                    confidence=s.get("confidence", 0.0),
+                    reasoning=s.get("reasoning", ""),
                 )
-                for s in item.get("stages", [])
+                for s in item.get("stage_results", [])
             ]
             entries.append(
                 VerificationEntryResponse(
                     relationship_id=item["relationship_id"],
-                    final_status=item["final_status"],
-                    overall_confidence=item.get("overall_confidence", 0.0),
-                    stages=stages,
-                    message=item.get("message"),
+                    source_entity_id=item.get("source_entity_id", ""),
+                    target_entity_id=item.get("target_entity_id", ""),
+                    relationship_type=item.get("relationship_type", ""),
+                    status=item["status"],
+                    confidence=item.get("confidence", 0.0),
+                    reasoning=item.get("reasoning", ""),
+                    stage_results=stages,
                 )
             )
 
     return VerificationReportResponse(
-        total=len(entries),
-        verified=sum(1 for e in entries if e.final_status == "verified"),
-        rejected=sum(1 for e in entries if e.final_status == "rejected"),
-        unverified=sum(1 for e in entries if e.final_status == "unverified"),
-        entries=entries,
+        total=result.data.get("total", len(entries)) if result.data else len(entries),
+        passed=result.data.get("passed", 0) if result.data else 0,
+        failed=result.data.get("failed", 0) if result.data else 0,
+        skipped=result.data.get("skipped", 0) if result.data else 0,
+        report=entries,
     )

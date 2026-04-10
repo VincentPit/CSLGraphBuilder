@@ -28,6 +28,13 @@ class EntityType(Enum):
     BRAND = "Brand"
     FEATURE = "Feature"
     SPECIFICATION = "Specification"
+    # Biomedical entity types
+    GENE = "GENE"
+    PROTEIN = "PROTEIN"
+    DISEASE = "DISEASE"
+    DRUG = "DRUG"
+    PATHWAY = "PATHWAY"
+    COMPOUND = "COMPOUND"
 
 
 class RelationshipType(Enum):

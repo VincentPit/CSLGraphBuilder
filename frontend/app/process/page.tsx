@@ -5,10 +5,10 @@ import { FileText, Link2, Tag, Loader2, CheckCircle2, XCircle } from 'lucide-rea
 
 function FieldLabel({ icon: Icon, label, optional }: { icon: any; label: string; optional?: boolean }) {
   return (
-    <label className="flex items-center gap-2 text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">
+    <label className="field-label flex items-center gap-2">
       <Icon size={13} />
       {label}
-      {optional ? <span className="text-slate-400 normal-case font-medium">optional</span> : null}
+      {optional ? <span className="normal-case font-medium" style={{ color: 'var(--text-muted)' }}>optional</span> : null}
     </label>
   );
 }
@@ -50,16 +50,16 @@ export default function ProcessPage() {
     }
   }
 
-  const input = 'w-full rounded-md bg-white border border-[#d0d7de] px-3 py-2.5 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#0969da]/20 focus:border-[#0969da]';
+  const input = 'input';
 
   return (
     <div className="space-y-8 max-w-3xl">
-      <header className="space-y-2">
-        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Process Document</h1>
-        <p className="text-slate-600 max-w-2xl">Extract entities and relationships from URLs or pasted text using your configured LLM pipeline.</p>
+      <header>
+        <h1 className="page-title">Process Document</h1>
+        <p className="page-desc">Extract entities and relationships from URLs or pasted text using your configured LLM pipeline.</p>
       </header>
 
-      <div className="surface p-6 md:p-7">
+      <div className="card p-6 md:p-7">
         <form onSubmit={handleSubmit} className="space-y-5">
           <div>
             <FieldLabel icon={Link2} label="Source URL" />
@@ -79,7 +79,7 @@ export default function ProcessPage() {
           <button
             type="submit"
             disabled={status === 'running' || (!url && !text)}
-            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-md bg-[#2da44e] border border-[#2c974b] text-white font-medium hover:bg-[#2c974b] disabled:opacity-40 disabled:cursor-not-allowed transition"
+            className="btn-primary"
           >
             {status === 'running' ? <><Loader2 size={15} className="animate-spin" /> Processing</> : 'Start Extraction'}
           </button>
@@ -87,9 +87,9 @@ export default function ProcessPage() {
       </div>
 
       {log.length > 0 && (
-        <div className="surface p-5">
-          <p className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Live Progress</p>
-          <div className="rounded-lg bg-slate-50 border border-slate-200 p-4 max-h-72 overflow-y-auto font-mono text-xs space-y-1.5">
+        <div className="card p-5">
+          <p className="field-label">Live Progress</p>
+          <div className="rounded-lg p-4 max-h-72 overflow-y-auto font-mono text-xs space-y-1.5" style={{ background: 'var(--bg-muted)', border: '1px solid var(--border)' }}>
             {log.map((line, i) => (
               <div key={i} className={line.includes('failed') ? 'text-rose-700' : line.includes('completed') ? 'text-emerald-700' : 'text-slate-600'}>{line}</div>
             ))}
@@ -98,13 +98,13 @@ export default function ProcessPage() {
       )}
 
       {status === 'done' && (
-        <div className="surface p-4 text-emerald-700 text-sm flex items-center gap-2">
+        <div className="card p-4 text-sm flex items-center gap-2" style={{ color: 'var(--success)' }}>
           <CheckCircle2 size={16} /> Processing complete. Entities and relationships were saved.
         </div>
       )}
 
       {status === 'error' && (
-        <div className="surface p-4 text-rose-700 text-sm flex items-center gap-2">
+        <div className="card p-4 text-sm flex items-center gap-2" style={{ color: 'var(--danger)' }}>
           <XCircle size={16} /> Processing failed. Check the live log for details.
         </div>
       )}

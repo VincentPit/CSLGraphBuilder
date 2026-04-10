@@ -60,7 +60,7 @@ def submit_curation_events(
 
 
 @router.get("/queue")
-def get_curation_queue(
+async def get_curation_queue(
     status: Optional[str] = Query(None, description="Filter by annotation status (rejected|flagged)"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -70,7 +70,8 @@ def get_curation_queue(
     """Return entities and relationships flagged or rejected by verifiers / LLM."""
     items = []
 
-    for ent in list(graph_repo.entities.values()):
+    all_entities = await graph_repo.get_all_entities()
+    for ent in list(all_entities.values()):
         ann = getattr(getattr(ent, "metadata", None), "annotations", {}) or {}
         ent_status = ann.get("verification_status", "")
         if status and ent_status != status:
@@ -87,7 +88,8 @@ def get_curation_queue(
                 }
             )
 
-    for rel in list(graph_repo.relationships.values()):
+    all_relationships = await graph_repo.get_all_relationships()
+    for rel in list(all_relationships.values()):
         ann = getattr(getattr(rel, "metadata", None), "annotations", {}) or {}
         rel_status = ann.get("verification_status", "")
         if status and rel_status != status:

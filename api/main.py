@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import health, graph, documents, ingest, curation, verification, export
+from .routers import health, graph, documents, ingest, curation, verification, export, dev
 
 
 def _configure_logging() -> None:
@@ -82,6 +82,7 @@ def create_app() -> FastAPI:
     app.include_router(curation.router)
     app.include_router(verification.router)
     app.include_router(export.router)
+    app.include_router(dev.router)
 
     return app
 

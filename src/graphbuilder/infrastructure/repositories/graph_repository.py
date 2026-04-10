@@ -61,6 +61,14 @@ class GraphRepositoryInterface(ABC):
         """Execute custom Cypher query."""
         pass
 
+    async def get_all_entities(self) -> Dict[str, 'GraphEntity']:
+        """Return all entities as {id: entity} dict."""
+        raise NotImplementedError
+
+    async def get_all_relationships(self) -> Dict[str, 'GraphRelationship']:
+        """Return all relationships as {id: relationship} dict."""
+        raise NotImplementedError
+
 
 class Neo4jGraphRepository(GraphRepositoryInterface):
     """
@@ -364,6 +372,38 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             
             return records
     
+    async def get_all_entities(self) -> Dict[str, GraphEntity]:
+        """Fetch all entities from Neo4j."""
+        async with self.driver.session() as session:
+            result = await session.run("MATCH (e:Entity) RETURN e")
+            entities = {}
+            async for record in result:
+                data = dict(record['e'])
+                try:
+                    entity = self._create_entity_from_data(data)
+                    entities[entity.id] = entity
+                except Exception as exc:
+                    self.logger.debug("Skipping entity: %s", exc)
+            return entities
+
+    async def get_all_relationships(self) -> Dict[str, GraphRelationship]:
+        """Fetch all relationships from Neo4j."""
+        async with self.driver.session() as session:
+            result = await session.run(
+                "MATCH ()-[r:RELATES]->() RETURN r, startNode(r).id as source_id, endNode(r).id as target_id"
+            )
+            rels = {}
+            async for record in result:
+                data = dict(record['r'])
+                data['source_entity_id'] = record['source_id']
+                data['target_entity_id'] = record['target_id']
+                try:
+                    rel = self._create_relationship_from_data(data)
+                    rels[rel.id] = rel
+                except Exception as exc:
+                    self.logger.debug("Skipping relationship: %s", exc)
+            return rels
+
     async def get_graph_statistics(self) -> Dict[str, Any]:
         """Get comprehensive graph statistics."""
         
@@ -461,14 +501,14 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
         entity_type = EntityType(data.get('entity_type', 'CONCEPT'))
         
         entity = GraphEntity(
-            id=data.get('id'),
             name=data.get('name', ''),
             entity_type=entity_type,
             description=data.get('description'),
-            properties=data.get('properties', {}),
-            aliases=set(data.get('aliases', [])),
-            external_ids=data.get('external_ids', {})
+            properties=data.get('properties', {}) if isinstance(data.get('properties'), dict) else {},
+            aliases=set(data.get('aliases', [])) if data.get('aliases') else set(),
+            external_ids=data.get('external_ids', {}) if isinstance(data.get('external_ids'), dict) else {},
         )
+        entity.id = data.get('id', entity.id)
         
         # Restore metadata
         if 'created_at' in data:
@@ -489,14 +529,14 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
         relationship_type = RelationshipType(data.get('relationship_type', 'RELATED_TO'))
         
         relationship = GraphRelationship(
-            id=data.get('id'),
             source_entity_id=data.get('source_entity_id', ''),
             target_entity_id=data.get('target_entity_id', ''),
             relationship_type=relationship_type,
             description=data.get('description'),
-            properties=data.get('properties', {}),
-            strength=data.get('strength', 1.0)
+            properties=data.get('properties', {}) if isinstance(data.get('properties'), dict) else {},
+            strength=data.get('strength', 1.0),
         )
+        relationship.id = data.get('id', relationship.id)
         
         # Handle temporal validity
         if 'temporal_validity' in data and data['temporal_validity']:
@@ -606,6 +646,12 @@ class InMemoryGraphRepository(GraphRepositoryInterface):
     ) -> List[Dict[str, Any]]:
         """Execute custom query (not supported in memory implementation)."""
         raise NotImplementedError("Custom queries not supported in memory implementation")
+
+    async def get_all_entities(self) -> Dict[str, GraphEntity]:
+        return dict(self.entities)
+
+    async def get_all_relationships(self) -> Dict[str, GraphRelationship]:
+        return dict(self.relationships)
     
     def _calculate_name_similarity(self, name1: str, name2: str) -> float:
         """Calculate simple name similarity score."""

@@ -4,10 +4,10 @@ import { getCurationQueue, submitCurationEvents, CurationQueueItem } from '@/lib
 import { useState } from 'react';
 import { CheckCircle2, XCircle, Loader2 } from 'lucide-react';
 
-const STATUS_STYLE: Record<string, string> = {
-  rejected: 'text-rose-700 border-rose-200 bg-rose-50',
-  flagged: 'text-amber-700 border-amber-200 bg-amber-50',
-  unverified: 'text-slate-700 border-slate-200 bg-slate-100',
+const STATUS_BADGE: Record<string, string> = {
+  rejected: 'badge badge-danger',
+  flagged: 'badge badge-warning',
+  unverified: 'badge badge-neutral',
 };
 
 export default function CurationPage() {
@@ -38,9 +38,9 @@ export default function CurationPage() {
 
   return (
     <div className="space-y-8">
-      <header className="space-y-2">
-        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Curation Queue</h1>
-        <p className="text-slate-600">Review extracted items before they are promoted to trusted graph content.</p>
+      <header>
+        <h1 className="page-title">Curation Queue</h1>
+        <p className="page-desc">Review extracted items before they are promoted to trusted graph content.</p>
       </header>
 
       <div className="flex flex-wrap gap-2">
@@ -48,46 +48,45 @@ export default function CurationPage() {
           <button
             key={value}
             onClick={() => setFilter(value)}
-            className={`px-3 py-1.5 rounded-md text-xs font-medium border transition ${filter === value ? 'bg-[#ddf4ff] text-[#0969da] border-[#54aeff]' : 'bg-white text-slate-700 border-[#d0d7de] hover:border-[#afb8c1]'}`}
+            className={`btn-ghost ${filter === value ? 'active' : ''}`}
+            style={filter === value ? { background: 'var(--accent-muted)', color: 'var(--accent)', borderColor: 'var(--accent)' } : {}}
           >
             {label}
           </button>
         ))}
       </div>
 
-      <div className="surface overflow-hidden">
+      <div className="card overflow-hidden">
         {isLoading ? (
-          <div className="p-6 text-sm text-slate-600 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Loading queue</div>
+          <div className="p-6 text-sm flex items-center gap-2" style={{ color: 'var(--text-muted)' }}><Loader2 size={14} className="animate-spin" /> Loading queue</div>
         ) : (data?.items.length ?? 0) === 0 ? (
-          <div className="p-8 text-slate-600 text-sm">No items in queue.</div>
+          <div className="p-8 text-sm" style={{ color: 'var(--text-muted)' }}>No items in queue.</div>
         ) : (
           <table className="w-full text-sm">
-            <thead className="bg-slate-50 border-b border-slate-200">
+            <thead style={{ background: 'var(--bg-muted)', borderBottom: '1px solid var(--border)' }}>
               <tr>
-                <th className="text-left px-4 py-3 text-slate-500 text-xs uppercase tracking-wide">Type</th>
-                <th className="text-left px-4 py-3 text-slate-500 text-xs uppercase tracking-wide">Name / Identifier</th>
-                <th className="text-left px-4 py-3 text-slate-500 text-xs uppercase tracking-wide">Status</th>
-                <th className="text-left px-4 py-3 text-slate-500 text-xs uppercase tracking-wide">Notes</th>
-                <th className="text-left px-4 py-3 text-slate-500 text-xs uppercase tracking-wide">Actions</th>
+                {['Type', 'Name / Identifier', 'Status', 'Notes', 'Actions'].map((h) => (
+                  <th key={h} className="text-left px-4 py-3 text-xs uppercase tracking-wide" style={{ color: 'var(--text-muted)' }}>{h}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
               {data!.items.map((item) => (
-                <tr key={item.id} className="border-b border-slate-100 hover:bg-slate-50">
-                  <td className="px-4 py-3 text-slate-700 capitalize">{item.type}</td>
-                  <td className="px-4 py-3 text-slate-900">{item.name ?? item.relationship_type ?? item.id}</td>
+                <tr key={item.id} className="hover:bg-[var(--bg-muted)]" style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td className="px-4 py-3 capitalize" style={{ color: 'var(--text-secondary)' }}>{item.type}</td>
+                  <td className="px-4 py-3" style={{ color: 'var(--text-primary)' }}>{item.name ?? item.relationship_type ?? item.id}</td>
                   <td className="px-4 py-3">
-                    <span className={`text-xs px-2 py-1 rounded border ${STATUS_STYLE[item.verification_status] ?? STATUS_STYLE.unverified}`}>
+                    <span className={STATUS_BADGE[item.verification_status] ?? STATUS_BADGE.unverified}>
                       {item.verification_status}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-slate-600">{item.notes ?? '—'}</td>
+                  <td className="px-4 py-3" style={{ color: 'var(--text-muted)' }}>{item.notes ?? '—'}</td>
                   <td className="px-4 py-3">
                     <div className="flex gap-2">
-                      <button onClick={() => act(item, 'approve')} className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-[#dafbe1] text-[#1a7f37] border border-[#a2e5b5] hover:bg-[#c5f3d2] text-xs font-medium">
+                      <button onClick={() => act(item, 'approve')} className="badge badge-success cursor-pointer hover:opacity-80 transition">
                         <CheckCircle2 size={12} /> Approve
                       </button>
-                      <button onClick={() => act(item, 'reject')} className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-[#ffebe9] text-[#cf222e] border border-[#ffc1ba] hover:bg-[#ffd8d3] text-xs font-medium">
+                      <button onClick={() => act(item, 'reject')} className="badge badge-danger cursor-pointer hover:opacity-80 transition">
                         <XCircle size={12} /> Reject
                       </button>
                     </div>

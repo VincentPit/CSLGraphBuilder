@@ -58,8 +58,10 @@ async def graph_stats(
     repo=Depends(get_graph_repo),
     _=Depends(require_api_key),
 ):
-    entities = list(repo.entities.values()) if hasattr(repo, "entities") else []
-    rels = list(repo.relationships.values()) if hasattr(repo, "relationships") else []
+    all_entities = await repo.get_all_entities()
+    all_rels = await repo.get_all_relationships()
+    entities = list(all_entities.values())
+    rels = list(all_rels.values())
 
     entity_type_counts: dict = {}
     for e in entities:
@@ -87,7 +89,8 @@ async def list_entities(
     repo=Depends(get_graph_repo),
     _=Depends(require_api_key),
 ):
-    entities = list(repo.entities.values()) if hasattr(repo, "entities") else []
+    all_entities = await repo.get_all_entities()
+    entities = list(all_entities.values())
     if entity_type:
         entities = [e for e in entities if e.entity_type.value == entity_type]
     total = len(entities)
@@ -123,7 +126,8 @@ async def list_relationships(
     repo=Depends(get_graph_repo),
     _=Depends(require_api_key),
 ):
-    rels = list(repo.relationships.values()) if hasattr(repo, "relationships") else []
+    all_rels = await repo.get_all_relationships()
+    rels = list(all_rels.values())
     if relationship_type:
         rels = [r for r in rels if r.relationship_type.value == relationship_type]
     if source_entity_id:

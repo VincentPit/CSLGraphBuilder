@@ -36,6 +36,11 @@ class CurationResultResponse(BaseModel):
 # ── Verification ─────────────────────────────────────────────────────────────
 
 class VerificationRunRequest(BaseModel):
+    relationship_ids: List[str] = Field(
+        ...,
+        min_length=1,
+        description="IDs of the relationships to verify (required, at least one)",
+    )
     enable_embedding: bool = False
     enable_llm: bool = False
     embedding_threshold: float = Field(0.5, ge=0.0, le=1.0)

@@ -33,15 +33,15 @@ export default function GraphPage() {
 
   return (
     <div className="space-y-6">
-      <header className="space-y-2">
-        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Knowledge Graph</h1>
-        <p className="text-slate-600">Interactive graph view. Drag to move, scroll to zoom, hover nodes for labels.</p>
+      <header>
+        <h1 className="page-title">Knowledge Graph</h1>
+        <p className="page-desc">Interactive graph view. Drag to move, scroll to zoom, hover nodes for labels.</p>
       </header>
 
       {!loading && (
         <div className="flex flex-wrap gap-2">
           {Object.entries(TYPE_COLORS).map(([type, color]) => (
-            <span key={type} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white border border-[#d0d7de] text-xs text-slate-700">
+            <span key={type} className="badge badge-neutral">
               <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: color }} />
               {type}
             </span>
@@ -49,9 +49,9 @@ export default function GraphPage() {
         </div>
       )}
 
-      <div className="surface overflow-hidden">
+      <div className="card overflow-hidden">
         {loading ? (
-          <div className="h-[620px] flex items-center justify-center text-slate-600 text-sm gap-2">
+          <div className="h-[620px] flex items-center justify-center text-sm gap-2" style={{ color: 'var(--text-muted)' }}>
             <Activity size={16} className="animate-pulse" /> Loading graph
           </div>
         ) : (

@@ -1,7 +1,17 @@
 'use client';
 import { useState, useRef } from 'react';
 import { processDocument, getJobStreamUrl } from '@/lib/api';
-import { FileText, Link2, Tag, Loader2, CheckCircle2, XCircle, Zap, ArrowRight } from 'lucide-react';
+import { FileText, Link2, Tag, Loader2, CheckCircle2, XCircle } from 'lucide-react';
+
+function FieldLabel({ icon: Icon, label, optional }: { icon: any; label: string; optional?: boolean }) {
+  return (
+    <label className="flex items-center gap-2 text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">
+      <Icon size={13} />
+      {label}
+      {optional ? <span className="text-slate-400 normal-case font-medium">optional</span> : null}
+    </label>
+  );
+}
 
 export default function ProcessPage() {
   const [url, setUrl] = useState('');
@@ -15,6 +25,7 @@ export default function ProcessPage() {
     e.preventDefault();
     setLog([]);
     setStatus('running');
+
     try {
       const job = await processDocument({ url: url || undefined, text: text || undefined, source_label: label || undefined });
       const es = new EventSource(getJobStreamUrl(job.job_id));
@@ -29,128 +40,72 @@ export default function ProcessPage() {
           }
         } catch {}
       };
-      es.onerror = () => { setStatus('error'); es.close(); };
+      es.onerror = () => {
+        setStatus('error');
+        es.close();
+      };
     } catch (err: any) {
       setLog([err.message]);
       setStatus('error');
     }
   }
 
-  const inputBase = "w-full bg-[#080d1a] border border-white/[0.06] rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/40 transition-all duration-200";
+  const input = 'w-full rounded-md bg-white border border-[#d0d7de] px-3 py-2.5 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#0969da]/20 focus:border-[#0969da]';
 
   return (
-    <div className="max-w-2xl space-y-10">
-      {/* Header */}
-      <div className="space-y-3">
-        <div className="flex items-center gap-2.5">
-          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-indigo-500/20 to-violet-500/10 border border-indigo-500/10 flex items-center justify-center">
-            <Zap size={18} className="text-indigo-400" />
-          </div>
+    <div className="space-y-8 max-w-3xl">
+      <header className="space-y-2">
+        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Process Document</h1>
+        <p className="text-slate-600 max-w-2xl">Extract entities and relationships from URLs or pasted text using your configured LLM pipeline.</p>
+      </header>
+
+      <div className="surface p-6 md:p-7">
+        <form onSubmit={handleSubmit} className="space-y-5">
           <div>
-            <h1 className="text-2xl font-bold text-white tracking-tight">Process Document</h1>
-            <p className="text-xs text-slate-500 font-medium">LLM-powered extraction pipeline</p>
-          </div>
-        </div>
-        <p className="text-sm text-slate-400 leading-relaxed max-w-xl">
-          Extract entities and relationships from any URL or raw text. The LLM will chunk the content, identify named entities (genes, diseases, pathways, etc.), and create relationship edges automatically.
-        </p>
-      </div>
-
-      {/* Form Card */}
-      <div className="bg-gradient-to-b from-[#0f1829] to-[#0d1526] border border-white/[0.06] rounded-2xl p-8 shadow-xl shadow-black/20">
-        <form onSubmit={handleSubmit} className="space-y-6">
-          {/* URL Field */}
-          <div className="space-y-2">
-            <label className="flex items-center gap-2 text-xs font-semibold text-slate-300 tracking-wide">
-              <Link2 size={13} className="text-slate-500" />
-              Source URL
-            </label>
-            <input
-              className={inputBase}
-              value={url} onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://pubmed.ncbi.nlm.nih.gov/12345"
-            />
+            <FieldLabel icon={Link2} label="Source URL" />
+            <input className={input} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://pubmed.ncbi.nlm.nih.gov/12345" />
           </div>
 
-          {/* Divider */}
-          <div className="flex items-center gap-4">
-            <div className="flex-1 h-px bg-white/[0.04]" />
-            <span className="text-[10px] font-bold text-slate-600 uppercase tracking-widest">or</span>
-            <div className="flex-1 h-px bg-white/[0.04]" />
+          <div>
+            <FieldLabel icon={FileText} label="Raw Text" />
+            <textarea className={`${input} resize-none`} rows={7} value={text} onChange={(e) => setText(e.target.value)} placeholder="Paste article text or report content here" />
           </div>
 
-          {/* Text Area */}
-          <div className="space-y-2">
-            <label className="flex items-center gap-2 text-xs font-semibold text-slate-300 tracking-wide">
-              <FileText size={13} className="text-slate-500" />
-              Paste raw text
-            </label>
-            <textarea
-              className={`${inputBase} resize-none`}
-              rows={6} value={text} onChange={(e) => setText(e.target.value)}
-              placeholder="Paste the full text of a research paper, article, or any document…"
-            />
+          <div>
+            <FieldLabel icon={Tag} label="Source Label" optional />
+            <input className={input} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="PubMed:12345" />
           </div>
 
-          {/* Label Field */}
-          <div className="space-y-2">
-            <label className="flex items-center gap-2 text-xs font-semibold text-slate-300 tracking-wide">
-              <Tag size={13} className="text-slate-500" />
-              Source Label
-              <span className="text-slate-600 font-normal">· optional</span>
-            </label>
-            <input
-              className={inputBase}
-              value={label} onChange={(e) => setLabel(e.target.value)}
-              placeholder="e.g. PubMed:12345"
-            />
-          </div>
-
-          {/* Submit */}
           <button
             type="submit"
             disabled={status === 'running' || (!url && !text)}
-            className="group w-full flex items-center justify-center gap-2.5 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm font-semibold px-6 py-3.5 rounded-xl transition-all duration-200 shadow-lg shadow-indigo-600/20 hover:shadow-indigo-500/30"
+            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-md bg-[#2da44e] border border-[#2c974b] text-white font-medium hover:bg-[#2c974b] disabled:opacity-40 disabled:cursor-not-allowed transition"
           >
-            {status === 'running'
-              ? <><Loader2 size={15} className="animate-spin" /> Processing…</>
-              : <>Start Extraction <ArrowRight size={14} className="group-hover:translate-x-0.5 transition-transform" /></>
-            }
+            {status === 'running' ? <><Loader2 size={15} className="animate-spin" /> Processing</> : 'Start Extraction'}
           </button>
         </form>
       </div>
 
-      {/* Live log */}
       {log.length > 0 && (
-        <div className="space-y-2.5">
-          <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-widest">Live Progress</p>
-          <div className="bg-[#060a14] border border-white/[0.04] rounded-xl p-5 font-mono text-xs space-y-1.5 max-h-64 overflow-y-auto">
-            {log.map((l, i) => (
-              <div key={i} className={`leading-relaxed ${l.includes('failed') ? 'text-red-400' : l.includes('completed') ? 'text-emerald-400' : 'text-slate-500'}`}>
-                <span className="text-slate-700 mr-2">{String(i + 1).padStart(2, '0')}</span>{l}
-              </div>
+        <div className="surface p-5">
+          <p className="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-3">Live Progress</p>
+          <div className="rounded-lg bg-slate-50 border border-slate-200 p-4 max-h-72 overflow-y-auto font-mono text-xs space-y-1.5">
+            {log.map((line, i) => (
+              <div key={i} className={line.includes('failed') ? 'text-rose-700' : line.includes('completed') ? 'text-emerald-700' : 'text-slate-600'}>{line}</div>
             ))}
           </div>
         </div>
       )}
 
-      {/* Status banners */}
       {status === 'done' && (
-        <div className="flex items-center gap-3 text-emerald-300 text-sm bg-emerald-500/[0.08] border border-emerald-500/15 rounded-xl px-5 py-4">
-          <CheckCircle2 size={18} />
-          <div>
-            <p className="font-semibold">Extraction complete</p>
-            <p className="text-emerald-400/60 text-xs mt-0.5">Entities and relationships have been saved to the graph.</p>
-          </div>
+        <div className="surface p-4 text-emerald-700 text-sm flex items-center gap-2">
+          <CheckCircle2 size={16} /> Processing complete. Entities and relationships were saved.
         </div>
       )}
+
       {status === 'error' && (
-        <div className="flex items-center gap-3 text-red-300 text-sm bg-red-500/[0.08] border border-red-500/15 rounded-xl px-5 py-4">
-          <XCircle size={18} />
-          <div>
-            <p className="font-semibold">Processing failed</p>
-            <p className="text-red-400/60 text-xs mt-0.5">Check the log above for details.</p>
-          </div>
+        <div className="surface p-4 text-rose-700 text-sm flex items-center gap-2">
+          <XCircle size={16} /> Processing failed. Check the live log for details.
         </div>
       )}
     </div>

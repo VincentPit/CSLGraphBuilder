@@ -1,10 +1,15 @@
 """Export router — graph export in multiple formats."""
 
 import io
-from fastapi import APIRouter, Depends, Query
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from ..dependencies import get_app_config, get_graph_repo
+from graphbuilder.core.utils.visualization import GraphExporter
+from graphbuilder.domain.models.graph_models import KnowledgeGraph
+
+from ..dependencies import get_graph_repo
 
 router = APIRouter(prefix="/export", tags=["export"])
 
@@ -19,31 +24,33 @@ _FORMAT_MIME = {
 @router.get("")
 def export_graph(
     format: str = Query("json", description="Export format: json|cytoscape|graphml|html"),
-    config=Depends(get_app_config),
     graph_repo=Depends(get_graph_repo),
 ):
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-    from graphbuilder.application.use_cases.graph_visualization import (
-        GraphVisualizationUseCase, VisualizationConfig,
-    )
-
     fmt = format.lower()
     if fmt not in _FORMAT_MIME:
-        from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=f"Unknown format '{fmt}'. Choose: {', '.join(_FORMAT_MIME)}")
 
-    vis_cfg = VisualizationConfig(output_format=fmt)
-    use_case = GraphVisualizationUseCase(graph_repo, config)
-    result = use_case.execute(vis_cfg)
+    graph = KnowledgeGraph()
+    if hasattr(graph_repo, "entities") and isinstance(graph_repo.entities, dict):
+        graph.entities = dict(graph_repo.entities)
+    if hasattr(graph_repo, "relationships") and isinstance(graph_repo.relationships, dict):
+        graph.relationships = dict(graph_repo.relationships)
 
-    if not result.success:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=500, detail=result.message)
+    exporter = GraphExporter(graph)
 
-    content = result.data.get("content", "")
-    if isinstance(content, str):
-        content = content.encode()
+    if fmt == "json":
+        payload = {
+            "entities": [entity.to_dict() for entity in graph.entities.values()],
+            "relationships": [relationship.to_dict() for relationship in graph.relationships.values()],
+            "statistics": graph.get_statistics(),
+        }
+        content = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    elif fmt == "cytoscape":
+        content = json.dumps(exporter.to_cytoscape_json(), indent=2).encode("utf-8")
+    elif fmt == "graphml":
+        content = exporter.to_graphml().encode("utf-8")
+    else:  # html
+        content = exporter.to_html().encode("utf-8")
 
     media_type = _FORMAT_MIME[fmt]
     ext_map = {"cytoscape": "json", "graphml": "xml", "html": "html", "json": "json"}

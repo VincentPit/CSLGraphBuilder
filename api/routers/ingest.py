@@ -25,7 +25,7 @@ async def _run_open_targets(job_id: str, request: OpenTargetsIngestRequest, conf
             min_association_score=request.min_association_score,
             tag=request.tag,
         )
-        use_case = OpenTargetsIngestionUseCase(graph_repo, config)
+        use_case = OpenTargetsIngestionUseCase(config, graph_repo)
         result = await use_case.execute(cfg)
         update_job(
             job_id,
@@ -56,7 +56,7 @@ async def _run_pubmed(job_id: str, request: PubMedIngestRequest, config, graph_r
             include_keywords=request.include_keywords,
             tag=request.tag,
         )
-        use_case = PubMedIngestionUseCase(graph_repo, config)
+        use_case = PubMedIngestionUseCase(config, graph_repo)
         result = await use_case.execute(cfg)
         update_job(
             job_id,

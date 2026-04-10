@@ -76,6 +76,9 @@ src_paths = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: tests that hit real external APIs (Open Targets, PubMed)",
+]
 
 [tool.mypy]
 python_version = "3.8"

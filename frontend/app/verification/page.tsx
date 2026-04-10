@@ -1,7 +1,19 @@
 'use client';
 import { useState } from 'react';
 import { runVerification, VerificationReport } from '@/lib/api';
-import { ShieldCheck, ChevronDown, ChevronUp, Loader2, ShieldAlert } from 'lucide-react';
+import { ShieldCheck, ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
+
+function Toggle({ label, desc, checked, onChange }: { label: string; desc: string; checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label className={`rounded-md border p-4 cursor-pointer transition ${checked ? 'bg-[#ddf4ff] border-[#54aeff]' : 'bg-white border-[#d0d7de] hover:border-[#afb8c1]'}`}>
+      <div className="flex justify-between items-center mb-1">
+        <span className="text-sm font-medium text-slate-900">{label}</span>
+        <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="accent-[#0969da]" />
+      </div>
+      <p className="text-xs text-slate-600">{desc}</p>
+    </label>
+  );
+}
 
 export default function VerificationPage() {
   const [useText, setUseText] = useState(true);
@@ -15,105 +27,90 @@ export default function VerificationPage() {
 
   async function handleRun(e: React.FormEvent) {
     e.preventDefault();
-    setLoading(true); setError(null); setReport(null);
+    setLoading(true);
+    setError(null);
+    setReport(null);
     try {
-      setReport(await runVerification({ use_text_match: useText, use_embedding: useEmbed, use_llm: useLLM, confidence_threshold: Number(threshold) }));
+      const result = await runVerification({
+        use_text_match: useText,
+        use_embedding: useEmbed,
+        use_llm: useLLM,
+        confidence_threshold: Number(threshold),
+      });
+      setReport(result);
     } catch (err: any) {
       setError(err.response?.data?.detail ?? err.message);
-    } finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
-    <div className="max-w-4xl space-y-10">
-      {/* Header */}
-      <div className="space-y-3">
-        <div className="flex items-center gap-2.5">
-          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-violet-500/20 to-purple-500/10 border border-violet-500/10 flex items-center justify-center">
-            <ShieldAlert size={18} className="text-violet-400" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold text-white tracking-tight">Verify Relationships</h1>
-            <p className="text-xs text-slate-500 font-medium">Automated confidence scoring</p>
-          </div>
-        </div>
-        <p className="text-sm text-slate-400 leading-relaxed max-w-xl">
-          Run automated checks on unverified relationships. Choose verification stages and a confidence threshold to classify results.
-        </p>
-      </div>
+    <div className="space-y-8 max-w-4xl">
+      <header className="space-y-2">
+        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Verification</h1>
+        <p className="text-slate-600">Run confidence checks before finalizing relationship assertions.</p>
+      </header>
 
-      {/* Config form */}
-      <form onSubmit={handleRun} className="bg-gradient-to-b from-[#0f1829] to-[#0d1526] border border-white/[0.06] rounded-2xl p-8 space-y-8 shadow-xl shadow-black/20">
-        <div>
-          <p className="text-[11px] font-bold text-slate-600 uppercase tracking-widest mb-4">Verification Stages</p>
-          <div className="grid grid-cols-3 gap-3">
-            <ToggleCard label="Text Match" desc="Exact string matching against source text" checked={useText} onChange={setUseText} />
-            <ToggleCard label="Embedding" desc="Semantic similarity via vector distance" checked={useEmbed} onChange={setUseEmbed} />
-            <ToggleCard label="LLM Review" desc="Language model logical validation" checked={useLLM} onChange={setUseLLM} />
+      <form onSubmit={handleRun} className="surface p-6 space-y-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <Toggle label="Text Match" desc="Literal mention checks" checked={useText} onChange={setUseText} />
+          <Toggle label="Embedding" desc="Semantic similarity" checked={useEmbed} onChange={setUseEmbed} />
+          <Toggle label="LLM Review" desc="Reasoning pass" checked={useLLM} onChange={setUseLLM} />
+        </div>
+
+        <div className="max-w-sm">
+          <label className="block text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Confidence Threshold</label>
+          <div className="flex items-center gap-3">
+            <input type="range" min="0" max="1" step="0.05" value={threshold} onChange={(e) => setThreshold(e.target.value)} className="flex-1 accent-slate-700" />
+            <span className="text-slate-700 font-mono text-sm w-10 text-right">{threshold}</span>
           </div>
         </div>
-        <div className="max-w-xs">
-          <label className="block text-[11px] font-bold text-slate-600 uppercase tracking-widest mb-3">Confidence Threshold</label>
-          <p className="text-[11px] text-slate-500 mb-3">Relationships scoring above this value pass verification.</p>
-          <div className="flex items-center gap-4">
-            <input type="range" min="0" max="1" step="0.05" value={threshold} onChange={(e) => setThreshold(e.target.value)}
-              className="flex-1 accent-indigo-500 h-1.5" />
-            <span className="text-indigo-400 font-mono font-bold text-base w-12 text-right">{threshold}</span>
-          </div>
-        </div>
-        <button type="submit" disabled={loading || (!useText && !useEmbed && !useLLM)}
-          className="group w-full flex items-center justify-center gap-2.5 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm font-semibold px-6 py-3.5 rounded-xl transition-all duration-200 shadow-lg shadow-indigo-600/20">
-          {loading ? <><Loader2 size={15} className="animate-spin"/>Running…</> : <><ShieldCheck size={15}/>Run Verification</>}
+
+        <button type="submit" disabled={loading || (!useText && !useEmbed && !useLLM)} className="inline-flex items-center gap-2 px-4 py-2.5 rounded-md bg-[#2da44e] border border-[#2c974b] text-white font-medium hover:bg-[#2c974b] disabled:opacity-50">
+          {loading ? <><Loader2 size={14} className="animate-spin" /> Running</> : <><ShieldCheck size={14} /> Run Verification</>}
         </button>
       </form>
 
-      {error && (
-        <div className="text-red-300 text-sm bg-red-500/[0.08] border border-red-500/15 rounded-xl px-5 py-4">{error}</div>
-      )}
+      {error && <div className="surface p-4 text-rose-700 text-sm">{error}</div>}
 
-      {/* Results */}
       {report && (
-        <div className="space-y-6">
-          <div className="grid grid-cols-4 gap-4">
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             {[
-              { label: 'Total',      value: report.total,      color: 'text-white',        gradient: 'from-slate-500/10 to-slate-500/5' },
-              { label: 'Verified',   value: report.verified,   color: 'text-emerald-400',  gradient: 'from-emerald-500/10 to-emerald-500/5' },
-              { label: 'Rejected',   value: report.rejected,   color: 'text-red-400',      gradient: 'from-red-500/10 to-red-500/5' },
-              { label: 'Unverified', value: report.unverified, color: 'text-amber-400',    gradient: 'from-amber-500/10 to-amber-500/5' },
-            ].map(({ label, value, color, gradient }) => (
-              <div key={label} className={`bg-gradient-to-b ${gradient} border border-white/[0.06] rounded-2xl p-5 text-center`}>
-                <p className="text-[10px] font-bold text-slate-600 uppercase tracking-widest mb-2">{label}</p>
-                <p className={`text-3xl font-extrabold ${color}`}>{value}</p>
+              ['Total', report.total],
+              ['Verified', report.verified],
+              ['Rejected', report.rejected],
+              ['Unverified', report.unverified],
+            ].map(([label, value]) => (
+              <div key={String(label)} className="surface p-4 text-center">
+                <p className="text-xs uppercase tracking-wide text-slate-500 mb-1">{label}</p>
+                <p className="text-2xl font-semibold text-slate-900">{value}</p>
               </div>
             ))}
           </div>
 
-          <p className="text-[11px] font-bold text-slate-600 uppercase tracking-widest">Relationship Details</p>
-          <div className="space-y-2">
+          <div className="surface overflow-hidden">
             {report.entries.map((entry) => {
               const isOpen = expanded === entry.relationship_id;
-              const statusColor = entry.final_status === 'verified' ? 'text-emerald-400' : entry.final_status === 'rejected' ? 'text-red-400' : 'text-amber-400';
               return (
-                <div key={entry.relationship_id} className="bg-gradient-to-b from-[#0f1829] to-[#0d1526] border border-white/[0.06] rounded-xl overflow-hidden">
-                  <button onClick={() => setExpanded(isOpen ? null : entry.relationship_id)}
-                    className="w-full flex justify-between items-center px-5 py-3.5 text-sm text-left hover:bg-white/[0.02] transition-colors">
-                    <span className="font-mono text-slate-500 text-xs truncate">{entry.relationship_id}</span>
-                    <div className="flex items-center gap-3 ml-4 shrink-0">
-                      <span className={`font-bold text-xs ${statusColor}`}>{entry.final_status}</span>
-                      <span className="text-slate-600 font-mono text-xs">{(entry.overall_confidence * 100).toFixed(0)}%</span>
-                      {isOpen ? <ChevronUp size={14} className="text-slate-600"/> : <ChevronDown size={14} className="text-slate-600"/>}
-                    </div>
+                <div key={entry.relationship_id} className="border-b border-slate-200 last:border-b-0">
+                  <button className="w-full px-4 py-3 text-left flex items-center justify-between hover:bg-slate-50" onClick={() => setExpanded(isOpen ? null : entry.relationship_id)}>
+                    <span className="text-xs font-mono text-slate-600 truncate pr-3">{entry.relationship_id}</span>
+                    <span className="inline-flex items-center gap-2 text-xs text-slate-600">
+                      {(entry.overall_confidence * 100).toFixed(0)}%
+                      {isOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                    </span>
                   </button>
                   {isOpen && (
-                    <div className="px-5 pb-4 pt-2 border-t border-white/[0.04] space-y-2">
-                      {entry.stages.map((s, i) => (
-                        <div key={i} className="flex items-center gap-3 text-xs">
-                          <span className="w-24 text-slate-500 shrink-0 font-medium">{s.stage}</span>
-                          <span className={`font-semibold ${s.status === 'verified' ? 'text-emerald-400' : 'text-red-400'}`}>{s.status}</span>
-                          {s.confidence != null && <span className="text-slate-600 font-mono">{(s.confidence * 100).toFixed(0)}%</span>}
-                          {s.reason && <span className="text-slate-600 truncate">{s.reason}</span>}
+                    <div className="px-4 pb-3 space-y-1.5">
+                      {entry.stages.map((stage, i) => (
+                        <div key={i} className="text-xs flex items-center gap-3">
+                          <span className="w-24 text-slate-500">{stage.stage}</span>
+                          <span className={stage.status === 'verified' ? 'text-emerald-700' : 'text-rose-700'}>{stage.status}</span>
+                          {stage.confidence != null && <span className="text-slate-500">{(stage.confidence * 100).toFixed(0)}%</span>}
                         </div>
                       ))}
-                      {entry.message && <p className="text-xs text-slate-600 mt-2">{entry.message}</p>}
                     </div>
                   )}
                 </div>
@@ -123,22 +120,5 @@ export default function VerificationPage() {
         </div>
       )}
     </div>
-  );
-}
-
-function ToggleCard({ label, desc, checked, onChange }: { label: string; desc: string; checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <label className={`flex flex-col gap-1.5 p-4 rounded-xl border cursor-pointer transition-all duration-200 ${
-      checked ? 'bg-indigo-500/[0.08] border-indigo-500/25' : 'bg-white/[0.02] border-white/[0.06] hover:border-white/[0.1]'
-    }`}>
-      <div className="flex items-center justify-between">
-        <span className={`text-sm font-semibold ${checked ? 'text-indigo-300' : 'text-slate-300'}`}>{label}</span>
-        <div className={`w-4 h-4 rounded border-2 flex items-center justify-center transition-all ${checked ? 'bg-indigo-500 border-indigo-500' : 'border-slate-600'}`}>
-          {checked && <svg viewBox="0 0 10 8" className="w-2.5 h-2 fill-white"><path d="M1 4l2.5 2.5L9 1"/></svg>}
-        </div>
-      </div>
-      <span className="text-[10px] text-slate-500 leading-snug">{desc}</span>
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="sr-only" />
-    </label>
   );
 }

@@ -1,9 +1,19 @@
 'use client';
 import { useState } from 'react';
 import { ingestOpenTargets, ingestPubMed, getJob } from '@/lib/api';
-import { Database, Search, Loader2, CheckCircle2, XCircle, ArrowRight, Beaker } from 'lucide-react';
+import { Database, Search, Loader2, CheckCircle2, XCircle } from 'lucide-react';
 
 type Tab = 'open-targets' | 'pubmed';
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-1.5">
+      <label className="text-xs uppercase tracking-wide text-slate-500 font-semibold">{label}</label>
+      {hint ? <p className="text-[11px] text-slate-500">{hint}</p> : null}
+      {children}
+    </div>
+  );
+}
 
 export default function IngestPage() {
   const [tab, setTab] = useState<Tab>('open-targets');
@@ -20,10 +30,10 @@ export default function IngestPage() {
   const [pmTag, setPmTag] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const inputBase = "w-full bg-[#080d1a] border border-white/[0.06] rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500/40 transition-all duration-200";
+  const inputClass = 'w-full rounded-md bg-white border border-[#d0d7de] px-3 py-2.5 text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-[#0969da]/20 focus:border-[#0969da]';
 
   async function pollJob(jobId: string) {
-    setJobStatus('Job queued, waiting to start…');
+    setJobStatus('Job queued, waiting to start...');
     setJobState('pending');
     const interval = setInterval(async () => {
       const job = await getJob(jobId);
@@ -36,134 +46,102 @@ export default function IngestPage() {
   }
 
   async function submitOT(e: React.FormEvent) {
-    e.preventDefault(); setLoading(true); setError(null); setJobStatus(null); setJobState(null);
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    setJobStatus(null);
+    setJobState(null);
     try {
-      const res = await ingestOpenTargets({ disease_id: diseaseId, max_associations: Number(maxAssoc), min_association_score: Number(minScore), tag: otTag || undefined });
+      const res = await ingestOpenTargets({
+        disease_id: diseaseId,
+        max_associations: Number(maxAssoc),
+        min_association_score: Number(minScore),
+        tag: otTag || undefined,
+      });
       pollJob(res.job_id);
-    } catch (err: any) { setError(err.message); }
-    finally { setLoading(false); }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function submitPM(e: React.FormEvent) {
-    e.preventDefault(); setLoading(true); setError(null); setJobStatus(null); setJobState(null);
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    setJobStatus(null);
+    setJobState(null);
     try {
-      const res = await ingestPubMed({ query, max_articles: Number(maxArticles), email: email || undefined, tag: pmTag || undefined });
+      const res = await ingestPubMed({
+        query,
+        max_articles: Number(maxArticles),
+        email: email || undefined,
+        tag: pmTag || undefined,
+      });
       pollJob(res.job_id);
-    } catch (err: any) { setError(err.message); }
-    finally { setLoading(false); }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
-    <div className="max-w-2xl space-y-10">
-      {/* Header */}
-      <div className="space-y-3">
-        <div className="flex items-center gap-2.5">
-          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-sky-500/20 to-cyan-500/10 border border-sky-500/10 flex items-center justify-center">
-            <Beaker size={18} className="text-sky-400" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold text-white tracking-tight">Ingest Data Sources</h1>
-            <p className="text-xs text-slate-500 font-medium">Structured third-party imports</p>
-          </div>
-        </div>
-        <p className="text-sm text-slate-400 leading-relaxed max-w-xl">
-          Populate the knowledge graph from curated databases. <strong className="text-slate-300">Open Targets</strong> provides gene-disease associations. <strong className="text-slate-300">PubMed</strong> pulls abstracts from NCBI.
-        </p>
-      </div>
+    <div className="space-y-8 max-w-3xl">
+      <header className="space-y-2">
+        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Ingest Sources</h1>
+        <p className="text-slate-600">Import structured data from Open Targets or PubMed.</p>
+      </header>
 
-      {/* Tab Switcher */}
-      <div className="flex gap-1 bg-[#080d1a] border border-white/[0.04] rounded-xl p-1">
+      <div className="inline-flex rounded-md border border-[#d0d7de] p-1 bg-white">
         {(['open-targets', 'pubmed'] as Tab[]).map((t) => (
-          <button key={t} onClick={() => setTab(t)}
-            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all duration-200 ${
-              tab === t ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-lg shadow-indigo-600/15' : 'text-slate-500 hover:text-slate-300'
-            }`}>
-            {t === 'open-targets' ? <><Database size={14} /> Open Targets</> : <><Search size={14} /> PubMed</>}
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`px-4 py-2 rounded-md text-sm font-medium transition flex items-center gap-2 ${tab === t ? 'bg-[#ddf4ff] text-[#0969da] border border-[#54aeff]' : 'text-slate-600 hover:text-slate-900'}`}
+          >
+            {t === 'open-targets' ? <Database size={14} /> : <Search size={14} />}
+            {t === 'open-targets' ? 'Open Targets' : 'PubMed'}
           </button>
         ))}
       </div>
 
-      {/* Open Targets form */}
-      {tab === 'open-targets' && (
-        <form onSubmit={submitOT} className="bg-gradient-to-b from-[#0f1829] to-[#0d1526] border border-white/[0.06] rounded-2xl p-8 space-y-6 shadow-xl shadow-black/20">
-          <Field label="Disease ID" required hint="Use EFO or MONDO identifiers from Open Targets">
-            <input required className={inputBase} value={diseaseId} onChange={(e) => setDiseaseId(e.target.value)} placeholder="EFO_0000275" />
+      {tab === 'open-targets' ? (
+        <form onSubmit={submitOT} className="surface p-6 space-y-5">
+          <Field label="Disease ID" hint="Use EFO or MONDO IDs">
+            <input required className={inputClass} value={diseaseId} onChange={(e) => setDiseaseId(e.target.value)} placeholder="EFO_0000275" />
           </Field>
-          <div className="grid grid-cols-2 gap-4">
-            <Field label="Max Associations" hint="Upper limit on results">
-              <input type="number" className={inputBase} value={maxAssoc} onChange={(e) => setMaxAssoc(e.target.value)} />
-            </Field>
-            <Field label="Min Score (0–1)" hint="Filter low-confidence links">
-              <input type="number" className={inputBase} value={minScore} onChange={(e) => setMinScore(e.target.value)} />
-            </Field>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Field label="Max Associations"><input className={inputClass} type="number" value={maxAssoc} onChange={(e) => setMaxAssoc(e.target.value)} /></Field>
+            <Field label="Min Score (0-1)"><input className={inputClass} type="number" value={minScore} onChange={(e) => setMinScore(e.target.value)} /></Field>
           </div>
-          <Field label="Tag" hint="Label this batch for tracking">
-            <input className={inputBase} value={otTag} onChange={(e) => setOtTag(e.target.value)} placeholder="e.g. cancer-2026" />
-          </Field>
-          <SubmitBtn loading={loading}>Run Open Targets Ingest</SubmitBtn>
+          <Field label="Tag" hint="Optional batch label"><input className={inputClass} value={otTag} onChange={(e) => setOtTag(e.target.value)} placeholder="cancer-2026" /></Field>
+          <button className="inline-flex items-center gap-2 px-4 py-2.5 rounded-md bg-[#2da44e] border border-[#2c974b] text-white font-medium hover:bg-[#2c974b] transition disabled:opacity-50" disabled={loading}>
+            {loading ? <><Loader2 size={14} className="animate-spin" /> Submitting</> : 'Run Open Targets Ingest'}
+          </button>
+        </form>
+      ) : (
+        <form onSubmit={submitPM} className="surface p-6 space-y-5">
+          <Field label="Query" hint="PubMed syntax supported"><input required className={inputClass} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="BRCA1 AND cancer" /></Field>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Field label="Max Articles"><input className={inputClass} type="number" value={maxArticles} onChange={(e) => setMaxArticles(e.target.value)} /></Field>
+            <Field label="Email"><input className={inputClass} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" /></Field>
+          </div>
+          <Field label="Tag" hint="Optional batch label"><input className={inputClass} value={pmTag} onChange={(e) => setPmTag(e.target.value)} placeholder="pubmed-brca" /></Field>
+          <button className="inline-flex items-center gap-2 px-4 py-2.5 rounded-md bg-[#2da44e] border border-[#2c974b] text-white font-medium hover:bg-[#2c974b] transition disabled:opacity-50" disabled={loading}>
+            {loading ? <><Loader2 size={14} className="animate-spin" /> Submitting</> : 'Run PubMed Ingest'}
+          </button>
         </form>
       )}
 
-      {/* PubMed form */}
-      {tab === 'pubmed' && (
-        <form onSubmit={submitPM} className="bg-gradient-to-b from-[#0f1829] to-[#0d1526] border border-white/[0.06] rounded-2xl p-8 space-y-6 shadow-xl shadow-black/20">
-          <Field label="Search Query" required hint="Standard PubMed syntax: AND/OR/NOT">
-            <input required className={inputBase} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="BRCA1 AND cancer" />
-          </Field>
-          <div className="grid grid-cols-2 gap-4">
-            <Field label="Max Articles" hint="Number of articles to download">
-              <input type="number" className={inputBase} value={maxArticles} onChange={(e) => setMaxArticles(e.target.value)} />
-            </Field>
-            <Field label="Email (NCBI)" hint="Required by NCBI for API access">
-              <input className={inputBase} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
-            </Field>
-          </div>
-          <Field label="Tag" hint="Label this batch for tracking">
-            <input className={inputBase} value={pmTag} onChange={(e) => setPmTag(e.target.value)} placeholder="e.g. pubmed-brca1" />
-          </Field>
-          <SubmitBtn loading={loading}>Run PubMed Ingest</SubmitBtn>
-        </form>
-      )}
-
-      {/* Status */}
-      {error && (
-        <div className="flex items-center gap-3 text-red-300 text-sm bg-red-500/[0.08] border border-red-500/15 rounded-xl px-5 py-4">
-          <XCircle size={16} />{error}
-        </div>
-      )}
+      {error && <div className="surface p-4 text-rose-700 text-sm flex items-center gap-2"><XCircle size={15} />{error}</div>}
       {jobStatus && (
-        <div className={`flex items-center gap-3 text-sm rounded-xl px-5 py-4 border ${
-          jobState === 'completed' ? 'bg-emerald-500/[0.08] border-emerald-500/15 text-emerald-300' :
-          jobState === 'failed'    ? 'bg-red-500/[0.08] border-red-500/15 text-red-300' :
-          'bg-indigo-500/[0.08] border-indigo-500/15 text-indigo-300'
-        }`}>
-          {jobState === 'completed' ? <CheckCircle2 size={16}/> : jobState === 'failed' ? <XCircle size={16}/> : <Loader2 size={16} className="animate-spin"/>}
+        <div className="surface p-4 text-sm flex items-center gap-2 text-slate-700">
+          {jobState === 'completed' ? <CheckCircle2 size={15} className="text-emerald-600" /> : jobState === 'failed' ? <XCircle size={15} className="text-rose-600" /> : <Loader2 size={15} className="animate-spin text-slate-500" />}
           {jobStatus}
         </div>
       )}
     </div>
-  );
-}
-
-function Field({ label, required, hint, children }: { label: string; required?: boolean; hint?: string; children: React.ReactNode }) {
-  return (
-    <div className="space-y-2">
-      <label className="block text-xs font-semibold text-slate-300 tracking-wide">
-        {label}
-        {required && <span className="text-indigo-400 ml-0.5">*</span>}
-        {!required && <span className="text-slate-600 font-normal ml-1">· optional</span>}
-      </label>
-      {hint && <p className="text-[11px] text-slate-600 -mt-1">{hint}</p>}
-      {children}
-    </div>
-  );
-}
-
-function SubmitBtn({ loading, children }: { loading: boolean; children: React.ReactNode }) {
-  return (
-    <button type="submit" disabled={loading}
-      className="group w-full flex items-center justify-center gap-2.5 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm font-semibold px-6 py-3.5 rounded-xl transition-all duration-200 shadow-lg shadow-indigo-600/20">
-      {loading ? <><Loader2 size={15} className="animate-spin"/>Submitting…</> : children}
-    </button>
   );
 }

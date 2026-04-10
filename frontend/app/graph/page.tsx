@@ -8,16 +8,16 @@ import { Activity } from 'lucide-react';
 const ForceGraph2D = dynamic(() => import('react-force-graph-2d'), { ssr: false });
 
 const TYPE_COLORS: Record<string, string> = {
-  GENE:     '#818cf8',
-  PROTEIN:  '#34d399',
-  DISEASE:  '#f87171',
-  DRUG:     '#fb923c',
-  PATHWAY:  '#a78bfa',
-  COMPOUND: '#fbbf24',
+  GENE: '#2563eb',
+  PROTEIN: '#0f766e',
+  DISEASE: '#b45309',
+  DRUG: '#7c3aed',
+  PATHWAY: '#0369a1',
+  COMPOUND: '#475569',
 };
 
 function entityColor(type: string): string {
-  return TYPE_COLORS[type.toUpperCase()] ?? '#475569';
+  return TYPE_COLORS[type.toUpperCase()] ?? '#64748b';
 }
 
 export default function GraphPage() {
@@ -30,57 +30,44 @@ export default function GraphPage() {
   }), [entData, relData]);
 
   const loading = entLoading || relLoading;
-  const legend = Object.entries(TYPE_COLORS);
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-white tracking-tight">Knowledge Graph</h1>
-          <p className="mt-1 text-sm text-slate-400">Interactive force-directed layout. Drag to pan, scroll to zoom, hover nodes for details.</p>
-        </div>
-        {!loading && (
-          <div className="flex gap-4 text-sm shrink-0">
-            <div className="text-center">
-              <p className="text-xl font-bold text-indigo-400">{graphData.nodes.length}</p>
-              <p className="text-xs text-slate-500">nodes</p>
-            </div>
-            <div className="text-center">
-              <p className="text-xl font-bold text-sky-400">{graphData.links.length}</p>
-              <p className="text-xs text-slate-500">edges</p>
-            </div>
-          </div>
-        )}
-      </div>
+      <header className="space-y-2">
+        <h1 className="text-2xl font-semibold text-slate-900 tracking-tight">Knowledge Graph</h1>
+        <p className="text-slate-600">Interactive graph view. Drag to move, scroll to zoom, hover nodes for labels.</p>
+      </header>
 
-      <div className="flex flex-wrap gap-2">
-        {legend.map(([type, color]) => (
-          <div key={type} className="flex items-center gap-1.5 px-2.5 py-1 bg-[#0d1526] border border-slate-800 rounded-full text-xs text-slate-400">
-            <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color }} />
-            {type.charAt(0) + type.slice(1).toLowerCase()}
-          </div>
-        ))}
-      </div>
-
-      {loading ? (
-        <div className="flex items-center justify-center h-[600px] bg-[#0d1526] border border-slate-800 rounded-2xl">
-          <div className="flex items-center gap-2 text-slate-500 text-sm"><Activity size={16} className="animate-pulse" /> Loading graph…</div>
+      {!loading && (
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(TYPE_COLORS).map(([type, color]) => (
+            <span key={type} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white border border-[#d0d7de] text-xs text-slate-700">
+              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: color }} />
+              {type}
+            </span>
+          ))}
         </div>
-      ) : (
-        <div className="rounded-2xl overflow-hidden border border-slate-800 bg-[#050c1a]">
+      )}
+
+      <div className="surface overflow-hidden">
+        {loading ? (
+          <div className="h-[620px] flex items-center justify-center text-slate-600 text-sm gap-2">
+            <Activity size={16} className="animate-pulse" /> Loading graph
+          </div>
+        ) : (
           <ForceGraph2D
             graphData={graphData}
             nodeLabel={(n: any) => `${n.name} (${n.type})`}
             nodeColor={(n: any) => n.color}
             linkLabel={(l: any) => l.label}
-            linkColor={() => '#1e293b'}
+            linkColor={() => '#94a3b8'}
             nodeRelSize={5}
-            width={typeof window !== 'undefined' ? window.innerWidth - 320 : 800}
-            height={600}
-            backgroundColor="#050c1a"
+            width={typeof window !== 'undefined' ? Math.max(window.innerWidth - 380, 700) : 900}
+            height={620}
+            backgroundColor="#ffffff"
           />
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

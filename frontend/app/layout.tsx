@@ -11,11 +11,11 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body>
+      <body className="min-h-screen bg-[#0a0f1e] text-slate-200 antialiased">
         <Providers>
           <div className="flex min-h-screen">
             <Nav />
-            <main className="flex-1 p-6 overflow-auto">{children}</main>
+            <main className="flex-1 p-8 lg:p-12 xl:p-16 overflow-auto">{children}</main>
           </div>
         </Providers>
       </body>

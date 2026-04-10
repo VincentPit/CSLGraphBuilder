@@ -2,16 +2,23 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getCurationQueue, submitCurationEvents, CurationQueueItem } from '@/lib/api';
 import { useState } from 'react';
+import { CheckCircle2, XCircle, Loader2, ClipboardList } from 'lucide-react';
 
-const STATUS_COLOR: Record<string, string> = {
-  rejected: 'text-red-400',
-  flagged: 'text-yellow-400',
-  unverified: 'text-slate-400',
+const STATUS_STYLE: Record<string, string> = {
+  rejected:   'text-red-400 bg-red-500/[0.08] border-red-500/15',
+  flagged:    'text-amber-400 bg-amber-500/[0.08] border-amber-500/15',
+  unverified: 'text-slate-400 bg-white/[0.03] border-white/[0.06]',
 };
 
 export default function CurationPage() {
   const qc = useQueryClient();
   const [filter, setFilter] = useState('');
+  const filters = [
+    { value: '',           label: 'All' },
+    { value: 'unverified', label: 'Unverified' },
+    { value: 'flagged',    label: 'Flagged' },
+    { value: 'rejected',   label: 'Rejected' },
+  ];
 
   const { data, isLoading } = useQuery({
     queryKey: ['curation-queue', filter],
@@ -24,53 +31,86 @@ export default function CurationPage() {
   });
 
   function act(item: CurationQueueItem, action: 'approve' | 'reject') {
-    const event = item.type === 'entity'
-      ? { entity_id: item.id, action }
-      : { relationship_id: item.id, action };
+    const event = item.type === 'entity' ? { entity_id: item.id, action } : { relationship_id: item.id, action };
     mutation.mutate([event as any]);
   }
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Curation Queue</h1>
+    <div className="max-w-5xl space-y-10">
+      {/* Header */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-2.5">
+          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-amber-500/20 to-orange-500/10 border border-amber-500/10 flex items-center justify-center">
+            <ClipboardList size={18} className="text-amber-400" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold text-white tracking-tight">Curation Queue</h1>
+            <p className="text-xs text-slate-500 font-medium">Review & approve extracted data</p>
+          </div>
+        </div>
+        <p className="text-sm text-slate-400 leading-relaxed max-w-xl">
+          Review entities and relationships flagged for human verification. Approve or reject each entry to curate the trusted graph.
+        </p>
+      </div>
 
-      <div className="flex gap-2">
-        {['', 'rejected', 'flagged', 'unverified'].map((s) => (
-          <button key={s} onClick={() => setFilter(s)}
-            className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${filter === s ? 'bg-sky-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`}>
-            {s || 'All'}
+      {/* Filters */}
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] text-slate-600 font-semibold uppercase tracking-wider mr-1">Filter</span>
+        {filters.map(({ value, label }) => (
+          <button key={value} onClick={() => setFilter(value)}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 ${
+              filter === value
+                ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 text-white shadow-lg shadow-indigo-600/15'
+                : 'bg-white/[0.03] border border-white/[0.06] text-slate-500 hover:text-slate-300 hover:border-white/[0.1]'
+            }`}>
+            {label}
           </button>
         ))}
       </div>
 
+      {/* Content */}
       {isLoading ? (
-        <p className="text-slate-400">Loading…</p>
+        <div className="flex items-center gap-2.5 text-slate-500 text-sm"><Loader2 size={14} className="animate-spin"/>Loading queue…</div>
       ) : (data?.items.length ?? 0) === 0 ? (
-        <p className="text-slate-500">Queue is empty.</p>
+        <div className="text-center py-20 bg-gradient-to-b from-[#0f1829] to-[#0d1526] border border-white/[0.06] rounded-2xl">
+          <CheckCircle2 size={36} className="text-emerald-500/60 mx-auto mb-4" />
+          <p className="text-white font-semibold text-[15px]">Queue is empty</p>
+          <p className="text-slate-500 text-sm mt-1.5">No items match this filter. Great work!</p>
+        </div>
       ) : (
-        <div className="overflow-x-auto">
+        <div className="bg-gradient-to-b from-[#0f1829] to-[#0d1526] border border-white/[0.06] rounded-2xl overflow-hidden">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-slate-400 border-b border-slate-700">
-                <th className="pb-2 pr-4">Type</th>
-                <th className="pb-2 pr-4">Name / Type</th>
-                <th className="pb-2 pr-4">Status</th>
-                <th className="pb-2 pr-4">Notes</th>
-                <th className="pb-2">Actions</th>
+              <tr className="border-b border-white/[0.04]">
+                <th className="text-left text-[10px] font-bold text-slate-600 uppercase tracking-widest px-6 py-4">Type</th>
+                <th className="text-left text-[10px] font-bold text-slate-600 uppercase tracking-widest px-6 py-4">Name / ID</th>
+                <th className="text-left text-[10px] font-bold text-slate-600 uppercase tracking-widest px-6 py-4">Status</th>
+                <th className="text-left text-[10px] font-bold text-slate-600 uppercase tracking-widest px-6 py-4">Notes</th>
+                <th className="text-left text-[10px] font-bold text-slate-600 uppercase tracking-widest px-6 py-4">Action</th>
               </tr>
             </thead>
             <tbody>
-              {data!.items.map((item) => (
-                <tr key={item.id} className="border-b border-slate-800 hover:bg-slate-800/50">
-                  <td className="py-2 pr-4 text-slate-400 capitalize">{item.type}</td>
-                  <td className="py-2 pr-4 text-slate-200">{item.name ?? item.relationship_type ?? item.id}</td>
-                  <td className={`py-2 pr-4 font-medium ${STATUS_COLOR[item.verification_status] ?? ''}`}>
-                    {item.verification_status}
+              {data!.items.map((item, i) => (
+                <tr key={item.id} className="border-b border-white/[0.03] hover:bg-white/[0.02] transition-colors">
+                  <td className="px-6 py-4">
+                    <span className="capitalize text-[11px] font-semibold bg-white/[0.04] border border-white/[0.06] text-slate-400 px-2.5 py-1 rounded-md">{item.type}</span>
                   </td>
-                  <td className="py-2 pr-4 text-slate-500 text-xs max-w-xs truncate">{item.notes}</td>
-                  <td className="py-2 flex gap-2">
-                    <Btn onClick={() => act(item, 'approve')} color="green">Approve</Btn>
-                    <Btn onClick={() => act(item, 'reject')} color="red">Reject</Btn>
+                  <td className="px-6 py-4 text-slate-200 font-medium">{item.name ?? item.relationship_type ?? item.id}</td>
+                  <td className="px-6 py-4">
+                    <span className={`text-[11px] font-semibold px-2.5 py-1 rounded-md border ${STATUS_STYLE[item.verification_status] ?? STATUS_STYLE.unverified}`}>
+                      {item.verification_status}
+                    </span>
+                  </td>
+                  <td className="px-6 py-4 text-slate-600 text-xs max-w-xs truncate">{item.notes ?? '—'}</td>
+                  <td className="px-6 py-4">
+                    <div className="flex gap-2">
+                      <button onClick={() => act(item, 'approve')} className="flex items-center gap-1.5 bg-emerald-500/[0.1] hover:bg-emerald-500/[0.2] text-emerald-400 border border-emerald-500/20 text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-all">
+                        <CheckCircle2 size={11}/> Approve
+                      </button>
+                      <button onClick={() => act(item, 'reject')} className="flex items-center gap-1.5 bg-red-500/[0.1] hover:bg-red-500/[0.2] text-red-400 border border-red-500/20 text-[11px] font-semibold px-3 py-1.5 rounded-lg transition-all">
+                        <XCircle size={11}/> Reject
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -80,9 +120,4 @@ export default function CurationPage() {
       )}
     </div>
   );
-}
-
-function Btn({ onClick, color, children }: { onClick: () => void; color: 'green' | 'red'; children: React.ReactNode }) {
-  const cls = color === 'green' ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-red-700 hover:bg-red-600';
-  return <button onClick={onClick} className={`${cls} text-white text-xs px-2 py-1 rounded transition-colors`}>{children}</button>;
 }

@@ -1,15 +1,20 @@
-data
-outputs
-errors
-record
-visited_links.txt
-ImageEmbed/images
-# GraphBuilder Enterprise
+# Secrets and local config
 .env
+.env.*
+!.env.example
 config/local.yaml
+
+# Logs and runtime data
 logs/
 *.log
+visited_links.txt
 backup_*/
+
+# Data and outputs
+data/
+outputs/
+errors/
+record/
 
 # Python
 __pycache__/
@@ -32,18 +37,39 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.venv/
+.venv*/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.DS_Store
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
+# Next.js / Node
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Docker
+*.override.yml
 
 # Documentation
 docs/_build/
+
+# Conda artifacts
+condaenv.*.requirements.txt
+*.conda

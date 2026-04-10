@@ -16,14 +16,14 @@ from datetime import datetime
 import hashlib
 from graphbuilder.infrastructure.database.neo4j_client import graphDBdataAccess
 from typing import List
-from graphbuilder.domain.entities.source_node import sourceNode
+from graphbuilder.domain.entities.source_node import SourceNode
 from langchain_text_splitters import TokenTextSplitter
-from langchain.docstore.document import Document
+from langchain_core.documents import Document
 from langchain_community.graphs import Neo4jGraph
 from graphbuilder.infrastructure.services.legacy_llm import generate_graphDocuments
 from graphbuilder.core.utils.common_functions import load_embedding_model, save_graphDocuments_in_neo4j,get_chunk_and_graphDocument,delete_uploaded_local_file, create_gcs_bucket_folder_name_hashed
 import shutil
-from local_file import get_documents_from_file_by_path
+from graphbuilder.infrastructure.crawlers.file_crawler import get_documents_from_file_by_path
 from langchain_community.document_loaders import WebBaseLoader
 import urllib.parse
 
@@ -295,7 +295,7 @@ def processing_source(graph, model, file_name, pages, allowedNodes, allowedRelat
   chunkId_chunkDoc_list = create_relation_between_chunks(graph,file_name,chunks)
   
   if result[0]['Status'] != 'Processing':      
-    obj_source_node = sourceNode()
+    obj_source_node = SourceNode()
     status = "Processing"
     obj_source_node.file_name = file_name
     obj_source_node.status = status
@@ -333,7 +333,7 @@ def processing_source(graph, model, file_name, pages, allowedNodes, allowedRelat
             end_time = datetime.now()
             processed_time = end_time - start_time
             
-            obj_source_node = sourceNode()
+            obj_source_node = SourceNode()
             obj_source_node.file_name = file_name
             obj_source_node.updated_at = end_time
             obj_source_node.processing_time = processed_time
@@ -350,7 +350,7 @@ def processing_source(graph, model, file_name, pages, allowedNodes, allowedRelat
     logging.info(f'Job Status at the end : {job_status}')
     end_time = datetime.now()
     processed_time = end_time - start_time
-    obj_source_node = sourceNode()
+    obj_source_node = SourceNode()
     obj_source_node.file_name = file_name
     obj_source_node.status = job_status
     obj_source_node.processing_time = processed_time
@@ -419,7 +419,7 @@ def create_source_node_graph_dfrobot_url(graph, model, source_url, source_type):
         message = f"Unable to read data for given url : {source_url}"
         raise Exception(message)
     try:
-        obj_source_node = sourceNode()
+        obj_source_node = SourceNode()
         obj_source_node.file_type = 'text'
         obj_source_node.file_source = source_type
         obj_source_node.model = model
@@ -478,7 +478,7 @@ def create_source_node_graph_json(graph, model, source_json_path):
         else:
             
             # Create and populate the source node
-            obj_source_node = sourceNode()
+            obj_source_node = SourceNode()
             obj_source_node.file_name = file_name
             obj_source_node.file_type = 'json' 
             obj_source_node.file_size = file_size

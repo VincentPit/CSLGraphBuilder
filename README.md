@@ -1,8 +1,6 @@
 # CSLGraphBuilder
 
-A knowledge graph construction pipeline for CSL Behring. Ingests documents (URLs, PDFs, JSON, plain text), extracts biomedical entities and relationships via LLM, and persists them into a Neo4j graph database. Designed to eventually layer in Open Targets API enrichment and a cascading relationship-verification pipeline.
-
-> **Status:** Core pipeline is functional via the legacy execution path. The new async architecture (`src/graphbuilder/`) is structurally complete but has broken imports that must be resolved before it can run end-to-end. Tests do not yet exist. See [Known Issues](#known-issues) and [Roadmap](#roadmap).
+An enterprise knowledge graph construction pipeline for CSL Behring. Ingests documents (URLs, PDFs, JSON, plain text), extracts biomedical entities and relationships via LLM, and persists them into a Neo4j graph database. Ships with a FastAPI backend, a Next.js 14 frontend, and Docker Compose for one-command deployment.
 
 ---
 
@@ -11,50 +9,51 @@ A knowledge graph construction pipeline for CSL Behring. Ingests documents (URLs
 1. [Architecture](#architecture)
 2. [Prerequisites](#prerequisites)
 3. [Quick Start](#quick-start)
-4. [Configuration](#configuration)
-5. [CLI Usage](#cli-usage)
-6. [Project Structure](#project-structure)
-7. [Module Responsibilities](#module-responsibilities)
-8. [Execution Paths](#execution-paths)
-9. [Known Issues](#known-issues)
-10. [Roadmap](#roadmap)
-11. [Contributing](#contributing)
+4. [Docker Deployment](#docker-deployment)
+5. [Configuration](#configuration)
+6. [CLI Usage](#cli-usage)
+7. [REST API](#rest-api)
+8. [Project Structure](#project-structure)
+9. [Module Responsibilities](#module-responsibilities)
+10. [Contributing](#contributing)
 
 ---
 
 ## Architecture
 
 ```
-Input (URL / File / Text)
+Input (URL / File / Text / Open Targets API / PubMed)
         │
         ▼
 ContentExtractorService          ← aiohttp, BeautifulSoup, PyMuPDF, UnstructuredFileLoader
         │
         ▼
-Chunking (TokenTextSplitter)     ← chunk_size=200, overlap=20
+Chunking (TokenTextSplitter)     ← configurable chunk_size + overlap
         │
         ▼
 Chunk Graph (Neo4j)              ← SHA-1 IDs; FIRST_CHUNK / NEXT_CHUNK linked list
         │
         ▼
-LLM Extraction                   ← AzureOpenAI / OpenAI (JSON-mode)
-  ├── Entity extraction           ← type, name, description, confidence
-  └── Relationship extraction     ← source, target, type, confidence
+LLM Extraction (LLMGraphTransformer)
+  ├── allowed_nodes filter        ← restrict extracted node types (optional)
+  ├── allowed_relationships filter← restrict extracted relationship types (optional)
+  └── strict_mode                 ← reject entities not in allowed lists
         │
         ▼
 Neo4j Knowledge Graph
   Document → [:FIRST_CHUNK] → Chunk → [:NEXT_CHUNK] → Chunk
   Chunk    → [:HAS_ENTITY]  → Entity
   Entity   → [:REL_TYPE]    → Entity
-
-── Planned ──────────────────────────────────────────
-Verification Pipeline (not yet implemented)
-  1. Text/pattern match
-  2. Embedding similarity (sentence-transformers)
-  3. LLM reasoning
-  → Cascading: stop at first pass; reject only if all three fail
-
-Open Targets API Enrichment (not yet implemented)
+  Chunk.embedding            ← float[] vector, native Neo4j vector index (cosine)
+        │
+        ▼
+Relationship Verification Pipeline (cascading, stops at first pass)
+  Stage 1 — TextMatchVerifier     ← regex / exact string pattern match
+  Stage 2 — EmbeddingVerifier     ← cosine similarity (sentence-transformers)
+  Stage 3 — LLMVerifier           ← structured LLM prompt with reasoning trace
+        │
+        ▼
+REST API (FastAPI)  ←→  Next.js 14 Frontend (React, Tailwind, react-force-graph-2d)
 ```
 
 ---
@@ -63,69 +62,81 @@ Open Targets API Enrichment (not yet implemented)
 
 | Requirement | Version | Notes |
 |---|---|---|
-| Python | 3.10+ | Tested on 3.10.16 (conda env `graph`) |
-| Neo4j | 5.x | Local or remote; Bolt protocol |
-| Azure OpenAI **or** OpenAI | — | GPT-4o recommended |
-| conda **or** pip | — | `environment.yml` or `requirements.txt` |
+| Python | 3.10+ | venv recommended |
+| Neo4j | 5.x | required for graph storage and vector search |
+| OpenAI **or** Azure OpenAI | — | GPT-4o recommended |
+| Node.js | 18+ | for local frontend development |
+| Docker + Docker Compose | — | for containerised deployment |
 
 ---
 
 ## Quick Start
 
-**1. Clone and create the environment**
+**1. Clone and install**
 
 ```bash
 git clone <repo-url>
 cd CSLGraphBuilder
 
-# Option A — conda
-conda env create -f environment.yml
-conda activate graph
-
-# Option B — pip + venv
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-**2. Configure environment variables**
+**2. Configure environment**
 
 ```bash
-cp .env.example .env   # template provided below; create this file manually for now
+cp .env.example .env
+# Edit .env with your Neo4j and LLM credentials
 ```
 
-Edit `.env` — at minimum you need Neo4j connection and an LLM key (see [Configuration](#configuration)).
-
-**3. Verify Neo4j is reachable**
+**3. Process a document**
 
 ```bash
-python -c "
-from graphbuilder.infrastructure.config.settings import GraphBuilderConfig
-from graphbuilder.core.utils.common_functions import create_graph_database_connection
-cfg = GraphBuilderConfig()
-g = create_graph_database_connection(cfg.database.uri, cfg.database.username, cfg.database.password)
-print('Connected:', g)
-"
-```
-
-**4. Process your first document**
-
-```bash
-# Process a URL
+# Single URL
 graphbuilder process --url https://example.com/article --title "My Article"
 
-# Process a local PDF
-graphbuilder process --file /path/to/document.pdf --title "Research Paper"
+# Local PDF
+graphbuilder process --file /path/to/paper.pdf --title "Research Paper"
 
-# Batch-process a directory
-graphbuilder batch --input-dir ./data/docs --pattern "*.pdf"
+# Restrict what the LLM may extract
+graphbuilder process --url https://... \
+  --allowed-nodes Gene Disease Drug \
+  --allowed-relationships ASSOCIATED_WITH TREATS
 ```
+
+**4. Verify relationships**
+
+```bash
+graphbuilder verify --method cascading --context-file context.txt
+```
+
+---
+
+## Docker Deployment
+
+```bash
+# Start Neo4j + API + Frontend (default)
+docker compose up -d
+
+# Add nginx reverse proxy
+docker compose --profile nginx up -d
+```
+
+| Service | Port | Description |
+|---|---|---|
+| `neo4j` | 7474 / 7687 | Neo4j database |
+| `api` | 8000 | FastAPI backend |
+| `frontend` | 3000 | Next.js frontend |
+| `nginx` *(optional)* | 80 | Reverse proxy (`/api/*` → api, `/*` → frontend) |
+
+Health check: `GET http://localhost:8000/health` → `{"status":"ok"}`
 
 ---
 
 ## Configuration
 
-All settings are read from environment variables (loaded from `.env` via `python-dotenv`). A config file (`--config`) in JSON/YAML format can override any value.
+All settings are read from environment variables (loaded from `.env` via `python-dotenv`).
 
 ### Neo4j
 
@@ -135,48 +146,42 @@ All settings are read from environment variables (loaded from `.env` via `python
 | `NEO4J_USER` | `neo4j` | Username |
 | `NEO4J_PASSWORD` | *(required)* | Password |
 | `NEO4J_DATABASE` | `neo4j` | Database name |
-| `NEO4J_MAX_POOL_SIZE` | `50` | Connection pool size |
-| `NEO4J_CONNECTION_TIMEOUT` | `30` | Seconds |
-| `NEO4J_ENCRYPTED` | `false` | Enable TLS |
 
 ### LLM
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `azure_openai` | `openai` \| `azure_openai` \| `huggingface` \| `local` |
+| `LLM_PROVIDER` | `azure_openai` | `openai` \| `azure_openai` |
 | `LLM_MODEL_NAME` | `gpt-4o` | Model or Azure deployment name |
 | `LLM_API_KEY` | *(required)* | API key |
 | `LLM_API_ENDPOINT` | *(required for Azure)* | `https://<resource>.openai.azure.com` |
 | `LLM_API_VERSION` | `2024-02-01` | Azure API version |
 | `LLM_TEMPERATURE` | `0.1` | Generation temperature |
 | `LLM_MAX_TOKENS` | `4096` | Max output tokens |
-| `LLM_MAX_RETRIES` | `3` | Retry attempts on failure |
-| `LLM_REQUESTS_PER_MINUTE` | `60` | Rate limit |
+
+### Embeddings
+
+| Variable | Default | Description |
+|---|---|---|
+| `IS_EMBEDDING` | `false` | Enable chunk embedding persistence |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name, or `openai` / `vertexai` |
+
+When `IS_EMBEDDING=true`, each `Chunk` node gets an `embedding` float-array property and Neo4j creates a native `VECTOR INDEX` (cosine similarity) over it.
 
 ### Processing
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROCESSING_CHUNK_SIZE` | `512` | Token chunk size (new path) |
+| `PROCESSING_CHUNK_SIZE` | `512` | Token chunk size |
 | `PROCESSING_CHUNK_OVERLAP` | `50` | Token overlap between chunks |
-| `NUMBER_OF_CHUNKS_TO_COMBINE` | `5` | Chunks per LLM extraction call (legacy) |
-| `NUMBER_OF_CHUNKS_ALLOWED` | `1000` | Max chunks per document |
+| `DATABASE_PROVIDER` | `in_memory` | `in_memory` \| `neo4j` |
 
-### Crawler
-
-| Variable | Default | Description |
-|---|---|---|
-| `CRAWLER_MAX_URLS` | `100` | Max URLs per crawl job |
-| `CRAWLER_MAX_WORKERS` | `10` | Concurrent crawl workers |
-| `CRAWLER_REQUEST_DELAY` | `1.0` | Seconds between requests |
-
-### Other
+### API Server
 
 | Variable | Default | Description |
 |---|---|---|
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformer model name, or `openai` / `vertexai` |
-| `APP_ENVIRONMENT` | `development` | `development` \| `production` |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `API_KEY` | *(unset = open)* | When set, all requests must include `X-API-Key: <value>` |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
 
 ### Minimal `.env` template
 
@@ -194,6 +199,8 @@ LLM_API_ENDPOINT=https://<resource>.openai.azure.com
 LLM_API_VERSION=2024-02-01
 
 # Processing
+DATABASE_PROVIDER=neo4j
+IS_EMBEDDING=true
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 LOG_LEVEL=INFO
 ```
@@ -205,34 +212,122 @@ LOG_LEVEL=INFO
 ```
 graphbuilder [OPTIONS] COMMAND [ARGS]
 
-Options:
-  --config PATH     Path to JSON/YAML config file
-  --verbose         Enable verbose logging
-  --log-file PATH   Write logs to file
-
 Commands:
   process    Process a single document (URL, file, or raw text)
-  batch      Batch-process all documents in a directory
-  crawl      Recursively crawl a website and ingest pages
-  status     Check the processing status of a document
-  optimize   Run graph optimization pass (deduplication, index tuning)
+  ingest     Ingest from external sources (Open Targets, PubMed)
+  verify     Run relationship verification pipeline
+  curate     Apply manual curation events to the graph
+  visualize  Export graph to HTML / JSON / GraphML / Cytoscape
 ```
 
-**Examples**
+### `process`
 
 ```bash
-# Single URL
-graphbuilder process --url https://example.com --title "Source Article"
+graphbuilder process --url <url> --title <title>
+graphbuilder process --file <path> --title <title>
+graphbuilder process --text "raw text content" --title <title>
 
-# Local file, extract entities only
-graphbuilder process --file report.pdf --no-extract-relationships
-
-# Batch PDF ingest, 5 concurrent workers
-graphbuilder batch --input-dir ./data --pattern "*.pdf" --max-concurrent 5
-
-# Check status of a named document
-graphbuilder status --title "Source Article"
+# Optional schema constraints
+--allowed-nodes Gene Disease Drug            # repeatable
+--allowed-relationships ASSOCIATED_WITH      # repeatable
+--chunk-size 512
+--chunk-overlap 50
 ```
+
+### `ingest`
+
+```bash
+# Open Targets
+graphbuilder ingest --source open-targets --disease-id EFO_0000400
+
+# PubMed
+graphbuilder ingest --source pubmed --query "FVIII hemophilia" --max-results 50
+```
+
+### `verify`
+
+```bash
+graphbuilder verify --method cascading --context-file context.txt
+graphbuilder verify --method text-match
+graphbuilder verify --method embedding --threshold 0.6
+```
+
+### `visualize`
+
+```bash
+graphbuilder visualize --format html --output graph.html
+graphbuilder visualize --format json --output graph.json
+graphbuilder visualize --format graphml --output graph.graphml
+```
+
+---
+
+## REST API
+
+Base URL: `http://localhost:8000`
+
+All endpoints accept/return JSON. Protect with `X-API-Key` header when `API_KEY` env var is set.
+
+### Health
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Liveness check |
+| GET | `/health/ready` | Readiness check (config loaded) |
+
+### Documents
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/documents/process` | Ingest a document (background job, returns job ID) |
+| GET | `/documents/jobs/{id}` | Poll job status |
+| GET | `/documents/jobs/{id}/stream` | SSE stream of job progress |
+| GET | `/documents` | List ingested documents |
+
+**`POST /documents/process` body:**
+```json
+{
+  "url": "https://...",
+  "title": "Optional title",
+  "tags": ["biomedical"],
+  "chunk_size": 512,
+  "chunk_overlap": 50
+}
+```
+
+### Graph
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/graph/stats` | Entity and relationship counts |
+| GET | `/graph/entities` | List entities (filterable by type) |
+| GET | `/graph/relationships` | List relationships |
+
+### Ingest
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/ingest/open-targets` | Open Targets disease/gene enrichment |
+| POST | `/ingest/pubmed` | PubMed article ingestion |
+
+### Curation
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/curation/events` | Submit batch curation events |
+| GET | `/curation/queue` | View pending curation events |
+
+### Verification
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/verification/run` | Run cascading verification on all relationships |
+
+### Export
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/export?format=json` | Export graph (json \| cytoscape \| graphml \| html) |
 
 ---
 
@@ -240,165 +335,76 @@ graphbuilder status --title "Source Article"
 
 ```
 CSLGraphBuilder/
-├── src/graphbuilder/              # Installable package (v2.0.0)
-│   ├── cli/main.py                # CLI entry point (Click + Rich)
-│   ├── application/
-│   │   ├── cli/                   # Migrated legacy entry-point scripts
-│   │   ├── dto/                   # (empty — DTOs not yet created)
-│   │   └── use_cases/
-│   │       └── document_processing.py   # ProcessDocumentUseCase, BatchProcessDocumentsUseCase
+├── api/                           # FastAPI application
+│   ├── main.py                    # App factory, CORS, router registration
+│   ├── auth.py                    # X-API-Key guard
+│   ├── dependencies.py            # FastAPI Depends() factories
+│   ├── job_store.py               # In-memory background job tracker
+│   ├── routers/                   # health, graph, documents, ingest, curation, verification, export
+│   └── schemas/                   # Pydantic request/response models
+├── frontend/                      # Next.js 14 frontend
+│   ├── app/
+│   │   ├── page.tsx               # Dashboard
+│   │   ├── graph/                 # Interactive graph viewer (react-force-graph-2d)
+│   │   ├── process/               # Document ingestion form
+│   │   ├── ingest/                # Open Targets / PubMed ingestion
+│   │   ├── curation/              # Manual curation queue
+│   │   ├── verification/          # Verification report viewer
+│   │   └── export/                # Graph export
+│   ├── components/
+│   │   ├── Nav.tsx                # Sidebar navigation
+│   │   └── Providers.tsx          # React Query provider
+│   └── lib/api.ts                 # Typed API client
+├── src/graphbuilder/              # Installable Python package
+│   ├── cli/main.py                # Click CLI entry point
+│   ├── application/use_cases/     # ProcessDocument, Ingest, Verify, Curate, Visualize
 │   ├── core/
-│   │   ├── graph/transformer.py         # LLMGraphTransformer (few-shot → GraphDocument)
-│   │   ├── processing/processor.py      # Chunking + FIRST/NEXT_CHUNK graph construction
-│   │   ├── schema/extraction.py         # Structured LLM output for node labels + rel types
-│   │   └── utils/
-│   │       ├── common_functions.py      # DB connection, embedding loader, graph write helpers
-│   │       └── constants.py             # MODEL_VERSIONS, prompt templates, thresholds
+│   │   ├── graph/transformer.py   # LLMGraphTransformer (allowed_nodes/rels, strict_mode)
+│   │   ├── processing/processor.py# Chunking, FIRST/NEXT_CHUNK graph, vector index
+│   │   ├── schema/extraction.py   # Structured schema extraction from LLM
+│   │   ├── verification/          # TextMatch → Embedding → LLM cascading verifiers
+│   │   └── utils/                 # common_functions, constants, visualization
 │   ├── domain/
-│   │   ├── entities/source_node.py      # SourceNode dataclass (status/type enums)
-│   │   └── models/
-│   │       ├── graph_models.py          # GraphEntity, GraphRelationship, KnowledgeGraph
-│   │       └── processing_models.py     # ProcessingTask, ProcessingPipeline, ProcessingResult
+│   │   ├── entities/              # SourceNode, UserCredential
+│   │   └── models/                # GraphEntity, GraphRelationship, KnowledgeGraph, ProcessingResult
 │   └── infrastructure/
-│       ├── config/settings.py           # GraphBuilderConfig (7 sub-configs, env-var driven)
-│       ├── crawlers/                    # web_crawler, sync_crawler, json_crawler, file_crawler
-│       ├── database/neo4j_client.py     # graphDBdataAccess (legacy LangChain wrapper)
-│       ├── repositories/                # Neo4jDocumentRepository, Neo4jGraphRepository (async)
-│       └── services/
-│           ├── llm_service.py           # AdvancedLLMService (async, OpenAI + Azure)
-│           ├── legacy_llm.py            # generate_graphDocuments (AzureChatOpenAI, LangChain)
-│           └── content_extractor.py     # AdvancedContentExtractorService (multi-format)
-├── legacy/                        # Pre-migration flat-file codebase (reference only)
+│       ├── config/settings.py     # GraphBuilderConfig (env-var driven)
+│       ├── crawlers/              # web, sync, json, file crawlers
+│       ├── database/neo4j_client.py
+│       ├── external/              # open_targets_client, pubmed_client
+│       ├── repositories/          # Neo4j + in-memory document/graph repositories
+│       └── services/              # llm_service, content_extractor, legacy_llm
 ├── tests/
-│   ├── unit/                      # (empty)
-│   ├── integration/               # (empty)
-│   └── e2e/                       # (empty)
-├── data/                          # Sample and test data (empty)
-├── docs/                          # Documentation
+│   ├── unit/                      # 130 unit tests (all passing)
+│   ├── integration/
+│   └── e2e/
+├── Dockerfile.api
+├── Dockerfile.frontend
+├── docker-compose.yml
+├── nginx.conf
 ├── pyproject.toml
-├── requirements.txt
-└── environment.yml
+└── requirements.txt
 ```
 
 ---
 
 ## Module Responsibilities
 
-| Module | Responsibility | External deps allowed? |
+| Layer | Responsibility | Allowed dependencies |
 |---|---|---|
-| `cli/` | Argument parsing and output formatting only. No business logic. | Click, Rich |
-| `application/use_cases/` | Orchestrates the full pipeline. Calls services and repositories via interfaces. No direct DB or API calls. | None |
-| `core/` | Pure domain algorithms: chunking, graph transformation, schema extraction. Stateless. | LangChain (graph transformer only) |
+| `cli/` | Argument parsing and output only. No business logic. | Click, Rich |
+| `api/` | HTTP transport, request validation, async job dispatch. | FastAPI, Pydantic |
+| `application/use_cases/` | Orchestrates the full pipeline via interfaces. No direct I/O. | None (calls domain interfaces) |
+| `core/` | Pure domain algorithms: chunking, graph transformation, schema extraction, verification. Stateless. | LangChain (transformer only) |
 | `domain/` | Data models and repository interfaces. No implementation. | Pydantic |
-| `infrastructure/` | All external integrations: Neo4j, LLM APIs, crawlers, file parsers, embeddings. Implements domain interfaces. | All external libs |
-
----
-
-## Execution Paths
-
-There are currently two working execution paths. The intent is to converge on the **new path** once broken imports are fixed.
-
-### Legacy path (battle-tested, functional)
-
-Entry points: `legacy/scripts/main_*.py` or `application/cli/legacy_*_main.py`
-
-```
-Input → sync/async crawlers → CreateChunksofDocument
-      → generate_graphDocuments() [LLMGraphTransformer + AzureChatOpenAI]
-      → save_graphDocuments_in_neo4j() [graphDBdataAccess]
-```
-
-Limitations: synchronous in places, hardcoded Azure OpenAI only, no retry/rate-limit logic.
-
-### New path (async, partially broken)
-
-Entry point: `graphbuilder process` / `graphbuilder batch` CLI
-
-```
-Input → AdvancedContentExtractorService
-      → ProcessDocumentUseCase
-      → AdvancedLLMService [async OpenAI / Azure]
-      → Neo4jDocumentRepository + Neo4jGraphRepository
-```
-
-Currently blocked by three broken import paths (see [Known Issues](#known-issues)).
-
----
-
-## Known Issues
-
-These must be resolved before the new execution path can run:
-
-1. **`core/schema/extraction.py`** — imports `from src.llm import get_llm`. Should import from `graphbuilder.infrastructure.services.legacy_llm`.
-
-2. **`core/processing/processor.py`** — bare import `from local_file import ...`. Should be `from graphbuilder.infrastructure.crawlers.file_crawler import ...`.
-
-3. **`infrastructure/services/legacy_llm.py`** — imports `from graphTransformer import LLMGraphTransformer`. Should be `from graphbuilder.core.graph.transformer import LLMGraphTransformer`.
-
-4. **`infrastructure/crawlers/web_crawler.py`** — domain filter is hardcoded to `dfrobot`. Must be made configurable before it can be used on any other source.
-
-5. **`tests/`** — all test directories are empty. There is no test coverage.
-
-6. **`application/dto/`** and **`domain/repositories/`** — empty; repository interfaces intended for `domain/` were placed directly in `infrastructure/` instead.
-
----
-
-## Roadmap
-
-Priorities are ordered by blocking impact.
-
-### P0 — Fix broken imports (unblocks new execution path)
-
-- Fix the three import errors in `core/schema/extraction.py`, `core/processing/processor.py`, and `infrastructure/services/legacy_llm.py`
-- Add a smoke test to CI that imports all package modules
-
-### P1 — Test coverage
-
-- Unit tests for `core/processing/processor.py` (chunking logic, chunk-link graph)
-- Unit tests for `core/graph/transformer.py` (LLM output → GraphDocument)
-- Integration test for `ProcessDocumentUseCase` (document → Neo4j write) with a mock Neo4j or test instance
-- Integration test for `AdvancedLLMService` with a mock OpenAI client
-
-### P2 — Relationship verification pipeline
-
-Implement the cascading verifier in `core/` with a clean interface:
-
-```
-verify_relationship(rel: GraphRelationship, context: str) -> VerificationResult
-  1. TextMatchVerifier     — regex / exact string match
-  2. EmbeddingVerifier     — cosine similarity via sentence-transformers; configurable threshold
-  3. LLMVerifier           — structured LLM prompt with reasoning trace
-```
-
-- Each verifier is independently testable
-- `VerificationResult` includes which stage passed and a confidence score
-- Thresholds configurable via `infrastructure/config/settings.py`
-
-### P3 — Open Targets API ingestion
-
-- Add `infrastructure/external/open_targets_client.py` (GraphQL API wrapper)
-- Create `application/use_cases/open_targets_ingestion.py`
-- Add `graphbuilder ingest --source open-targets --disease-id EFO_XXXX` CLI command
-
-### P4 — Configurability and hardening
-
-- Make `web_crawler.py` domain-agnostic (pass allowed domains via config)
-- Add structured JSON logging to `infrastructure/logging/`
-- Add Dockerfile and docker-compose (Neo4j + app)
-- Add `.env.example` to repo
-
-### P5 — Future directions
-
-- PubMed and internal dataset ingestion
-- Manual curation / feedback loop
-- Visualization tooling
+| `infrastructure/` | All external integrations: Neo4j, LLM APIs, crawlers, file parsers, embeddings. | All external libs |
 
 ---
 
 ## Contributing
 
 1. Fork the repo and create a feature branch from `main`.
-2. Run `pip install -e ".[dev]"` and ensure `black`, `isort`, and `mypy` pass before submitting.
+2. Run `pip install -e ".[dev]"` and confirm `python -m pytest tests/ -q` passes.
 3. All new business logic in `core/` and `application/` must have unit tests in `tests/unit/`.
-4. Follow the module responsibility boundaries in the table above — no direct DB or API calls from `core/`.
+4. Follow the module responsibility boundaries above — no direct DB or API calls from `core/`.
 5. Secrets must never be committed; use `.env` (gitignored).

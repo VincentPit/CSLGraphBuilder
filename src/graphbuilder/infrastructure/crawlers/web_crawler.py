@@ -1,95 +1,228 @@
 """
-Web Crawler - Migrated from webpage_retriever.py
+Web Crawler - Domain-agnostic async crawler.
 
-This module has been migrated to the new GraphBuilder enterprise structure.
-Original functionality is preserved with improved organization and standards.
+Allowed domains, URL limits, request delay, and user-agent are all driven by
+``CrawlerConfiguration`` so the crawler has no hard-coded domain knowledge.
 
-Migration Date: 2025-10-31
-Original File: webpage_retriever.py
-New Location: src/graphbuilder/infrastructure/crawlers/web_crawler.py
+Typical usage::
+
+    config = get_config()
+    crawler = WebCrawler(config.crawler)
+    pages = await crawler.crawl(start_urls=["https://example.com/"])
 """
 
 import asyncio
-import aiohttp
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 import logging
 import os
+from typing import Dict, List, Optional, Set
+from urllib.parse import urljoin, urlparse
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+import aiohttp
+from bs4 import BeautifulSoup
 
-# File to store visited links
-VISITED_FILE = 'visited_links.txt'
+from ..config.settings import CrawlerConfiguration
 
-# Set up visited set (this will store visited URLs)
-visited = set()
 
-async def extract_links(url):
+class WebCrawler:
+    """
+    Domain-agnostic async web crawler driven by ``CrawlerConfiguration``.
+
+    Parameters
+    ----------
+    config:
+        ``CrawlerConfiguration`` instance.  All filtering (allowed domains,
+        URL limit, delay, user-agent) is read from this object.
+    visited_file:
+        Optional path to a file that persists visited URLs across runs.
+        Pass ``None`` (default) to keep state in-memory only.
+    """
+
+    def __init__(
+        self,
+        config: CrawlerConfiguration,
+        visited_file: Optional[str] = None,
+    ) -> None:
+        self.config = config
+        self.visited_file = visited_file
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self._visited: Set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def crawl(
+        self,
+        start_urls: List[str],
+        extra_allowed_domains: Optional[List[str]] = None,
+    ) -> Dict[str, str]:
+        """
+        Crawl from *start_urls* up to ``config.max_urls`` pages.
+
+        Domain filtering uses ``config.allowed_domains``.  When that list is
+        empty *and* ``extra_allowed_domains`` is also empty, ALL domains found
+        via link extraction are followed (open crawl).  Pass either to
+        restrict the crawl.
+
+        Parameters
+        ----------
+        start_urls:
+            Seed URLs.
+        extra_allowed_domains:
+            Additional domains to allow on top of ``config.allowed_domains``.
+            Useful for ad-hoc CLI invocations without changing config files.
+
+        Returns
+        -------
+        dict
+            Mapping ``url → page_text`` for every successfully fetched page.
+        """
+        allowed = set(
+            d.strip().lower()
+            for d in (self.config.allowed_domains or [])
+            if d.strip()
+        )
+        if extra_allowed_domains:
+            allowed.update(d.strip().lower() for d in extra_allowed_domains if d.strip())
+
+        blocked = set(
+            d.strip().lower()
+            for d in (self.config.blocked_domains or [])
+            if d.strip()
+        )
+
+        if self.visited_file:
+            self._visited = _load_visited(self.visited_file)
+        else:
+            self._visited = set()
+
+        pages: Dict[str, str] = {}
+        queue: List[str] = list(start_urls)
+
+        headers = {"User-Agent": self.config.user_agent}
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout)
+
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            while queue and len(self._visited) < self.config.max_urls:
+                url = queue.pop(0)
+
+                if url in self._visited:
+                    continue
+
+                if not self._is_allowed(url, allowed, blocked):
+                    self.logger.debug("Skipping (domain filter): %s", url)
+                    continue
+
+                text = await self._fetch_text(session, url)
+                if text is None:
+                    continue
+
+                self._visited.add(url)
+                pages[url] = text
+                self.logger.info(
+                    "Crawled %s  (%d/%d)", url, len(self._visited), self.config.max_urls
+                )
+
+                new_links = _extract_links(text, url)
+                for link in new_links:
+                    if link not in self._visited and link not in queue:
+                        queue.append(link)
+
+                await asyncio.sleep(self.config.request_delay)
+
+        if self.visited_file:
+            _save_visited(self.visited_file, self._visited)
+
+        self.logger.info("Crawl finished. %d pages collected.", len(pages))
+        return pages
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _is_allowed(self, url: str, allowed: Set[str], blocked: Set[str]) -> bool:
+        """Return True if *url* passes the domain allow/block filters."""
+        host = urlparse(url).hostname or ""
+        host = host.lower().lstrip("www.")
+
+        if any(host == b or host.endswith("." + b) for b in blocked):
+            return False
+
+        if not allowed:
+            return True  # open crawl
+
+        return any(host == a or host.endswith("." + a) for a in allowed)
+
+    async def _fetch_text(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> Optional[str]:
+        """Fetch *url* and return its text, or ``None`` on error."""
+        try:
+            async with session.get(
+                url,
+                max_redirects=self.config.max_redirects,
+                allow_redirects=True,
+            ) as response:
+                content_type = response.headers.get("Content-Type", "")
+                if not any(
+                    ct in content_type
+                    for ct in self.config.allowed_content_types
+                ):
+                    self.logger.debug(
+                        "Skipping unsupported content-type '%s': %s", content_type, url
+                    )
+                    return None
+
+                content_length = int(response.headers.get("Content-Length", 0))
+                if content_length > self.config.max_file_size:
+                    self.logger.debug(
+                        "Skipping oversized response (%d bytes): %s",
+                        content_length,
+                        url,
+                    )
+                    return None
+
+                return await response.text(errors="replace")
+
+        except asyncio.TimeoutError:
+            self.logger.warning("Timeout fetching: %s", url)
+        except aiohttp.ClientError as exc:
+            self.logger.error("HTTP error fetching %s: %s", url, exc)
+        except Exception as exc:
+            self.logger.error("Unexpected error fetching %s: %s", url, exc)
+
+        return None
+
+
+# ------------------------------------------------------------------
+# Module-level helpers (no domain knowledge)
+# ------------------------------------------------------------------
+
+
+def _extract_links(html: str, base_url: str) -> List[str]:
+    """Parse *html* and return all absolute href links."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                return [urljoin(url, a.get('href')) for a in soup.find_all('a') if a.get('href')]
-    except Exception as e:
-        logging.error(f"Error fetching {url}: {e}")
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"].strip()
+            if href and not href.startswith(("#", "javascript:", "mailto:")):
+                links.append(urljoin(base_url, href))
+        return links
+    except Exception:
         return []
 
-async def recursive_crawl(url, limit, delay=0.05):  # Be nice to the server
-    if url in visited:
-        return
 
-    if len(visited) >= limit:
-        logging.info(f"Reached the limit of {limit} links. Stopping crawl.")
-        return
-
-    if 'dfrobot' not in url:
-        logging.info(f"Skipping URL without keyword: {url}")
-        return
-
-    visited.add(url)
-    logging.info(f"Processing: {url} (Visited: {len(visited)})")
-    links = await extract_links(url)
-    for link in links:
-        if len(visited) >= limit:
-            break  # Stop if the limit is reached
-        await asyncio.sleep(delay)  # Be nice to the server
-        await recursive_crawl(link, limit)
-
-def load_visited_links():
-    """Load previously visited links from a file."""
-    if os.path.exists(VISITED_FILE):
-        with open(VISITED_FILE, 'r') as f:
-            return set(f.read().splitlines())
+def _load_visited(path: str) -> Set[str]:
+    """Load visited URLs from *path*; return empty set if file absent."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            return set(line.strip() for line in fh if line.strip())
     return set()
 
-def save_visited_links():
-    """Save visited links to a file."""
-    with open(VISITED_FILE, 'w') as f:
-        for link in visited:
-            f.write(link + '\n')
 
-if __name__ == "__main__":
-    start_url = "https://www.dfrobot.com.cn/"
-    crawl_limit = 1000 # Set a limit on how many links you want to crawl
-    start_urls = [
-        "https://www.dfrobot.com.cn/", 
-        "https://makelog.dfrobot.com.cn/", 
-        "https://mc.dfrobot.com.cn/", 
-        "https://www.dfrobot.com.cn/index.php", 
-        "https://wiki.dfrobot.com.cn/"
-    ]
-    
-    
-    # Load previously visited links
-    visited = load_visited_links()
-    logging.info(f"Loaded {len(visited)} previously visited links.")
-    for start_url in start_urls:
-        logging.info(f"Starting crawl at {start_url}")
-        asyncio.run(recursive_crawl(start_url, crawl_limit))
-
-    # Save the visited links to a file
-    save_visited_links()
-    
-    logging.info(f"Crawl completed. {len(visited)} links found.")
+def _save_visited(path: str, visited: Set[str]) -> None:
+    """Persist *visited* URLs to *path*."""
+    with open(path, "w", encoding="utf-8") as fh:
+        for url in sorted(visited):
+            fh.write(url + "\n")

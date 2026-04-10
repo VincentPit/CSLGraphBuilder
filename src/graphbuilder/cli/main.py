@@ -22,7 +22,25 @@ from ..infrastructure.services.content_extractor import create_content_extractor
 from ..application.use_cases.document_processing import (
     ProcessDocumentUseCase, BatchProcessDocumentsUseCase, OptimizeKnowledgeGraphUseCase
 )
-from ..domain.models.graph_models import SourceDocument, ProcessingStatus
+from ..application.use_cases.open_targets_ingestion import (
+    OpenTargetsIngestionUseCase, IngestionConfig
+)
+from ..application.use_cases.pubmed_ingestion import (
+    PubMedIngestionUseCase, PubMedIngestionConfig
+)
+from ..application.use_cases.curation import (
+    CurationUseCase, CurationRequest, CurationAction
+)
+from ..application.use_cases.graph_visualization import (
+    GraphVisualizationUseCase, VisualizationConfig
+)
+from ..application.use_cases.relationship_verification import (
+    RelationshipVerificationUseCase, VerificationConfig
+)
+from ..core.verification.cascading import CascadingVerifierConfig
+from ..core.verification.text_match import TextMatchConfig
+from ..core.verification.embedding import EmbeddingConfig
+from ..domain.models.graph_models import KnowledgeGraph, SourceDocument, ProcessingStatus
 from ..domain.models.processing_models import TaskType, ProcessingPipeline
 
 
@@ -669,6 +687,460 @@ def version(ctx):
         console.print(text)
     else:
         click.echo(f"GraphBuilder version {version_str}")
+
+
+@cli.command()
+@click.option('--source', required=True,
+              type=click.Choice(['open-targets', 'pubmed'], case_sensitive=False),
+              help='External data source to ingest from.')
+@click.option('--disease-id', default=None,
+              help='EFO disease identifier for Open Targets, e.g. EFO_0000275.')
+@click.option('--query', default=None,
+              help='Search query for PubMed, e.g. "BRCA1 breast cancer".')
+@click.option('--max-results', default=500, show_default=True,
+              help='Maximum number of records to fetch.')
+@click.option('--min-score', default=0.0, show_default=True,
+              help='(Open Targets only) Minimum association score (0.0 – 1.0).')
+@click.option('--email', default=None,
+              help='(PubMed only) Email address for NCBI API identification.')
+@click.option('--output', '-o', help='Optional JSON file to write the result summary.')
+@click.pass_context
+def ingest(
+    ctx,
+    source: str,
+    disease_id: Optional[str],
+    query: Optional[str],
+    max_results: int,
+    min_score: float,
+    email: Optional[str],
+    output: Optional[str],
+):
+    """
+    Ingest data from an external biomedical source into the knowledge graph.
+
+    Supported sources:
+
+    \b
+      open-targets   Open Targets Platform (disease–target associations)
+      pubmed         NCBI PubMed (article metadata + MeSH concepts)
+
+    Examples:
+
+    \b
+      graphbuilder ingest --source open-targets --disease-id EFO_0000275
+      graphbuilder ingest --source pubmed --query "BRCA1 breast cancer" \\
+          --max-results 200 --email you@example.com --output results.json
+    """
+    ensure_config_loaded(ctx)
+
+    app = ctx.obj['app']
+    config = ctx.obj['config']
+
+    # Validate source-specific required options
+    if source == 'open-targets' and not disease_id:
+        raise click.UsageError("--disease-id is required for --source open-targets")
+    if source == 'pubmed' and not query:
+        raise click.UsageError("--query is required for --source pubmed")
+
+    async def run_ingestion():
+        try:
+            graph_repo = create_graph_repository(config)
+
+            if source == 'open-targets':
+                use_case = OpenTargetsIngestionUseCase(config, graph_repo)
+                ingestion_cfg = IngestionConfig(
+                    disease_id=disease_id,
+                    max_associations=max_results,
+                    min_association_score=min_score,
+                )
+                app.print_status(
+                    f"Ingesting '{disease_id}' from Open Targets "
+                    f"(max {max_results} associations, min score {min_score})…"
+                )
+            else:  # pubmed
+                use_case = PubMedIngestionUseCase(config, graph_repo)
+                ingestion_cfg = PubMedIngestionConfig(
+                    query=query,
+                    max_articles=max_results,
+                    email=email or "graphbuilder@example.com",
+                )
+                app.print_status(
+                    f"Searching PubMed for '{query}' (max {max_results} articles)…"
+                )
+
+            if RICH_AVAILABLE:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task("Fetching and persisting…", total=None)
+                    result = await use_case.execute(ingestion_cfg)
+                    progress.update(task, completed=True)
+            else:
+                result = await use_case.execute(ingestion_cfg)
+
+            if result.success:
+                app.print_status("Ingestion completed successfully!", "success")
+
+                if result.data:
+                    if source == 'open-targets':
+                        metrics = [
+                            {"Metric": "Disease", "Value": result.data.get("disease_name", disease_id)},
+                            {"Metric": "Entities Created", "Value": result.data.get("entities_created", 0)},
+                            {"Metric": "Relationships Created", "Value": result.data.get("relationships_created", 0)},
+                            {"Metric": "Associations Fetched", "Value": result.data.get("associations_fetched", 0)},
+                            {"Metric": "Total Available", "Value": result.data.get("total_associations_available", "?")},
+                            {"Metric": "Processing Time", "Value": f"{result.processing_time:.2f}s"},
+                        ]
+                    else:
+                        metrics = [
+                            {"Metric": "Query", "Value": query},
+                            {"Metric": "Articles Fetched", "Value": result.data.get("articles_fetched", 0)},
+                            {"Metric": "Entities Created", "Value": result.data.get("entities_created", 0)},
+                            {"Metric": "Relationships Created", "Value": result.data.get("relationships_created", 0)},
+                            {"Metric": "Processing Time", "Value": f"{result.processing_time:.2f}s"},
+                        ]
+                    app.print_table(metrics, "Ingestion Results")
+
+                if output:
+                    import json as _json
+                    with open(output, "w") as fh:
+                        _json.dump(result.data, fh, indent=2)
+                    app.print_status(f"Result summary written to {output}", "success")
+
+                return 0
+
+            else:
+                app.print_status(f"Ingestion failed: {result.message}", "error")
+                for err in result.errors:
+                    app.print_status(f"  {err}", "error")
+                return 1
+
+        except Exception as exc:
+            app.logger.error("Ingestion error: %s", exc, exc_info=True)
+            app.print_status(f"Unexpected error: {exc}", "error")
+            return 1
+
+    exit_code = asyncio.run(run_ingestion())
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
+@cli.command()
+@click.option('--input', '-i', 'input_file', required=True,
+              help='JSON file containing curation events (see docs for schema).')
+@click.option('--curator', required=True,
+              help='Identifier of the human curator (username or email).')
+@click.option('--output', '-o', help='Optional JSON file to write the audit log.')
+@click.option('--dry-run', is_flag=True,
+              help='Validate the input file without applying changes.')
+@click.pass_context
+def curate(ctx, input_file: str, curator: str, output: Optional[str], dry_run: bool):
+    """
+    Apply manual curation events to the knowledge graph.
+
+    The input JSON must be an array of curation event objects, each with:
+
+    \b
+      {
+        "action":      "approve_entity" | "reject_entity" | "correct_entity" |
+                       "approve_relationship" | "reject_relationship" |
+                       "correct_relationship",
+        "target_id":   "<entity or relationship UUID>",
+        "reason":      "optional human note",
+        "corrections": {}   // only for correct_* actions
+      }
+
+    Example:
+
+    \b
+      graphbuilder curate --input events.json --curator alice@example.com
+    """
+    ensure_config_loaded(ctx)
+
+    app = ctx.obj['app']
+    config = ctx.obj['config']
+
+    # Load and validate input file
+    input_path = Path(input_file)
+    if not input_path.exists():
+        raise click.UsageError(f"Input file not found: {input_file}")
+
+    try:
+        with open(input_path) as fh:
+            raw_events = json.load(fh)
+        if not isinstance(raw_events, list):
+            raise ValueError("Expected a JSON array of curation events")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise click.UsageError(f"Invalid input file: {exc}")
+
+    app.print_status(f"Loaded {len(raw_events)} curation events from {input_file}")
+
+    if dry_run:
+        app.print_status("Dry-run mode — no changes will be applied.", "warning")
+        # Validate each event's action field
+        valid_actions = {a.value for a in CurationAction}
+        errors = []
+        for i, ev in enumerate(raw_events):
+            if ev.get("action") not in valid_actions:
+                errors.append(f"Event {i}: unknown action '{ev.get('action')}'")
+            if not ev.get("target_id"):
+                errors.append(f"Event {i}: missing 'target_id'")
+        if errors:
+            for err in errors:
+                app.print_status(err, "error")
+            sys.exit(1)
+        app.print_status("Validation passed.", "success")
+        return
+
+    async def run_curation():
+        try:
+            graph_repo = create_graph_repository(config)
+            use_case = CurationUseCase(config, graph_repo)
+
+            # Build CurationRequest from raw JSON
+            request = CurationRequest(curator=curator)
+            for ev in raw_events:
+                action = ev.get("action", "")
+                target_id = ev.get("target_id", "")
+                reason = ev.get("reason", "")
+                corrections = ev.get("corrections", {})
+
+                if action == CurationAction.APPROVE_ENTITY.value:
+                    request.approve_entity(target_id, reason)
+                elif action == CurationAction.REJECT_ENTITY.value:
+                    request.reject_entity(target_id, reason)
+                elif action == CurationAction.CORRECT_ENTITY.value:
+                    request.correct_entity(target_id, corrections, reason)
+                elif action == CurationAction.APPROVE_RELATIONSHIP.value:
+                    request.approve_relationship(target_id, reason)
+                elif action == CurationAction.REJECT_RELATIONSHIP.value:
+                    request.reject_relationship(target_id, reason)
+                elif action == CurationAction.CORRECT_RELATIONSHIP.value:
+                    request.correct_relationship(target_id, corrections, reason)
+                else:
+                    app.print_status(f"Unknown action '{action}', skipping", "warning")
+
+            result = await use_case.execute(request)
+
+            if result.success:
+                app.print_status("Curation applied successfully!", "success")
+                s = result.data.get("summary", {})
+                metrics = [
+                    {"Metric": "Events Applied", "Value": result.data.get("summary", {}).get("total_events", 0) - s.get("skipped", 0)},
+                    {"Metric": "Entities Approved", "Value": s.get("approved_entities", 0)},
+                    {"Metric": "Entities Rejected", "Value": s.get("rejected_entities", 0)},
+                    {"Metric": "Entities Corrected", "Value": s.get("corrected_entities", 0)},
+                    {"Metric": "Rels Approved", "Value": s.get("approved_relationships", 0)},
+                    {"Metric": "Rels Rejected", "Value": s.get("rejected_relationships", 0)},
+                    {"Metric": "Rels Corrected", "Value": s.get("corrected_relationships", 0)},
+                    {"Metric": "Skipped", "Value": s.get("skipped", 0)},
+                ]
+                app.print_table(metrics, "Curation Results")
+            else:
+                app.print_status(f"Curation completed with errors: {result.message}", "warning")
+                for err in result.errors:
+                    app.print_status(f"  {err}", "error")
+
+            if output and result.data.get("audit_log"):
+                with open(output, "w") as fh:
+                    json.dump(result.data["audit_log"], fh, indent=2)
+                app.print_status(f"Audit log written to {output}", "success")
+
+            return 0 if result.success else 1
+
+        except Exception as exc:
+            app.logger.error("Curation error: %s", exc, exc_info=True)
+            app.print_status(f"Unexpected error: {exc}", "error")
+            return 1
+
+    exit_code = asyncio.run(run_curation())
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
+@cli.command()
+@click.option('--format', 'fmt', default='html',
+              type=click.Choice(['cytoscape', 'graphml', 'html'], case_sensitive=False),
+              show_default=True, help='Export format.')
+@click.option('--output', '-o', default=None,
+              help='Output file path (default: graph.<format-ext>).')
+@click.option('--title', default='Knowledge Graph', show_default=True,
+              help='Page title for HTML output.')
+@click.option('--entity-types', default=None,
+              help='Comma-separated entity types to include (default: all).')
+@click.option('--relationship-types', default=None,
+              help='Comma-separated relationship types to include (default: all).')
+@click.option('--include-rejected', is_flag=True, default=False,
+              help='Include entities/relationships marked as rejected by curation.')
+@click.pass_context
+def export(ctx: click.Context, fmt: str, output: Optional[str], title: str,
+           entity_types: Optional[str], relationship_types: Optional[str],
+           include_rejected: bool) -> None:
+    """Export the knowledge graph to a portable format.
+
+    \b
+    Examples:
+      graphbuilder export --format html --output viz/graph.html
+      graphbuilder export --format graphml --output graph.graphml
+      graphbuilder export --format cytoscape --output graph.json \\
+          --entity-types Concept,Person
+    """
+    app: CLIApp = ctx.obj
+
+    _EXT = {"cytoscape": "json", "graphml": "graphml", "html": "html"}
+    if output is None:
+        output = f"graph.{_EXT[fmt.lower()]}"
+
+    entity_filter = [t.strip() for t in entity_types.split(",")] if entity_types else None
+    rel_filter = [t.strip() for t in relationship_types.split(",")] if relationship_types else None
+
+    async def run_export() -> int:
+        try:
+            app.print_status(f"Exporting graph → {output} ({fmt}) …", "info")
+
+            config = app.config
+
+            # Load graph from repository
+            graph_repo = create_graph_repository(config)
+            raw_graph = await graph_repo.load_graph() if hasattr(graph_repo, "load_graph") else KnowledgeGraph()
+
+            vis_config = VisualizationConfig(
+                output_path=output,
+                format=fmt,
+                title=title,
+                include_rejected=include_rejected,
+                entity_types=entity_filter,
+                relationship_types=rel_filter,
+            )
+
+            use_case = GraphVisualizationUseCase(raw_graph)
+            result = use_case.execute(vis_config)
+
+            if result.success:
+                d = result.data or {}
+                app.print_status(
+                    f"Exported {d.get('nodes', 0)} nodes, {d.get('edges', 0)} edges → {output}",
+                    "success",
+                )
+                return 0
+            else:
+                app.print_status(f"Export failed: {result.error}", "error")
+                return 1
+
+        except Exception as exc:
+            app.logger.error("Export error: %s", exc, exc_info=True)
+            app.print_status(f"Unexpected error: {exc}", "error")
+            return 1
+
+    exit_code = asyncio.run(run_export())
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
+@cli.command()
+@click.option('--output', '-o', default='verification_report.json',
+              show_default=True, help='Write JSON report to this file.')
+@click.option('--no-embedding', is_flag=True, default=False,
+              help='Disable the embedding stage (no sentence-transformers needed).')
+@click.option('--no-llm', is_flag=True, default=False,
+              help='Disable the LLM stage.')
+@click.option('--early-exit-pass', is_flag=True, default=False,
+              help='Stop pipeline as soon as a stage passes.')
+@click.option('--early-exit-fail', is_flag=True, default=False,
+              help='Stop pipeline as soon as a stage fails.')
+@click.option('--threshold', default=0.5, show_default=True, type=float,
+              help='Cosine similarity threshold for the embedding stage.')
+@click.option('--context-file', default=None,
+              help='JSON file mapping relationship_id → context string.')
+@click.pass_context
+def verify(ctx: click.Context, output: str, no_embedding: bool, no_llm: bool,
+           early_exit_pass: bool, early_exit_fail: bool,
+           threshold: float, context_file: Optional[str]) -> None:
+    """Verify relationships in the graph using the cascading pipeline.
+
+    \b
+    Runs up to three stages for each relationship:
+      1. TextMatch  — lexical term presence check
+      2. Embedding  — cosine similarity via sentence-transformers
+      3. LLM        — structured LLM prompt with reasoning trace
+
+    Results are written to --output as a JSON report.  Relationships that
+    fail are annotated in-memory (use `curate` to persist corrections).
+
+    \b
+    Examples:
+      graphbuilder verify --no-embedding --no-llm
+      graphbuilder verify --threshold 0.6 --output report.json
+    """
+    app: CLIApp = ctx.obj
+
+    async def run_verify() -> int:
+        try:
+            context_map: Dict[str, Any] = {}
+            if context_file:
+                import json as _json
+                with open(context_file) as fh:
+                    context_map = _json.load(fh)
+
+            text_cfg = TextMatchConfig()
+            emb_cfg  = EmbeddingConfig(threshold=threshold)
+            cascade_cfg = CascadingVerifierConfig(
+                text_match=text_cfg,
+                embedding=emb_cfg,
+                enable_embedding=not no_embedding,
+                enable_llm=not no_llm,
+                early_exit_on_pass=early_exit_pass,
+                early_exit_on_fail=early_exit_fail,
+            )
+
+            config = app.config
+            graph_repo = create_graph_repository(config)
+            raw_graph = await graph_repo.load_graph() if hasattr(graph_repo, 'load_graph') else KnowledgeGraph()
+
+            llm_svc = None
+            if not no_llm:
+                try:
+                    llm_svc = create_llm_service(config)
+                except Exception:
+                    app.print_status('LLM service unavailable; LLM stage will be skipped.', 'warning')
+
+            ver_config = VerificationConfig(
+                cascading=cascade_cfg,
+                context_map=context_map,
+            )
+            use_case = RelationshipVerificationUseCase(raw_graph, llm_service=llm_svc)
+            result = use_case.execute(ver_config)
+
+            if result.success:
+                d = result.data or {}
+                app.print_status(
+                    f"Verified {d.get('total', 0)} relationships: "
+                    f"{d.get('passed', 0)} passed, "
+                    f"{d.get('failed', 0)} failed, "
+                    f"{d.get('skipped', 0)} skipped.",
+                    'success',
+                )
+                import json as _json
+                from pathlib import Path as _Path
+                _Path(output).parent.mkdir(parents=True, exist_ok=True)
+                _Path(output).write_text(_json.dumps(d.get('report', []), indent=2), encoding='utf-8')
+                app.print_status(f'Report written to {output}', 'info')
+                return 0
+            else:
+                app.print_status(f'Verification failed: {result.error}', 'error')
+                return 1
+
+        except Exception as exc:
+            app.logger.error('Verify error: %s', exc, exc_info=True)
+            app.print_status(f'Unexpected error: {exc}', 'error')
+            return 1
+
+    exit_code = asyncio.run(run_verify())
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 
 if __name__ == '__main__':

@@ -12,9 +12,7 @@ New Location: src/graphbuilder/core/utils/common_functions.py
 import hashlib
 import logging
 
-from modelscope import snapshot_download
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain_google_vertexai import VertexAIEmbeddings
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.graphs import Neo4jGraph
 from langchain_community.graphs.graph_document import GraphDocument
@@ -73,6 +71,7 @@ def create_graph_database_connection(uri, userName, password, database):
 
 def load_embedding_model(embedding_model_name: str):
     if embedding_model_name.startswith("iic"):
+        from modelscope import snapshot_download  # optional: Chinese model hub
         local_dir = "../data/embedding/"
         if not os.path.exists(local_dir):
             model_dir = snapshot_download(embedding_model_name, local_dir=local_dir)
@@ -88,6 +87,7 @@ def load_embedding_model(embedding_model_name: str):
         dimension = 1536
         logging.info(f"Embedding: Using OpenAI Embeddings , Dimension:{dimension}")
     elif embedding_model_name == "vertexai":        
+        from langchain_google_vertexai import VertexAIEmbeddings  # optional: Google Cloud dep
         embeddings = VertexAIEmbeddings(
             model="textembedding-gecko@003"
         )

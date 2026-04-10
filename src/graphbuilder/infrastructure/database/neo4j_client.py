@@ -11,7 +11,7 @@ New Location: src/graphbuilder/infrastructure/database/neo4j_client.py
 
 import logging
 from langchain_community.graphs import Neo4jGraph
-from graphbuilder.domain.entities.source_node import sourceNode
+from graphbuilder.domain.entities.source_node import SourceNode
 import json
 
 
@@ -33,7 +33,7 @@ class graphDBdataAccess:
             logging.error(f"Error in updating document node status as failed: {error_message}")
             raise Exception(error_message)
 
-    def create_source_node(self, obj_source_node: sourceNode):
+    def create_source_node(self, obj_source_node: SourceNode):
         
         try:
             job_status = "New"
@@ -55,7 +55,7 @@ class graphDBdataAccess:
             self.update_exception_db(obj_source_node.file_name, error_message)
             raise Exception(error_message)
 
-    def update_source_node(self, obj_source_node: sourceNode):
+    def update_source_node(self, obj_source_node: SourceNode):
         try:
             params = {}
 

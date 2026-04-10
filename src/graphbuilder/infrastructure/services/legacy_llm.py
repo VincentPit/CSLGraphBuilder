@@ -12,14 +12,14 @@ New Location: src/graphbuilder/infrastructure/services/legacy_llm.py
 import logging
 from graphbuilder.core.utils.constants import MODEL_VERSIONS
 from langchain_openai import AzureChatOpenAI
-from langchain.docstore.document import Document
+from langchain_core.documents import Document
 from langchain_community.graphs import Neo4jGraph
 from typing import List
 import os
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
-from graphTransformer import LLMGraphTransformer
+from graphbuilder.core.graph.transformer import LLMGraphTransformer
 
 
 def generate_graphDocuments(model: str, graph: Neo4jGraph, chunkId_chunkDoc_list: List, allowedNodes=None, allowedRelationship=None):

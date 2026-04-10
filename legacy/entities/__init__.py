@@ -1,1 +1,0 @@
-"""Entity models for GraphBuilder."""

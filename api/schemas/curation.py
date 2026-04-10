@@ -1,0 +1,73 @@
+"""Pydantic v2 schemas for curation and verification."""
+
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+# ── Curation ────────────────────────────────────────────────────────────────
+
+class CurationEventRequest(BaseModel):
+    action: str = Field(
+        ...,
+        description=(
+            "One of: approve_entity, reject_entity, correct_entity, "
+            "approve_relationship, reject_relationship, correct_relationship"
+        ),
+    )
+    target_id: str = Field(..., description="Entity or relationship ID")
+    curator: str = Field(..., min_length=1)
+    reason: Optional[str] = None
+    corrections: Optional[Dict[str, Any]] = None
+
+
+class CurationBatchRequest(BaseModel):
+    events: List[CurationEventRequest]
+    dry_run: bool = False
+
+
+class CurationResultResponse(BaseModel):
+    success: bool
+    applied: int
+    failed: int
+    audit_log: List[Dict[str, Any]]
+    message: str
+
+
+# ── Verification ─────────────────────────────────────────────────────────────
+
+class VerificationRunRequest(BaseModel):
+    enable_embedding: bool = False
+    enable_llm: bool = False
+    embedding_threshold: float = Field(0.5, ge=0.0, le=1.0)
+    early_exit_on_pass: bool = False
+    early_exit_on_fail: bool = False
+    context_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Optional map of relationship_id → supporting context string",
+    )
+
+
+class VerificationStageResult(BaseModel):
+    stage: str
+    status: str
+    confidence: float
+    reasoning: str
+
+
+class VerificationEntryResponse(BaseModel):
+    relationship_id: str
+    source_entity_id: str
+    target_entity_id: str
+    relationship_type: str
+    status: str
+    confidence: float
+    reasoning: str
+    stage_results: List[VerificationStageResult]
+
+
+class VerificationReportResponse(BaseModel):
+    total: int
+    passed: int
+    failed: int
+    skipped: int
+    report: List[VerificationEntryResponse]

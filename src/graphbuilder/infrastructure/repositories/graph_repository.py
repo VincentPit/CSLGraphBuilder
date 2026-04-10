@@ -627,7 +627,9 @@ class InMemoryGraphRepository(GraphRepositoryInterface):
 def create_graph_repository(config: GraphBuilderConfig, neo4j_driver=None) -> GraphRepositoryInterface:
     """Create graph repository based on configuration."""
     
-    if config.database.provider == "neo4j" and neo4j_driver:
+    import os
+    db_provider = os.getenv("DATABASE_PROVIDER", "in_memory")
+    if db_provider == "neo4j" and neo4j_driver:
         return Neo4jGraphRepository(config, neo4j_driver)
     else:
         return InMemoryGraphRepository(config)

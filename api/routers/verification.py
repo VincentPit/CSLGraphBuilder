@@ -8,7 +8,10 @@ from ..schemas.curation import (
     VerificationReportResponse, VerificationEntryResponse, VerificationStageResult, VerificationRunRequest,
     TextVerificationRequest, TextVerificationResponse, TextVerificationEntryResponse, TextVerificationStageResult,
 )
-from ..schemas.graph import ConflictCheckRequest, ConflictCheckResponse, ConflictEntryResponse
+from ..schemas.graph import (
+    ConflictCheckRequest, ConflictCheckResponse, ConflictEntryResponse,
+    PendingReviewItem, PendingReviewListResponse, ReviewDecisionRequest,
+)
 
 router = APIRouter(prefix="/verification", tags=["verification"])
 
@@ -59,7 +62,7 @@ async def run_verification(
         if ent.id in needed_ids:
             kg.entities[ent.id] = ent
 
-    use_case = RelationshipVerificationUseCase(kg)
+    use_case = RelationshipVerificationUseCase(kg, graph_repo=graph_repo)
     result = use_case.execute(ver_cfg)
 
     entries: list[VerificationEntryResponse] = []
@@ -71,6 +74,7 @@ async def run_verification(
                     status=s["status"],
                     confidence=s.get("confidence", 0.0),
                     reasoning=s.get("reasoning", ""),
+                    metadata=s.get("metadata"),
                 )
                 for s in item.get("stage_results", [])
             ]
@@ -156,7 +160,7 @@ async def verify_text(
         max_candidates=request.max_candidates,
     )
 
-    use_case = TextVerificationUseCase(kg)
+    use_case = TextVerificationUseCase(kg, graph_repo=graph_repo)
     report = use_case.execute(request.text, ver_cfg)
 
     entries = [
@@ -246,24 +250,81 @@ async def check_conflicts(
         use_llm=request.use_llm,
     )
 
+    # Build response entries and auto-queue trust conflicts for review
+    from ..review_store import add_review
+
+    conflict_entries = []
+    for c in report.conflicts:
+        entry = ConflictEntryResponse(
+            conflict_type=c.conflict_type,
+            severity=c.severity,
+            existing_relationship_id=c.existing_relationship_id,
+            existing_relationship_type=c.existing_relationship_type,
+            existing_description=c.existing_description,
+            existing_source_chunk_ids=c.existing_source_chunk_ids,
+            existing_source_trust=c.existing_source_trust,
+            new_relationship_type=c.new_relationship_type,
+            new_description=c.new_description,
+            new_source_chunk_ids=c.new_source_chunk_ids,
+            new_source_trust=c.new_source_trust,
+            source_entity_name=c.source_entity_name,
+            target_entity_name=c.target_entity_name,
+            reasoning=c.reasoning,
+            requires_review=c.requires_review,
+        )
+        conflict_entries.append(entry)
+
+        # Auto-queue conflicts that need review (lower-trust vs higher-trust)
+        if c.requires_review:
+            add_review(entry.model_dump())
+
     return ConflictCheckResponse(
         total_checked=report.total_checked,
         conflicts_found=report.conflicts_found,
-        conflicts=[
-            ConflictEntryResponse(
-                conflict_type=c.conflict_type,
-                severity=c.severity,
-                existing_relationship_id=c.existing_relationship_id,
-                existing_relationship_type=c.existing_relationship_type,
-                existing_description=c.existing_description,
-                existing_source_chunk_ids=c.existing_source_chunk_ids,
-                new_relationship_type=c.new_relationship_type,
-                new_description=c.new_description,
-                new_source_chunk_ids=c.new_source_chunk_ids,
-                source_entity_name=c.source_entity_name,
-                target_entity_name=c.target_entity_name,
-                reasoning=c.reasoning,
-            )
-            for c in report.conflicts
-        ],
+        conflicts=conflict_entries,
     )
+
+
+# ── Pending Review Queue ────────────────────────────────────────────────
+
+@router.get("/reviews", response_model=PendingReviewListResponse)
+async def list_pending_reviews(
+    status: str = "pending",
+    _=Depends(require_api_key),
+):
+    """List pending review items (trust-conflicted knowledge awaiting user decision)."""
+    from ..review_store import get_pending_reviews
+
+    reviews = get_pending_reviews(status=status if status != "all" else None)
+    items = [
+        PendingReviewItem(
+            review_id=r.review_id,
+            conflict=ConflictEntryResponse(**r.conflict_data),
+            submitted_at=r.submitted_at,
+            status=r.status,
+        )
+        for r in reviews
+    ]
+    return PendingReviewListResponse(total=len(items), items=items)
+
+
+@router.post("/reviews/decide")
+async def decide_review(
+    request: ReviewDecisionRequest,
+    config=Depends(get_app_config),
+    graph_repo=Depends(get_graph_repo),
+    _=Depends(require_api_key),
+):
+    """Approve or reject a pending review item.
+
+    - **approve**: The new (lower-trust) claim is accepted and injected into the graph.
+    - **reject**: The new claim is discarded; existing trusted knowledge is kept.
+    """
+    from ..review_store import decide_review as _decide
+
+    review = _decide(request.review_id, request.decision, request.notes)
+    if review is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Review not found")
+
+    return {"review_id": review.review_id, "status": review.status, "notes": review.notes}

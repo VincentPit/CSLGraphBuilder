@@ -180,7 +180,8 @@ class ProcessDocumentUseCase(UseCase):
             description="Extract relationships between entities",
             priority=TaskPriority.NORMAL,
             configuration=extraction_config or {},
-            depends_on=[entity_extraction_task.id]
+            depends_on=[entity_extraction_task.id],
+            input_data={"document_id": document.id}
         )
         
         # Task 4: Graph Construction
@@ -423,75 +424,441 @@ class ProcessDocumentUseCase(UseCase):
         return chunks
     
     async def _execute_entity_extraction(self, task: ProcessingTask) -> ProcessingResult:
-        """Execute entity extraction task."""
-        
-        # Get document chunks
+        """Execute entity extraction with LLM-powered dedup.
+
+        For each chunk the LLM extracts entities.  Before saving, a two-stage
+        dedup runs:
+
+        1. **Vector pre-filter** — query the graph's vector index with a *low*
+           threshold (0.4) to gather candidate existing entities cheaply.
+        2. **LLM confirmation** — send the new entities + candidates to the LLM
+           which decides which pairs truly refer to the same real-world concept
+           (handles abbreviations, synonyms, alternate names that BERT misses).
+
+        Confirmed duplicates are merged; the rest are saved as new nodes.
+        """
+
         document_id = task.input_data.get("document_id")
         chunks = await self.document_repo.get_chunks_by_document_id(document_id)
-        
+
         if not chunks:
             return ProcessingResult(
                 success=False,
                 message="No chunks found for entity extraction",
-                errors=["No document chunks available"]
+                errors=["No document chunks available"],
             )
-        
+
+        # Low vector threshold — just a cheap pre-filter; LLM makes the call
+        VECTOR_PREFILTER_THRESHOLD = 0.4
+        VECTOR_PREFILTER_TOP_K = 5
+
         total_entities = 0
+        merged_entities = 0
         processed_chunks = 0
-        
+
         for i, chunk in enumerate(chunks):
             try:
-                # Extract entities using LLM
                 extraction_result = await self.llm_service.extract_entities(
                     chunk.content,
-                    task.configuration
+                    task.configuration,
                 )
-                
-                if extraction_result.success:
-                    entities = extraction_result.data.get("entities", [])
-                    
-                    # Save entities with provenance
-                    for entity_data in entities:
-                        entity = GraphEntity(
-                            name=entity_data.get("name"),
-                            entity_type=EntityType(entity_data.get("type", "CONCEPT")),
-                            description=entity_data.get("description"),
-                            properties=entity_data.get("properties", {}),
-                            source_chunk_ids=[chunk.id],
-                            source_document_ids=[chunk.document_id],
+
+                if not extraction_result.success:
+                    processed_chunks += 1
+                    continue
+
+                raw_entities = extraction_result.data.get("entities", [])
+                if not raw_entities:
+                    processed_chunks += 1
+                    continue
+
+                # Build GraphEntity objects for this chunk
+                chunk_entities: list[GraphEntity] = []
+                for entity_data in raw_entities:
+                    entity = GraphEntity(
+                        name=entity_data.get("name"),
+                        entity_type=EntityType(entity_data.get("type", "CONCEPT")),
+                        description=entity_data.get("description"),
+                        properties=entity_data.get("properties", {}),
+                        source_chunk_ids=[chunk.id],
+                        source_document_ids=[chunk.document_id],
+                    )
+                    entity.metadata.source_trust = "extracted"
+                    chunk_entities.append(entity)
+
+                # -- Stage 1: vector pre-filter to gather candidates --
+                candidate_map: dict[str, GraphEntity] = {}  # name_lower → entity
+                for entity in chunk_entities:
+                    try:
+                        emb = self._embed_entity_text(entity)
+                        if emb is not None:
+                            hits = await self.graph_repo.vector_search_entities(
+                                emb,
+                                top_k=VECTOR_PREFILTER_TOP_K,
+                                min_score=VECTOR_PREFILTER_THRESHOLD,
+                            )
+                            for hit_ent, _ in hits:
+                                candidate_map[hit_ent.name.lower()] = hit_ent
+                    except Exception:
+                        pass  # vector search failure is non-fatal
+
+                # -- Stage 2: LLM confirmation --
+                # Build dicts for the LLM call
+                new_dicts = [
+                    {"name": e.name, "type": e.entity_type.value,
+                     "description": e.description or ""}
+                    for e in chunk_entities
+                ]
+                existing_dicts = [
+                    {"name": e.name, "type": e.entity_type.value,
+                     "description": e.description or ""}
+                    for e in candidate_map.values()
+                ]
+
+                # Maps new_name_lower → existing GraphEntity for confirmed dupes
+                merge_targets: dict[str, GraphEntity] = {}
+
+                if existing_dicts:
+                    try:
+                        dedup_result = await self.llm_service.resolve_entity_duplicates(
+                            new_dicts, existing_dicts,
                         )
+                        if dedup_result.success:
+                            for match in dedup_result.data.get("matches", []):
+                                conf = match.get("confidence", 0)
+                                if conf < 0.7:
+                                    continue
+                                existing_name = (match.get("existing_name") or "").lower()
+                                new_name = (match.get("new_name") or "").lower()
+                                if existing_name in candidate_map:
+                                    merge_targets[new_name] = candidate_map[existing_name]
+                    except Exception as llm_err:
+                        self.logger.debug("LLM entity dedup failed (non-fatal): %s", llm_err)
+
+                # -- Save or merge each entity --
+                for entity in chunk_entities:
+                    target = merge_targets.get(entity.name.lower())
+                    if target and target.entity_type == entity.entity_type:
+                        self.logger.info(
+                            "LLM dedup: merging '%s' into existing '%s'",
+                            entity.name, target.name,
+                        )
+                        target.source_chunk_ids = list(dict.fromkeys(
+                            target.source_chunk_ids + entity.source_chunk_ids
+                        ))
+                        target.source_document_ids = list(dict.fromkeys(
+                            target.source_document_ids + entity.source_document_ids
+                        ))
+                        if entity.description and (
+                            not target.description
+                            or len(entity.description) > len(target.description)
+                        ):
+                            target.description = entity.description
+                        await self.graph_repo.save_entity(target)
+                        merged_entities += 1
+                    else:
                         await self.graph_repo.save_entity(entity)
-                        total_entities += 1
-                
+
+                    total_entities += 1
+
                 processed_chunks += 1
                 progress = (processed_chunks / len(chunks)) * 100
-                task.update_progress(progress, f"Processed {processed_chunks}/{len(chunks)} chunks")
-                
+                task.update_progress(
+                    progress, f"Processed {processed_chunks}/{len(chunks)} chunks"
+                )
+
             except Exception as e:
-                self.logger.error(f"Error extracting entities from chunk {i}: {str(e)}")
+                self.logger.error("Error extracting entities from chunk %d: %s", i, e)
                 continue
-        
+
         return ProcessingResult(
             success=True,
-            message=f"Extracted {total_entities} entities from {processed_chunks} chunks",
+            message=(
+                f"Extracted {total_entities} entities "
+                f"({merged_entities} merged) from {processed_chunks} chunks"
+            ),
             data={
                 "entities_extracted": total_entities,
-                "chunks_processed": processed_chunks
-            }
+                "merged_entities": merged_entities,
+                "chunks_processed": processed_chunks,
+            },
         )
     
     async def _execute_relationship_extraction(self, task: ProcessingTask) -> ProcessingResult:
-        """Execute relationship extraction task."""
-        
-        # Implementation would extract relationships between entities
-        # This is a simplified version
-        
+        """Extract relationships between entities from document chunks using LLM.
+
+        Entity resolution and relationship dedup both use the LLM:
+
+        1. If a relationship references an entity name not in the name→ID map,
+           a vector pre-filter + LLM confirmation resolves synonyms /
+           abbreviations to existing graph entities.
+        2. Before saving, existing relationships between the same entity pair
+           are fetched and the LLM decides whether the new one is a duplicate
+           (e.g. ACTIVATES ≈ STIMULATES).
+        """
+
+        document_id = (task.input_data or {}).get("document_id")
+        if not document_id:
+            return ProcessingResult(
+                success=False,
+                message="No document_id provided for relationship extraction",
+                errors=["Missing document_id"],
+            )
+
+        chunks = await self.document_repo.get_chunks_by_document_id(document_id)
+        if not chunks:
+            return ProcessingResult(
+                success=False,
+                message="No chunks found for relationship extraction",
+                errors=["No document chunks available"],
+            )
+
+        # Gather all entities previously extracted for this document so the LLM
+        # knows *which* entities to look for relationships between.
+        all_entities = await self.graph_repo.get_all_entities()
+        doc_entity_list: list[dict] = []
+        entity_name_to_id: dict[str, str] = {}
+        entity_id_to_name: dict[str, str] = {}
+
+        for entity in all_entities.values():
+            if document_id in (entity.source_document_ids or []):
+                entry = {
+                    "name": entity.name,
+                    "type": entity.entity_type.value,
+                    "description": entity.description or "",
+                }
+                doc_entity_list.append(entry)
+                entity_name_to_id[entity.name.lower()] = entity.id
+                entity_id_to_name[entity.id] = entity.name
+
+        if not doc_entity_list:
+            return ProcessingResult(
+                success=True,
+                message="No entities found for this document; skipping relationship extraction",
+                data={"relationships_extracted": 0},
+            )
+
+        # Build a quick lookup list for LLM entity resolution
+        all_entity_dicts = [
+            {"name": e.name, "type": e.entity_type.value,
+             "description": e.description or ""}
+            for e in all_entities.values()
+        ]
+
+        total_relationships = 0
+        merged_relationships = 0
+        processed_chunks = 0
+
+        for i, chunk in enumerate(chunks):
+            try:
+                extraction_result = await self.llm_service.extract_relationships(
+                    chunk.content,
+                    doc_entity_list,
+                    task.configuration,
+                )
+
+                if not extraction_result.success:
+                    processed_chunks += 1
+                    continue
+
+                relationships = extraction_result.data.get("relationships", [])
+
+                # Collect unresolved entity names for batch LLM resolution
+                unresolved_names: list[str] = []
+                for rel_data in relationships:
+                    for key in ("source_entity", "target_entity"):
+                        name = (rel_data.get(key) or "").lower()
+                        if name and name not in entity_name_to_id:
+                            unresolved_names.append(rel_data.get(key, ""))
+
+                # --- Batch LLM entity resolution for unresolved names ---
+                if unresolved_names:
+                    unresolved_dicts = [{"name": n, "type": "UNKNOWN", "description": ""} for n in set(unresolved_names)]
+
+                    # Vector pre-filter: collect candidates
+                    candidate_map: dict[str, dict] = {}
+                    for udict in unresolved_dicts:
+                        try:
+                            emb = self._embed_text(udict["name"])
+                            if emb is not None:
+                                hits = await self.graph_repo.vector_search_entities(
+                                    emb, top_k=5, min_score=0.3,
+                                )
+                                for ent, _ in hits:
+                                    candidate_map[ent.name.lower()] = {
+                                        "name": ent.name,
+                                        "type": ent.entity_type.value,
+                                        "description": ent.description or "",
+                                    }
+                        except Exception:
+                            pass
+
+                    if candidate_map:
+                        try:
+                            resolve_result = await self.llm_service.resolve_entity_duplicates(
+                                unresolved_dicts, list(candidate_map.values()),
+                            )
+                            if resolve_result.success:
+                                for match in resolve_result.data.get("matches", []):
+                                    if match.get("confidence", 0) < 0.7:
+                                        continue
+                                    existing_name = (match.get("existing_name") or "").lower()
+                                    new_name = (match.get("new_name") or "").lower()
+                                    if existing_name in entity_name_to_id:
+                                        entity_name_to_id[new_name] = entity_name_to_id[existing_name]
+                                        self.logger.info(
+                                            "LLM resolved entity '%s' → '%s'",
+                                            match.get("new_name"), match.get("existing_name"),
+                                        )
+                        except Exception as llm_err:
+                            self.logger.debug("LLM entity resolution failed (non-fatal): %s", llm_err)
+
+                # --- Process each relationship ---
+                for rel_data in relationships:
+                    source_name_raw = rel_data.get("source_entity") or ""
+                    target_name_raw = rel_data.get("target_entity") or ""
+
+                    source_id = entity_name_to_id.get(source_name_raw.lower())
+                    target_id = entity_name_to_id.get(target_name_raw.lower())
+
+                    if not source_id or not target_id:
+                        self.logger.debug(
+                            "Skipping relationship: unresolved entities "
+                            "source='%s' target='%s'",
+                            source_name_raw, target_name_raw,
+                        )
+                        continue
+
+                    try:
+                        rel_type = RelationshipType(
+                            rel_data.get("relationship_type", "RELATED_TO")
+                        )
+                    except ValueError:
+                        rel_type = RelationshipType.RELATED_TO
+
+                    relationship = GraphRelationship(
+                        source_entity_id=source_id,
+                        target_entity_id=target_id,
+                        relationship_type=rel_type,
+                        description=rel_data.get("description"),
+                        properties=rel_data.get("properties", {}),
+                        strength=float(rel_data.get("confidence", 1.0)),
+                        source_chunk_ids=[chunk.id],
+                        source_document_ids=[chunk.document_id],
+                    )
+                    relationship.metadata.source_trust = "extracted"
+
+                    # --- LLM-powered relationship dedup ---
+                    try:
+                        existing_rels = await self.graph_repo.get_entity_relationships(source_id)
+                        same_pair = [
+                            r for r in existing_rels
+                            if r.target_entity_id == target_id
+                        ]
+
+                        if same_pair:
+                            # Exact type match → let save_relationship merge
+                            exact_match = any(
+                                r.relationship_type == rel_type for r in same_pair
+                            )
+                            if not exact_match:
+                                # Ask LLM if it's a semantic duplicate
+                                src_name = entity_id_to_name.get(source_id, source_name_raw)
+                                tgt_name = entity_id_to_name.get(target_id, target_name_raw)
+                                new_rel_dict = {
+                                    "source": src_name, "target": tgt_name,
+                                    "type": rel_type.value,
+                                    "description": rel_data.get("description", ""),
+                                }
+                                existing_rel_dicts = [
+                                    {"source": src_name, "target": tgt_name,
+                                     "type": r.relationship_type.value,
+                                     "description": r.description or ""}
+                                    for r in same_pair
+                                ]
+                                dup_result = await self.llm_service.check_relationship_duplicates(
+                                    new_rel_dict, existing_rel_dicts,
+                                )
+                                dup_idx = dup_result.data.get("duplicate_of")
+                                if dup_idx is not None and dup_result.data.get("confidence", 0) >= 0.7:
+                                    existing = same_pair[dup_idx]
+                                    existing.source_chunk_ids = list(dict.fromkeys(
+                                        existing.source_chunk_ids + relationship.source_chunk_ids
+                                    ))
+                                    existing.source_document_ids = list(dict.fromkeys(
+                                        existing.source_document_ids + relationship.source_document_ids
+                                    ))
+                                    await self.graph_repo.save_relationship(existing)
+                                    merged_relationships += 1
+                                    total_relationships += 1
+                                    continue
+                    except Exception as dedup_err:
+                        self.logger.debug("Relationship dedup failed (non-fatal): %s", dedup_err)
+
+                    await self.graph_repo.save_relationship(relationship)
+                    total_relationships += 1
+
+                processed_chunks += 1
+                progress = (processed_chunks / len(chunks)) * 100
+                task.update_progress(
+                    progress,
+                    f"Processed {processed_chunks}/{len(chunks)} chunks",
+                )
+
+            except Exception as e:
+                self.logger.error(
+                    "Error extracting relationships from chunk %d: %s", i, e
+                )
+                continue
+
         return ProcessingResult(
             success=True,
-            message="Relationship extraction completed",
-            data={"relationships_extracted": 0}
+            message=(
+                f"Extracted {total_relationships} relationships "
+                f"({merged_relationships} merged) from {processed_chunks} chunks"
+            ),
+            data={
+                "relationships_extracted": total_relationships,
+                "merged_relationships": merged_relationships,
+                "chunks_processed": processed_chunks,
+            },
         )
-    
+
+    # ------------------------------------------------------------------
+    # Embedding / dedup helpers
+    # ------------------------------------------------------------------
+
+    _embedding_model = None  # class-level lazy cache
+
+    def _get_embedding_model(self):
+        """Lazy-load sentence-transformers model (shared across calls)."""
+        if ProcessDocumentUseCase._embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+                ProcessDocumentUseCase._embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+            except ImportError:
+                self.logger.warning("sentence-transformers not installed; vector dedup disabled.")
+                return None
+        return ProcessDocumentUseCase._embedding_model
+
+    def _embed_entity_text(self, entity: GraphEntity) -> Optional[list]:
+        """Produce an embedding for an entity name + description."""
+        model = self._get_embedding_model()
+        if model is None:
+            return None
+        parts = [entity.name]
+        if entity.description:
+            parts.append(entity.description)
+        text = " — ".join(parts)
+        return model.encode(text, convert_to_numpy=True).tolist()
+
+    def _embed_text(self, text: str) -> Optional[list]:
+        """Produce an embedding for arbitrary text."""
+        model = self._get_embedding_model()
+        if model is None or not text:
+            return None
+        return model.encode(text, convert_to_numpy=True).tolist()
+
     async def _execute_graph_construction(self, task: ProcessingTask) -> ProcessingResult:
         """Execute graph construction task."""
         

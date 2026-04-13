@@ -1,8 +1,8 @@
 'use client';
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { runVerification, getRelationships, VerificationReport, Relationship, verifyText, TextVerificationResponse, checkConflicts, ConflictCheckResponse } from '@/lib/api';
-import { ShieldCheck, ChevronDown, ChevronUp, Loader2, CheckSquare, Square, AlertCircle, FileText, GitBranch, AlertTriangle } from 'lucide-react';
+import { runVerification, getRelationships, VerificationReport, Relationship, verifyText, TextVerificationResponse, checkConflicts, ConflictCheckResponse, getPendingReviews, decideReview, PendingReviewItem } from '@/lib/api';
+import { ShieldCheck, ChevronDown, ChevronUp, Loader2, CheckSquare, Square, AlertCircle, FileText, GitBranch, AlertTriangle, ClipboardList } from 'lucide-react';
 
 function Toggle({ label, desc, checked, onChange }: { label: string; desc: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -17,7 +17,7 @@ function Toggle({ label, desc, checked, onChange }: { label: string; desc: strin
 }
 
 export default function VerificationPage() {
-  const [tab, setTab] = useState<'text' | 'relationships' | 'conflicts'>('text');
+  const [tab, setTab] = useState<'text' | 'relationships' | 'conflicts' | 'reviews'>('text');
 
   // ── Relationship verification state ──
   const [useEmbed, setUseEmbed] = useState(false);
@@ -45,6 +45,14 @@ export default function VerificationPage() {
   const [conflictReport, setConflictReport] = useState<ConflictCheckResponse | null>(null);
   const [conflictLoading, setConflictLoading] = useState(false);
   const [conflictError, setConflictError] = useState<string | null>(null);
+
+  // ── Review queue state ──
+  const { data: reviewData, isLoading: reviewsLoading, refetch: refetchReviews } = useQuery({
+    queryKey: ['pending-reviews'],
+    queryFn: () => getPendingReviews('pending'),
+    enabled: tab === 'reviews',
+  });
+  const [decidingId, setDecidingId] = useState<string | null>(null);
 
   const { data: relData, isLoading: relsLoading } = useQuery({
     queryKey: ['relationships-for-verify'],
@@ -153,6 +161,13 @@ export default function VerificationPage() {
           style={tab === 'conflicts' ? { background: 'var(--bg-primary)', color: 'var(--text-primary)' } : { color: 'var(--text-muted)' }}
         >
           <AlertTriangle size={14} /> Conflict Check
+        </button>
+        <button
+          onClick={() => setTab('reviews')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition ${tab === 'reviews' ? 'shadow-sm' : ''}`}
+          style={tab === 'reviews' ? { background: 'var(--bg-primary)', color: 'var(--text-primary)' } : { color: 'var(--text-muted)' }}
+        >
+          <ClipboardList size={14} /> Review Queue
         </button>
       </div>
 
@@ -481,13 +496,17 @@ export default function VerificationPage() {
                           {c.severity}
                         </span>
                         <span className="badge badge-neutral">{c.conflict_type}</span>
+                        {c.requires_review && <span className="badge badge-danger text-[10px]">Needs Review</span>}
                         <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
                           {c.source_entity_name} → {c.target_entity_name}
                         </span>
                       </div>
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
                         <div className="p-2 rounded" style={{ background: 'var(--bg-muted)' }}>
-                          <p className="font-medium mb-1" style={{ color: 'var(--text-muted)' }}>Existing Knowledge</p>
+                          <div className="flex items-center gap-2 mb-1">
+                            <p className="font-medium" style={{ color: 'var(--text-muted)' }}>Existing Knowledge</p>
+                            {c.existing_source_trust && <span className="badge badge-success text-[10px]">{c.existing_source_trust}</span>}
+                          </div>
                           <p style={{ color: 'var(--text-primary)' }}>
                             <span className="badge badge-neutral mr-1">{c.existing_relationship_type}</span>
                             {c.existing_description || '(no description)'}
@@ -511,6 +530,111 @@ export default function VerificationPage() {
                   ))}
                 </div>
               )}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ── Review Queue Tab ──────────────────────────────── */}
+      {tab === 'reviews' && (
+        <>
+          <div className="card p-6 space-y-2">
+            <h2 className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>Trust Conflict Review Queue</h2>
+            <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+              When document-extracted knowledge conflicts with trusted sources (PubMed, Open Targets), it is held here for review.
+              Approve to inject into the graph, or reject to keep existing trusted knowledge.
+            </p>
+          </div>
+
+          {reviewsLoading ? (
+            <div className="flex items-center gap-2 py-8 justify-center text-sm" style={{ color: 'var(--text-muted)' }}>
+              <Loader2 size={14} className="animate-spin" /> Loading reviews…
+            </div>
+          ) : !reviewData || reviewData.items.length === 0 ? (
+            <div className="card p-8 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
+              <ShieldCheck size={20} className="inline mr-2" />
+              No pending reviews. All knowledge is consistent with trusted sources.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                {reviewData.total} pending review{reviewData.total !== 1 ? 's' : ''}
+              </p>
+              {reviewData.items.map((item) => {
+                const c = item.conflict;
+                return (
+                  <div key={item.review_id} className="card p-4 space-y-3" style={{ borderColor: 'var(--danger)' }}>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className={`badge ${c.severity === 'high' ? 'badge-danger' : c.severity === 'medium' ? 'badge-warning' : 'badge-neutral'}`}>
+                        {c.severity}
+                      </span>
+                      <span className="badge badge-neutral">{c.conflict_type}</span>
+                      <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                        {c.source_entity_name} → {c.target_entity_name}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                      <div className="p-3 rounded" style={{ background: 'var(--bg-muted)' }}>
+                        <div className="flex items-center gap-2 mb-1">
+                          <p className="font-medium" style={{ color: 'var(--text-muted)' }}>Existing (Trusted)</p>
+                          {c.existing_source_trust && (
+                            <span className="badge badge-success text-[10px]">{c.existing_source_trust}</span>
+                          )}
+                        </div>
+                        <p style={{ color: 'var(--text-primary)' }}>
+                          <span className="badge badge-neutral mr-1">{c.existing_relationship_type}</span>
+                          {c.existing_description || '(no description)'}
+                        </p>
+                      </div>
+                      <div className="p-3 rounded" style={{ background: 'var(--bg-muted)' }}>
+                        <div className="flex items-center gap-2 mb-1">
+                          <p className="font-medium" style={{ color: 'var(--text-muted)' }}>New Claim</p>
+                          {c.new_source_trust && (
+                            <span className="badge badge-warning text-[10px]">{c.new_source_trust}</span>
+                          )}
+                        </div>
+                        <p style={{ color: 'var(--text-primary)' }}>
+                          <span className="badge badge-neutral mr-1">{c.new_relationship_type}</span>
+                          {c.new_description || '(no description)'}
+                        </p>
+                      </div>
+                    </div>
+
+                    <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{c.reasoning}</p>
+
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        disabled={decidingId === item.review_id}
+                        onClick={async () => {
+                          setDecidingId(item.review_id);
+                          try {
+                            await decideReview({ review_id: item.review_id, decision: 'approve' });
+                            refetchReviews();
+                          } finally { setDecidingId(null); }
+                        }}
+                        className="btn-primary text-xs px-3 py-1.5"
+                      >
+                        {decidingId === item.review_id ? <Loader2 size={12} className="animate-spin" /> : 'Approve & Inject'}
+                      </button>
+                      <button
+                        disabled={decidingId === item.review_id}
+                        onClick={async () => {
+                          setDecidingId(item.review_id);
+                          try {
+                            await decideReview({ review_id: item.review_id, decision: 'reject' });
+                            refetchReviews();
+                          } finally { setDecidingId(null); }
+                        }}
+                        className="btn-ghost text-xs px-3 py-1.5"
+                        style={{ color: 'var(--danger)' }}
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </>

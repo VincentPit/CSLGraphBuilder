@@ -1,9 +1,9 @@
 'use client';
 import { useState } from 'react';
-import { ingestOpenTargets, ingestPubMed, getJob } from '@/lib/api';
-import { Database, Search, Loader2, CheckCircle2, XCircle } from 'lucide-react';
+import { ingestOpenTargets, ingestPubMed, ingestCrawl, getJob } from '@/lib/api';
+import { Database, Search, Globe, Loader2, CheckCircle2, XCircle } from 'lucide-react';
 
-type Tab = 'open-targets' | 'pubmed';
+type Tab = 'open-targets' | 'pubmed' | 'crawl';
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
@@ -28,6 +28,10 @@ export default function IngestPage() {
   const [maxArticles, setMaxArticles] = useState('50');
   const [email, setEmail] = useState('');
   const [pmTag, setPmTag] = useState('');
+  const [crawlUrls, setCrawlUrls] = useState('');
+  const [crawlMaxPages, setCrawlMaxPages] = useState('10');
+  const [crawlDomains, setCrawlDomains] = useState('');
+  const [crawlTag, setCrawlTag] = useState('');
   const [loading, setLoading] = useState(false);
 
   const inputClass = 'input';
@@ -87,28 +91,66 @@ export default function IngestPage() {
     }
   }
 
+  async function submitCrawl(e: React.FormEvent) {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    setJobStatus(null);
+    setJobState(null);
+    try {
+      const urls = crawlUrls.split('\n').map(u => u.trim()).filter(Boolean);
+      if (urls.length === 0) throw new Error('Enter at least one URL');
+      const domains = crawlDomains.split(',').map(d => d.trim()).filter(Boolean);
+      const res = await ingestCrawl({
+        urls,
+        max_pages: Number(crawlMaxPages),
+        allowed_domains: domains.length > 0 ? domains : undefined,
+        tag: crawlTag || undefined,
+      });
+      pollJob(res.job_id);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <div className="space-y-8 max-w-3xl">
       <header>
         <h1 className="page-title">Ingest Sources</h1>
-        <p className="page-desc">Import structured data from Open Targets or PubMed.</p>
+        <p className="page-desc">Import structured data from Open Targets, PubMed, or the web.</p>
       </header>
 
       <div className="inline-flex rounded-lg p-1" style={{ background: 'var(--bg-muted)', border: '1px solid var(--border)' }}>
-        {(['open-targets', 'pubmed'] as Tab[]).map((t) => (
+        {(['open-targets', 'pubmed', 'crawl'] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
             className={`px-4 py-2 rounded-md text-sm font-medium transition flex items-center gap-2 ${tab === t ? 'btn-ghost' : ''}`}
             style={tab === t ? { background: 'white', color: 'var(--accent)', boxShadow: '0 1px 3px rgba(0,0,0,.08)' } : { color: 'var(--text-muted)' }}
           >
-            {t === 'open-targets' ? <Database size={14} /> : <Search size={14} />}
-            {t === 'open-targets' ? 'Open Targets' : 'PubMed'}
+            {t === 'open-targets' ? <Database size={14} /> : t === 'pubmed' ? <Search size={14} /> : <Globe size={14} />}
+            {t === 'open-targets' ? 'Open Targets' : t === 'pubmed' ? 'PubMed' : 'Web Crawl'}
           </button>
         ))}
       </div>
 
-      {tab === 'open-targets' ? (
+      {tab === 'crawl' ? (
+        <form onSubmit={submitCrawl} className="card p-6 space-y-5">
+          <Field label="URLs" hint="One URL per line — starting points for the crawler">
+            <textarea required className={inputClass} rows={4} value={crawlUrls} onChange={(e) => setCrawlUrls(e.target.value)} placeholder={"https://example.com\nhttps://example.com/docs"} />
+          </Field>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Field label="Max Pages" hint="Maximum pages to crawl per seed URL"><input className={inputClass} type="number" value={crawlMaxPages} onChange={(e) => setCrawlMaxPages(e.target.value)} /></Field>
+            <Field label="Allowed Domains" hint="Comma-separated, leave blank for seed domains only"><input className={inputClass} value={crawlDomains} onChange={(e) => setCrawlDomains(e.target.value)} placeholder="example.com, docs.example.com" /></Field>
+          </div>
+          <Field label="Tag" hint="Optional batch label"><input className={inputClass} value={crawlTag} onChange={(e) => setCrawlTag(e.target.value)} placeholder="web-docs-2026" /></Field>
+          <button className="btn-primary" disabled={loading}>
+            {loading ? <><Loader2 size={14} className="animate-spin" /> Crawling</> : 'Start Web Crawl'}
+          </button>
+        </form>
+      ) : tab === 'open-targets' ? (
         <form onSubmit={submitOT} className="card p-6 space-y-5">
           <Field label="Disease ID" hint="Use EFO or MONDO IDs">
             <input required className={inputClass} value={diseaseId} onChange={(e) => setDiseaseId(e.target.value)} placeholder="EFO_0000275" />

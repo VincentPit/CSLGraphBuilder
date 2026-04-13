@@ -57,6 +57,7 @@ class VerificationStageResult(BaseModel):
     status: str
     confidence: float
     reasoning: str
+    metadata: Optional[dict] = None
 
 
 class VerificationEntryResponse(BaseModel):
@@ -99,6 +100,7 @@ class TextVerificationStageResult(BaseModel):
     status: str
     confidence: float
     reasoning: str
+    metadata: Optional[dict] = None
 
 
 class TextVerificationEntryResponse(BaseModel):

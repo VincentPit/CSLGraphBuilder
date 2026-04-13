@@ -1,6 +1,6 @@
 """Pydantic v2 schemas for external data ingestion."""
 
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -26,3 +26,10 @@ class IngestResponse(BaseModel):
     source: str
     status: str
     message: Optional[str] = None
+
+
+class CrawlIngestRequest(BaseModel):
+    urls: List[str] = Field(..., min_length=1, description="Seed URLs to crawl")
+    max_pages: int = Field(10, ge=1, le=1000, description="Max pages to crawl per seed URL")
+    allowed_domains: List[str] = Field(default_factory=list, description="Restrict crawl to these domains")
+    tag: Optional[str] = "web-crawl"

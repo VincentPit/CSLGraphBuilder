@@ -73,6 +73,29 @@ class ConfidenceLevel(Enum):
     VERY_HIGH = "very_high"  # 0.9 - 1.0
 
 
+class SourceTrust(Enum):
+    """Trust level of the source that produced an entity/relationship.
+
+    Higher-priority sources override lower-priority ones during conflict
+    resolution.  Priority order (highest → lowest):
+        CURATED > REVIEWED > EXTRACTED > USER
+    """
+    CURATED = "curated"       # Manually curated / expert-verified
+    REVIEWED = "reviewed"     # From reviewed sources (PubMed, Open Targets)
+    EXTRACTED = "extracted"   # LLM-extracted from documents
+    USER = "user"             # User-submitted, unverified
+
+    @property
+    def priority(self) -> int:
+        """Numeric priority — higher is more trusted."""
+        return {
+            SourceTrust.CURATED: 100,
+            SourceTrust.REVIEWED: 75,
+            SourceTrust.EXTRACTED: 50,
+            SourceTrust.USER: 25,
+        }[self]
+
+
 @dataclass
 class Metadata:
     """Rich metadata for all domain entities."""
@@ -86,6 +109,7 @@ class Metadata:
     annotations: Dict[str, Any] = field(default_factory=dict)
     source_system: Optional[str] = None
     confidence_score: Optional[float] = None
+    source_trust: Optional[str] = None  # SourceTrust value: curated/reviewed/extracted/user
     
     def update(self, updated_by: Optional[str] = None) -> None:
         """Update metadata with new timestamp and version."""
@@ -261,7 +285,8 @@ class GraphEntity(DomainEntity):
                 "version": self.metadata.version,
                 "tags": list(self.metadata.tags),
                 "annotations": self.metadata.annotations,
-                "confidence_score": self.metadata.confidence_score
+                "confidence_score": self.metadata.confidence_score,
+                "source_trust": self.metadata.source_trust,
             }
         }
 
@@ -370,7 +395,8 @@ class GraphRelationship(DomainEntity):
                 "version": self.metadata.version,
                 "tags": list(self.metadata.tags),
                 "annotations": self.metadata.annotations,
-                "confidence_score": self.metadata.confidence_score
+                "confidence_score": self.metadata.confidence_score,
+                "source_trust": self.metadata.source_trust,
             }
         }
         

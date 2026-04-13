@@ -63,9 +63,11 @@ class RelationshipVerificationUseCase:
         self,
         graph: KnowledgeGraph,
         llm_service: Optional[Any] = None,
+        graph_repo: Optional[Any] = None,
     ) -> None:
         self._graph = graph
         self._llm_service = llm_service
+        self._graph_repo = graph_repo
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,6 +77,7 @@ class RelationshipVerificationUseCase:
         verifier = CascadingVerifier(
             config=config.cascading,
             llm_service=self._llm_service,
+            graph_repo=self._graph_repo,
         )
 
         report: List[Dict[str, Any]] = []
@@ -123,6 +126,7 @@ class RelationshipVerificationUseCase:
                         "status":     sr.status.value,
                         "confidence": sr.confidence,
                         "reasoning":  sr.reasoning,
+                        "metadata":   sr.metadata if sr.metadata else None,
                     }
                     for sr in result.stage_results
                 ],

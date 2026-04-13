@@ -221,6 +221,8 @@ class PubMedIngestionUseCase:
         if article.doi:
             entity.add_external_id("doi", article.doi)
         entity.metadata.add_tag(cfg.tag)
+        entity.metadata.source_trust = "reviewed"
+        entity.metadata.source_system = "pubmed"
         entity.properties["journal"] = article.journal
         entity.properties["publication_date"] = article.publication_date
         entity.properties["pmid"] = article.pmid
@@ -237,6 +239,8 @@ class PubMedIngestionUseCase:
         entity = GraphEntity(name=name, entity_type=EntityType.PERSON)
         entity.metadata.add_tag(cfg.tag)
         entity.metadata.add_tag("author")
+        entity.metadata.source_trust = "reviewed"
+        entity.metadata.source_system = "pubmed"
         return entity
 
     @staticmethod
@@ -250,4 +254,6 @@ class PubMedIngestionUseCase:
         entity = GraphEntity(name=name, entity_type=EntityType.CONCEPT)
         entity.metadata.add_tag(cfg.tag)
         entity.metadata.add_tag("mesh")
+        entity.metadata.source_trust = "reviewed"
+        entity.metadata.source_system = "pubmed"
         return entity

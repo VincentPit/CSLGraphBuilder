@@ -7,7 +7,7 @@ for graph entities and relationships with advanced querying capabilities.
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set, Tuple, Sequence
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 
@@ -73,6 +73,18 @@ class GraphRepositoryInterface(ABC):
         """Search entities whose name or description contains any of the given terms."""
         raise NotImplementedError
 
+    async def vector_search_entities(
+        self, query_embedding: List[float], top_k: int = 10, min_score: float = 0.5
+    ) -> List[Tuple['GraphEntity', float]]:
+        """Find entities by vector similarity. Returns (entity, score) pairs."""
+        raise NotImplementedError
+
+    async def vector_search_relationships(
+        self, query_embedding: List[float], top_k: int = 10, min_score: float = 0.5
+    ) -> List[Tuple['GraphRelationship', float]]:
+        """Find relationships by vector similarity on their description embedding. Returns (rel, score) pairs."""
+        raise NotImplementedError
+
 
 class Neo4jGraphRepository(GraphRepositoryInterface):
     """
@@ -86,6 +98,8 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
         self.config = config
         self.driver = neo4j_driver
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._embedding_model = None
+        self._embedding_dim: int = 384  # default for all-MiniLM-L6-v2
         
         # Initialize graph schema
         asyncio.create_task(self._initialize_schema())
@@ -119,6 +133,69 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                     await session.run(query)
                 except Exception as e:
                     self.logger.debug(f"Schema creation result: {str(e)}")
+
+            # Create vector indexes (separate try since they need dimension param)
+            for label, prop, idx_name in [
+                ("Entity", "name_embedding", "entity_name_vector"),
+                ("Relationship", "desc_embedding", "rel_desc_vector"),
+            ]:
+                try:
+                    await session.run(
+                        f"CREATE VECTOR INDEX `{idx_name}` IF NOT EXISTS "
+                        f"FOR (n:{label}) ON (n.{prop}) "
+                        "OPTIONS {indexConfig: {"
+                        "  `vector.dimensions`: $dim,"
+                        "  `vector.similarity_function`: 'cosine'"
+                        "}}",
+                        {"dim": self._embedding_dim},
+                    )
+                except Exception as e:
+                    self.logger.debug(f"Vector index creation ({idx_name}): {e}")
+
+    # ------------------------------------------------------------------
+    # Embedding helpers
+    # ------------------------------------------------------------------
+
+    def _get_embedding_model(self):
+        """Lazy-load sentence-transformers model (shared across calls)."""
+        if self._embedding_model is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                model_name = "all-MiniLM-L6-v2"
+                self.logger.info("Loading embedding model '%s' for vector index …", model_name)
+                self._embedding_model = SentenceTransformer(model_name)
+                self._embedding_dim = self._embedding_model.get_sentence_embedding_dimension()
+            except ImportError:
+                self.logger.warning("sentence-transformers not installed; vector indexing disabled.")
+                return None
+        return self._embedding_model
+
+    def _embed_text(self, text: str) -> Optional[List[float]]:
+        """Produce an embedding vector for *text*, or None if unavailable."""
+        model = self._get_embedding_model()
+        if model is None or not text:
+            return None
+        vec = model.encode(text, convert_to_numpy=True)
+        return vec.tolist()
+
+    def _entity_embedding_text(self, entity: GraphEntity) -> str:
+        """Build the string to embed for an entity (name + description)."""
+        parts = [entity.name]
+        if entity.description:
+            parts.append(entity.description)
+        return " — ".join(parts)
+
+    def _relationship_embedding_text(self, rel: GraphRelationship, source_name: str = "", target_name: str = "") -> str:
+        """Build the string to embed for a relationship."""
+        parts = []
+        if source_name:
+            parts.append(source_name)
+        parts.append(rel.relationship_type.value.replace("_", " "))
+        if target_name:
+            parts.append(target_name)
+        if rel.description:
+            parts.append(rel.description)
+        return " ".join(parts)
     
     async def save_entity(self, entity: GraphEntity) -> GraphEntity:
         """Save entity to Neo4j graph database with provenance tracking."""
@@ -162,6 +239,11 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties.pop('id', None)
                 properties.pop('source_chunk_ids', None)
                 properties.pop('source_document_ids', None)
+
+                # Compute embedding for vector index
+                emb = self._embed_text(self._entity_embedding_text(entity))
+                if emb is not None:
+                    properties['name_embedding'] = emb
                 
                 await session.run(update_query, {
                     'existing_id': existing_id,
@@ -202,6 +284,11 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties.pop('source_chunk_ids', None)
                 properties.pop('source_document_ids', None)
                 properties['content_hash'] = entity.get_hash()
+
+                # Compute embedding for vector index
+                emb = self._embed_text(self._entity_embedding_text(entity))
+                if emb is not None:
+                    properties['name_embedding'] = emb
                 
                 await session.run(create_query, {
                     'id': entity.id,
@@ -264,6 +351,10 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             if not entities_record:
                 raise ValueError(f"Source or target entity not found for relationship {relationship.id}")
 
+            # Extract entity names for embedding text
+            source_name = dict(entities_record['source']).get('name', '')
+            target_name = dict(entities_record['target']).get('name', '')
+
             # Check for existing relationship between same entities with same type
             existing_query = """
             MATCH (source:Entity {id: $source_id})-[r:RELATES]->(target:Entity {id: $target_id})
@@ -286,10 +377,16 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 merged_chunks = list(dict.fromkeys(existing_chunks + relationship.source_chunk_ids))
                 merged_docs = list(dict.fromkeys(existing_docs + relationship.source_document_ids))
 
+                # Compute embedding for vector index
+                emb = self._embed_text(self._relationship_embedding_text(
+                    relationship, source_name, target_name
+                ))
+
                 update_query = """
                 MATCH ()-[r:RELATES {id: $existing_id}]->()
                 SET r.source_chunk_ids = $source_chunk_ids,
                     r.source_document_ids = $source_document_ids,
+                    r.desc_embedding = $desc_embedding,
                     r.updated_at = datetime(),
                     r.version = r.version + 1
                 RETURN r
@@ -298,6 +395,7 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                     'existing_id': existing_id,
                     'source_chunk_ids': merged_chunks,
                     'source_document_ids': merged_docs,
+                    'desc_embedding': emb,
                 })
 
                 # Create EXTRACTED_FROM edges for new chunks
@@ -332,6 +430,13 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties.pop('id', None)
                 properties.pop('source_chunk_ids', None)
                 properties.pop('source_document_ids', None)
+
+                # Compute embedding for vector index
+                emb = self._embed_text(self._relationship_embedding_text(
+                    relationship, source_name, target_name
+                ))
+                if emb is not None:
+                    properties['desc_embedding'] = emb
                 
                 await session.run(create_query, {
                     'source_id': relationship.source_entity_id,
@@ -540,6 +645,70 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                     self.logger.debug("Skipping entity from search: %s", exc)
             return entities
 
+    async def vector_search_entities(
+        self, query_embedding: List[float], top_k: int = 10, min_score: float = 0.5
+    ) -> List[Tuple[GraphEntity, float]]:
+        """Find entities whose name_embedding is similar to *query_embedding*."""
+        query = (
+            "CALL db.index.vector.queryNodes('entity_name_vector', $k, $embedding) "
+            "YIELD node, score "
+            "WHERE score >= $min_score "
+            "RETURN node, score "
+            "ORDER BY score DESC"
+        )
+        async with self.driver.session() as session:
+            result = await session.run(query, {"k": top_k, "embedding": query_embedding, "min_score": min_score})
+            hits: List[Tuple[GraphEntity, float]] = []
+            async for record in result:
+                data = dict(record['node'])
+                try:
+                    entity = self._create_entity_from_data(data)
+                    hits.append((entity, float(record['score'])))
+                except Exception as exc:
+                    self.logger.debug("Skipping entity from vector search: %s", exc)
+            return hits
+
+    async def vector_search_relationships(
+        self, query_embedding: List[float], top_k: int = 10, min_score: float = 0.5
+    ) -> List[Tuple[GraphRelationship, float]]:
+        """Find relationships whose connected entities have similar embeddings.
+
+        Since Neo4j vector indexes only work on nodes, this performs a vector
+        search on Entity nodes first, then returns all relationships between
+        the matching entities.
+        """
+        entity_hits = await self.vector_search_entities(query_embedding, top_k=top_k * 2, min_score=min_score)
+        if not entity_hits:
+            return []
+
+        entity_ids = [e.id for e, _ in entity_hits]
+        entity_scores = {e.id: s for e, s in entity_hits}
+
+        query = (
+            "MATCH (src:Entity)-[r:RELATES]->(tgt:Entity) "
+            "WHERE src.id IN $ids OR tgt.id IN $ids "
+            "RETURN r, src.id as source_id, tgt.id as target_id"
+        )
+        async with self.driver.session() as session:
+            result = await session.run(query, {"ids": entity_ids})
+            hits: List[Tuple[GraphRelationship, float]] = []
+            async for record in result:
+                data = dict(record['r'])
+                data['source_entity_id'] = record['source_id']
+                data['target_entity_id'] = record['target_id']
+                try:
+                    rel = self._create_relationship_from_data(data)
+                    # Score = max of the two entity match scores
+                    score = max(
+                        entity_scores.get(record['source_id'], 0.0),
+                        entity_scores.get(record['target_id'], 0.0),
+                    )
+                    hits.append((rel, score))
+                except Exception as exc:
+                    self.logger.debug("Skipping relationship from vector search: %s", exc)
+            hits.sort(key=lambda x: x[1], reverse=True)
+            return hits[:top_k]
+
     async def get_graph_statistics(self) -> Dict[str, Any]:
         """Get comprehensive graph statistics."""
         
@@ -657,6 +826,8 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             entity.metadata.version = data['version']
         if 'confidence_score' in data:
             entity.metadata.confidence_score = data['confidence_score']
+        if 'source_trust' in data and data['source_trust']:
+            entity.metadata.source_trust = data['source_trust']
         
         return entity
     
@@ -694,6 +865,8 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             relationship.metadata.version = data['version']
         if 'confidence_score' in data:
             relationship.metadata.confidence_score = data['confidence_score']
+        if 'source_trust' in data and data['source_trust']:
+            relationship.metadata.source_trust = data['source_trust']
         
         return relationship
     

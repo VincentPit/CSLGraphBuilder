@@ -573,7 +573,172 @@ RESPOND WITH VALID JSON:
                 message=f"Content summarization failed: {str(e)}",
                 errors=[str(e)]
             )
-    
+
+    # ------------------------------------------------------------------
+    # Deduplication helpers (LLM-powered)
+    # ------------------------------------------------------------------
+
+    async def resolve_entity_duplicates(
+        self,
+        new_entities: List[Dict[str, str]],
+        existing_entities: List[Dict[str, str]],
+    ) -> ProcessingResult:
+        """Ask the LLM which *new* entities are duplicates of *existing* ones.
+
+        Parameters
+        ----------
+        new_entities:
+            List of dicts with keys ``name``, ``type``, ``description``.
+        existing_entities:
+            Same format — candidate entities already in the graph.
+
+        Returns
+        -------
+        ProcessingResult with ``data["matches"]`` — a list of
+        ``{"new_name": …, "existing_name": …, "confidence": …}``
+        for every confirmed duplicate pair.
+        """
+        if not new_entities or not existing_entities:
+            return ProcessingResult(
+                success=True,
+                message="Nothing to resolve",
+                data={"matches": []},
+            )
+
+        prompt = (
+            "You are an expert knowledge-graph entity resolution assistant.\n\n"
+            "Given a list of NEW entities just extracted from a document and a "
+            "list of EXISTING entities already stored in the graph, identify "
+            "which new entities refer to the SAME real-world concept as an "
+            "existing entity — even when the names differ (abbreviations, "
+            "synonyms, alternate spellings, etc.).\n\n"
+            "Rules:\n"
+            "- Only match entities of the SAME type.\n"
+            "- Abbreviations count as matches (e.g. 'TNF-alpha' = "
+            "'Tumor Necrosis Factor Alpha').\n"
+            "- Synonyms count (e.g. 'heart attack' = 'myocardial infarction').\n"
+            "- Do NOT match entities that are merely related but distinct.\n"
+            "- Return a confidence score between 0 and 1.\n\n"
+            "NEW entities:\n"
+            f"{json.dumps(new_entities, indent=2)}\n\n"
+            "EXISTING entities:\n"
+            f"{json.dumps(existing_entities, indent=2)}\n\n"
+            "Respond in JSON:\n"
+            '{"matches": [{"new_name": "...", "existing_name": "...", '
+            '"confidence": 0.95, "reasoning": "..."}]}\n'
+            'If there are no duplicates, return {"matches": []}.'
+        )
+
+        try:
+            llm_request = LLMRequest(
+                prompt=prompt,
+                content="",
+                prompt_type=PromptType.VALIDATION,
+                temperature=0.0,
+                max_tokens=1500,
+            )
+            llm_response = await self._execute_llm_call(llm_request)
+            data = await self._parse_json_response(llm_response.content)
+            matches = data.get("matches", [])
+            valid_matches = [
+                m for m in matches
+                if m.get("new_name") and m.get("existing_name")
+            ]
+            return ProcessingResult(
+                success=True,
+                message=f"Resolved {len(valid_matches)} duplicate(s)",
+                data={"matches": valid_matches},
+            )
+        except Exception as e:
+            self.logger.error("Entity duplicate resolution failed: %s", e)
+            return ProcessingResult(
+                success=False,
+                message=f"Entity duplicate resolution failed: {e}",
+                errors=[str(e)],
+                data={"matches": []},
+            )
+
+    async def check_relationship_duplicates(
+        self,
+        new_relationship: Dict[str, str],
+        existing_relationships: List[Dict[str, str]],
+    ) -> ProcessingResult:
+        """Ask the LLM whether a new relationship duplicates an existing one.
+
+        Parameters
+        ----------
+        new_relationship:
+            Dict with ``source``, ``target``, ``type``, ``description``.
+        existing_relationships:
+            Same format — relationships already stored between the same
+            entity pair.
+
+        Returns
+        -------
+        ProcessingResult with ``data["duplicate_of"]`` set to the index
+        (0-based) of the matching existing relationship, or ``None`` if
+        no duplicate is found.
+        """
+        if not existing_relationships:
+            return ProcessingResult(
+                success=True,
+                message="No existing relationships to compare",
+                data={"duplicate_of": None},
+            )
+
+        prompt = (
+            "You are an expert knowledge-graph relationship deduplication "
+            "assistant.\n\n"
+            "A NEW relationship has been extracted from a document.  A set of "
+            "EXISTING relationships already connect the same entity pair in "
+            "the graph.  Determine whether the NEW relationship expresses the "
+            "SAME fact as any EXISTING one — even if the relationship type or "
+            "description uses different wording (e.g. 'ACTIVATES' ≈ "
+            "'STIMULATES', 'inhibits growth' ≈ 'suppresses proliferation').\n\n"
+            "NEW relationship:\n"
+            f"{json.dumps(new_relationship, indent=2)}\n\n"
+            "EXISTING relationships (indexed 0..N-1):\n"
+            f"{json.dumps(list(enumerate(existing_relationships)), indent=2)}\n\n"
+            "Respond in JSON:\n"
+            '{"duplicate_of": <index or null>, "confidence": <0-1>, '
+            '"reasoning": "..."}\n'
+            "If the new relationship is NOT a duplicate of any existing one, "
+            'return {"duplicate_of": null, "confidence": 0, "reasoning": "…"}.'
+        )
+
+        try:
+            llm_request = LLMRequest(
+                prompt=prompt,
+                content="",
+                prompt_type=PromptType.VALIDATION,
+                temperature=0.0,
+                max_tokens=500,
+            )
+            llm_response = await self._execute_llm_call(llm_request)
+            data = await self._parse_json_response(llm_response.content)
+            dup_idx = data.get("duplicate_of")
+            # Validate index is in range
+            if dup_idx is not None:
+                if not isinstance(dup_idx, int) or dup_idx < 0 or dup_idx >= len(existing_relationships):
+                    dup_idx = None
+            return ProcessingResult(
+                success=True,
+                message="Relationship duplicate check completed",
+                data={
+                    "duplicate_of": dup_idx,
+                    "confidence": data.get("confidence", 0),
+                    "reasoning": data.get("reasoning", ""),
+                },
+            )
+        except Exception as e:
+            self.logger.error("Relationship duplicate check failed: %s", e)
+            return ProcessingResult(
+                success=False,
+                message=f"Relationship duplicate check failed: {e}",
+                errors=[str(e)],
+                data={"duplicate_of": None},
+            )
+
     async def _execute_llm_call(self, request: LLMRequest) -> LLMResponse:
         """Execute LLM API call with error handling and retries."""
         

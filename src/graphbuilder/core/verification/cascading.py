@@ -74,16 +74,21 @@ class CascadingVerifier:
     llm_service:
         Required only when ``config.enable_llm`` is ``True``.  Any object with
         a ``generate_text(prompt, system_prompt, temperature) -> str`` method.
+    graph_repo:
+        Optional graph repository for Neo4j vector search in the embedding
+        stage.  When provided, the EmbeddingVerifier will query the vector
+        index to find semantically similar entities/relationships.
     """
 
     def __init__(
         self,
         config: Optional[CascadingVerifierConfig] = None,
         llm_service: Optional[Any] = None,
+        graph_repo: Optional[Any] = None,
     ) -> None:
         self._cfg = config or CascadingVerifierConfig()
         self._text_verifier = TextMatchVerifier(self._cfg.text_match)
-        self._emb_verifier  = EmbeddingVerifier(self._cfg.embedding)
+        self._emb_verifier  = EmbeddingVerifier(self._cfg.embedding, graph_repo=graph_repo)
         self._llm_verifier  = (
             LLMVerifier(llm_service, self._cfg.llm)
             if llm_service is not None

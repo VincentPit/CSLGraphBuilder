@@ -21,6 +21,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from ..config.settings import CrawlerConfiguration
+from .crawler_cache import CrawlerCache
 
 
 class WebCrawler:
@@ -35,15 +36,20 @@ class WebCrawler:
     visited_file:
         Optional path to a file that persists visited URLs across runs.
         Pass ``None`` (default) to keep state in-memory only.
+    cache:
+        Optional ``CrawlerCache`` for URL-level content caching.  When
+        provided, already-crawled URLs return cached content instantly.
     """
 
     def __init__(
         self,
         config: CrawlerConfiguration,
         visited_file: Optional[str] = None,
+        cache: Optional[CrawlerCache] = None,
     ) -> None:
         self.config = config
         self.visited_file = visited_file
+        self.cache = cache or CrawlerCache()
         self.logger = logging.getLogger(self.__class__.__name__)
         self._visited: Set[str] = set()
 
@@ -113,9 +119,26 @@ class WebCrawler:
                     self.logger.debug("Skipping (domain filter): %s", url)
                     continue
 
+                # Check cache first
+                cached = self.cache.get(url)
+                if cached is not None:
+                    self._visited.add(url)
+                    pages[url] = cached.content
+                    self.logger.info(
+                        "Cache hit %s  (%d/%d)", url, len(self._visited), self.config.max_urls
+                    )
+                    new_links = _extract_links(cached.content, url)
+                    for link in new_links:
+                        if link not in self._visited and link not in queue:
+                            queue.append(link)
+                    continue
+
                 text = await self._fetch_text(session, url)
                 if text is None:
                     continue
+
+                # Store in cache
+                self.cache.put(url, text)
 
                 self._visited.add(url)
                 pages[url] = text

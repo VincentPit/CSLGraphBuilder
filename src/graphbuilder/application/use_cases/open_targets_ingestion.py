@@ -200,6 +200,8 @@ class OpenTargetsIngestionUseCase:
         entity.add_external_id("open_targets", disease.id)
         entity.metadata.add_tag(cfg.tag)
         entity.metadata.add_tag("disease")
+        entity.metadata.source_trust = "reviewed"
+        entity.metadata.source_system = "open_targets"
         entity.metadata.add_annotation(
             "therapeutic_areas",
             [ta.get("name") for ta in disease.therapeutic_areas],
@@ -224,6 +226,8 @@ class OpenTargetsIngestionUseCase:
         entity.add_external_id("ensembl", assoc.target_id)
         entity.metadata.add_tag(cfg.tag)
         entity.metadata.add_tag("target")
+        entity.metadata.source_trust = "reviewed"
+        entity.metadata.source_system = "open_targets"
         entity.metadata.add_tag(assoc.biotype)
         entity.properties["biotype"] = assoc.biotype
         entity.properties["approved_name"] = assoc.target_name
@@ -247,4 +251,6 @@ class OpenTargetsIngestionUseCase:
         rel.properties["association_score"] = assoc.association_score
         rel.properties["datatype_scores"] = assoc.datatype_scores
         rel.properties["source"] = "open_targets"
+        rel.metadata.source_trust = "reviewed"
+        rel.metadata.source_system = "open_targets"
         return rel

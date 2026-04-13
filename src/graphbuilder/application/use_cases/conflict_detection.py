@@ -23,9 +23,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from ...domain.models.graph_models import GraphEntity, GraphRelationship, KnowledgeGraph
+from ...domain.models.graph_models import GraphEntity, GraphRelationship, KnowledgeGraph, SourceTrust
 
 logger = logging.getLogger(__name__)
+
+
+def _trust_priority(trust_str: Optional[str]) -> int:
+    """Return numeric priority for a trust string.  Higher = more trusted."""
+    try:
+        return SourceTrust(trust_str).priority if trust_str else 0
+    except ValueError:
+        return 0
 
 
 class ConflictType(Enum):
@@ -52,12 +60,15 @@ class ConflictEntry:
     existing_relationship_type: str
     existing_description: str
     existing_source_chunk_ids: List[str]
+    existing_source_trust: Optional[str]
     new_relationship_type: str
     new_description: str
     new_source_chunk_ids: List[str]
+    new_source_trust: Optional[str]
     source_entity_name: str
     target_entity_name: str
     reasoning: str
+    requires_review: bool = False  # True when new low-trust claim conflicts with high-trust
 
 
 @dataclass
@@ -220,6 +231,18 @@ class KnowledgeConflictDetector:
             else:
                 return None
 
+        existing_trust = getattr(existing.metadata, 'source_trust', None) if hasattr(existing, 'metadata') else None
+        new_trust = getattr(new.metadata, 'source_trust', None) if hasattr(new, 'metadata') else None
+        # Requires review when existing is higher trust than new
+        requires_review = _trust_priority(existing_trust) > _trust_priority(new_trust)
+        if requires_review:
+            reasoning += (
+                f" [TRUST] Existing comes from '{existing_trust or 'unknown'}' source "
+                f"(priority {_trust_priority(existing_trust)}), new comes from "
+                f"'{new_trust or 'unknown'}' (priority {_trust_priority(new_trust)}). "
+                f"Review required before overwriting trusted knowledge."
+            )
+
         return ConflictEntry(
             conflict_type=conflict_type.value,
             severity=severity.value,
@@ -227,12 +250,15 @@ class KnowledgeConflictDetector:
             existing_relationship_type=existing.relationship_type.value,
             existing_description=existing.description or "",
             existing_source_chunk_ids=existing.source_chunk_ids,
+            existing_source_trust=existing_trust,
             new_relationship_type=new.relationship_type.value,
             new_description=new.description or "",
             new_source_chunk_ids=new.source_chunk_ids,
+            new_source_trust=new_trust,
             source_entity_name=src_name,
             target_entity_name=tgt_name,
             reasoning=reasoning,
+            requires_review=requires_review,
         )
 
     def _llm_conflict_check(
@@ -274,6 +300,10 @@ class KnowledgeConflictDetector:
             if verdict == "redundant" or verdict == "complementary":
                 return None
 
+            existing_trust = getattr(existing.metadata, 'source_trust', None) if hasattr(existing, 'metadata') else None
+            new_trust = getattr(new.metadata, 'source_trust', None) if hasattr(new, 'metadata') else None
+            requires_review = _trust_priority(existing_trust) > _trust_priority(new_trust)
+
             return ConflictEntry(
                 conflict_type=ConflictType.CONTRADICTORY.value,
                 severity=ConflictSeverity.HIGH.value,
@@ -281,12 +311,15 @@ class KnowledgeConflictDetector:
                 existing_relationship_type=existing.relationship_type.value,
                 existing_description=existing.description or "",
                 existing_source_chunk_ids=existing.source_chunk_ids,
+                existing_source_trust=existing_trust,
                 new_relationship_type=new.relationship_type.value,
                 new_description=new.description or "",
                 new_source_chunk_ids=new.source_chunk_ids,
+                new_source_trust=new_trust,
                 source_entity_name=src_name,
                 target_entity_name=tgt_name,
                 reasoning=f"LLM: {reasoning}",
+                requires_review=requires_review,
             )
         except Exception as exc:
             logger.warning("LLM conflict check failed: %s", exc)

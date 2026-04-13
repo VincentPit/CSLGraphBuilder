@@ -12,6 +12,7 @@ class EntityResponse(BaseModel):
     description: Optional[str] = None
     properties: Dict[str, Any] = {}
     confidence_score: Optional[float] = None
+    source_trust: Optional[str] = None
     curated: bool = False
     rejected: bool = False
     tags: List[str] = []
@@ -31,6 +32,7 @@ class RelationshipResponse(BaseModel):
     curated: bool = False
     verification_passed: Optional[bool] = None
     verification_confidence: Optional[float] = None
+    source_trust: Optional[str] = None
     source_chunk_ids: List[str] = []
     source_document_ids: List[str] = []
     created_at: datetime
@@ -76,15 +78,38 @@ class ConflictEntryResponse(BaseModel):
     existing_relationship_type: str
     existing_description: str
     existing_source_chunk_ids: List[str]
+    existing_source_trust: Optional[str] = None
     new_relationship_type: str
     new_description: str
     new_source_chunk_ids: List[str]
+    new_source_trust: Optional[str] = None
     source_entity_name: str
     target_entity_name: str
     reasoning: str
+    requires_review: bool = False
 
 
 class ConflictCheckResponse(BaseModel):
     total_checked: int
     conflicts_found: int
     conflicts: List[ConflictEntryResponse]
+
+
+# ── Pending Review Queue ──────────────────────────────────────────────────
+
+class PendingReviewItem(BaseModel):
+    review_id: str
+    conflict: ConflictEntryResponse
+    submitted_at: datetime
+    status: str = "pending"  # pending | approved | rejected
+
+
+class PendingReviewListResponse(BaseModel):
+    total: int
+    items: List[PendingReviewItem]
+
+
+class ReviewDecisionRequest(BaseModel):
+    review_id: str = Field(..., description="ID of the pending review item")
+    decision: str = Field(..., pattern="^(approve|reject)$", description="'approve' to inject, 'reject' to discard")
+    notes: Optional[str] = None

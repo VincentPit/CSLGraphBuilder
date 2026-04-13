@@ -7,17 +7,37 @@ from pydantic import BaseModel, Field
 # ── Curation ────────────────────────────────────────────────────────────────
 
 class CurationEventRequest(BaseModel):
+    """Accept the shape the frontend sends.
+
+    The frontend sends separate entity_id / relationship_id fields and simple
+    action names (approve, reject, flag, correct).  We normalise here.
+    """
+    entity_id: Optional[str] = None
+    relationship_id: Optional[str] = None
     action: str = Field(
         ...,
-        description=(
-            "One of: approve_entity, reject_entity, correct_entity, "
-            "approve_relationship, reject_relationship, correct_relationship"
-        ),
+        description="One of: approve, reject, flag, correct",
     )
-    target_id: str = Field(..., description="Entity or relationship ID")
-    curator: str = Field(..., min_length=1)
-    reason: Optional[str] = None
+    curator_id: Optional[str] = Field(None, description="Curator identifier")
+    notes: Optional[str] = None
     corrections: Optional[Dict[str, Any]] = None
+
+    @property
+    def target_id(self) -> str:
+        return self.entity_id or self.relationship_id or ""
+
+    @property
+    def target_type(self) -> str:
+        return "entity" if self.entity_id else "relationship"
+
+    @property
+    def resolved_action(self) -> str:
+        """Map short action + target type to CurationAction value."""
+        base = self.action.lower()
+        if base == "flag":
+            base = "reject"  # flags treated as soft rejections
+        suffix = self.target_type
+        return f"{base}_{suffix}"
 
 
 class CurationBatchRequest(BaseModel):
@@ -26,11 +46,9 @@ class CurationBatchRequest(BaseModel):
 
 
 class CurationResultResponse(BaseModel):
-    success: bool
-    applied: int
+    processed: int
     failed: int
-    audit_log: List[Dict[str, Any]]
-    message: str
+    errors: List[str] = []
 
 
 # ── Verification ─────────────────────────────────────────────────────────────

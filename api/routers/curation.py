@@ -28,25 +28,32 @@ def submit_curation_events(
     errors = []
     for event in request.events:
         try:
-            action = CurationAction(event.action.value)
-            req = CurationRequest(
-                entity_id=event.entity_id,
-                relationship_id=event.relationship_id,
-                action=action,
-                curator_id=event.curator_id,
-                notes=event.notes,
-                correction=event.correction,
-            )
+            action = CurationAction(event.resolved_action)
+            curator = event.curator_id or "anonymous"
+            curation_req = CurationRequest(curator=curator)
+            target = event.target_id
+            reason = event.notes or ""
+
+            if action == CurationAction.APPROVE_ENTITY:
+                curation_req.approve_entity(target, reason)
+            elif action == CurationAction.REJECT_ENTITY:
+                curation_req.reject_entity(target, reason)
+            elif action == CurationAction.CORRECT_ENTITY:
+                curation_req.correct_entity(target, event.corrections or {}, reason)
+            elif action == CurationAction.APPROVE_RELATIONSHIP:
+                curation_req.approve_relationship(target, reason)
+            elif action == CurationAction.REJECT_RELATIONSHIP:
+                curation_req.reject_relationship(target, reason)
+            elif action == CurationAction.CORRECT_RELATIONSHIP:
+                curation_req.correct_relationship(target, event.corrections or {}, reason)
+            else:
+                errors.append(f"Unknown action: {event.resolved_action}")
+                continue
+
             use_case = CurationUseCase(graph_repo, config)
-            result = use_case.execute(req)
+            result = use_case.execute(curation_req)
             if result.success:
-                results.append(
-                    {
-                        "entity_id": event.entity_id,
-                        "relationship_id": event.relationship_id,
-                        "status": "ok",
-                    }
-                )
+                results.append({"target_id": target, "status": "ok"})
             else:
                 errors.append(result.message)
         except Exception as exc:

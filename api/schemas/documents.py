@@ -9,9 +9,16 @@ class ProcessDocumentRequest(BaseModel):
     url: Optional[str] = None
     text: Optional[str] = None
     title: Optional[str] = None
+    source_label: Optional[str] = Field(None, description="Alias for title (frontend compat)")
     tags: List[str] = []
     chunk_size: Optional[int] = Field(None, ge=64, le=4096)
     chunk_overlap: Optional[int] = Field(None, ge=0, le=512)
+
+    @model_validator(mode="after")
+    def coalesce_title(self) -> "ProcessDocumentRequest":
+        if not self.title and self.source_label:
+            self.title = self.source_label
+        return self
 
     @model_validator(mode="after")
     def require_url_or_text(self) -> "ProcessDocumentRequest":

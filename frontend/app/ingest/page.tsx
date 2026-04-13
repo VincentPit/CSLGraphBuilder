@@ -169,7 +169,7 @@ export default function IngestPage() {
           <Field label="Query" hint="PubMed syntax supported"><input required className={inputClass} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="BRCA1 AND cancer" /></Field>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Field label="Max Articles"><input className={inputClass} type="number" value={maxArticles} onChange={(e) => setMaxArticles(e.target.value)} /></Field>
-            <Field label="Email"><input className={inputClass} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" /></Field>
+            <Field label="Email" hint="Required by NCBI"><input required className={inputClass} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" /></Field>
           </div>
           <Field label="Tag" hint="Optional batch label"><input className={inputClass} value={pmTag} onChange={(e) => setPmTag(e.target.value)} placeholder="pubmed-brca" /></Field>
           <button className="btn-primary" disabled={loading}>

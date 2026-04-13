@@ -140,7 +140,7 @@ graphbuilder process --url https://... \
 **4. Verify relationships**
 
 ```bash
-graphbuilder verify --method cascading --context-file context.txt
+graphbuilder verify --context-file context.txt
 ```
 
 ---
@@ -279,9 +279,19 @@ graphbuilder ingest --source pubmed --query "FVIII hemophilia" --max-results 50
 ### `verify`
 
 ```bash
-graphbuilder verify --method cascading --context-file context.txt
-graphbuilder verify --method text-match
-graphbuilder verify --method embedding --threshold 0.6
+# Full cascading pipeline (default: text-match → embedding → LLM)
+graphbuilder verify --context-file context.txt
+
+# Disable individual stages
+graphbuilder verify --no-llm
+graphbuilder verify --no-embedding --no-llm          # text-match only
+
+# Tune embedding threshold
+graphbuilder verify --threshold 0.6
+
+# Early exit strategies
+graphbuilder verify --early-exit-pass                 # stop on first pass
+graphbuilder verify --early-exit-fail                 # stop on first fail
 ```
 
 ### `visualize`

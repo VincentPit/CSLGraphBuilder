@@ -6,7 +6,7 @@ Covers:
   - TextMatchVerifier (pass / fail / edge cases)
   - EmbeddingVerifier (graceful skip when sentence-transformers absent)
   - LLMVerifier (valid / invalid / uncertain / malformed JSON)
-  - CascadingVerifier (majority vote, early exit, all-skip)
+  - CascadingVerifier (escalation bands, decisive exit, all-skip)
   - RelationshipVerificationUseCase (annotation side-effects, report shape)
 """
 
@@ -341,14 +341,18 @@ class TestCascadingVerifier:
         assert result.stage == VerificationStage.CASCADING
         assert result.passed
 
-    def test_early_exit_on_pass_skips_later_stages(self):
-        """With early_exit_on_pass, a passing TextMatch should prevent Embedding running."""
+    def test_decisive_pass_skips_later_stages(self):
+        """A decisive PASS from TextMatch (confidence ≥ escalation_upper) should skip Embedding."""
         cfg = CascadingVerifierConfig(
             enable_embedding=True,
             enable_llm=False,
-            early_exit_on_pass=True,
+            escalation_upper=0.7,
         )
         v = CascadingVerifier(config=cfg)
+
+        # Patch text verifier to return a decisive PASS (confidence 0.9 ≥ 0.7)
+        v._text_verifier.verify = lambda **kw: self._pass_result(VerificationStage.TEXT_MATCH, conf=0.9)
+
         # Override the embedding verifier to detect if it was called
         called = []
         original_verify = v._emb_verifier.verify
@@ -359,9 +363,60 @@ class TestCascadingVerifier:
 
         rel = _make_rel()
         result = v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
-        # embedding stage should NOT have been called because text match passed first
+        # embedding stage should NOT have been called because text match was decisive
         assert len(called) == 0
         assert result.stage == VerificationStage.CASCADING
+        assert result.passed
+
+    def test_inconclusive_result_escalates_to_next_stage(self):
+        """An inconclusive TextMatch (confidence within escalation band) should trigger Embedding."""
+        cfg = CascadingVerifierConfig(
+            enable_embedding=True,
+            enable_llm=False,
+            escalation_lower=0.3,
+            escalation_upper=0.7,
+        )
+        v = CascadingVerifier(config=cfg)
+
+        # Patch text verifier to return inconclusive result (0.5 is within [0.3, 0.7))
+        v._text_verifier.verify = lambda **kw: self._pass_result(VerificationStage.TEXT_MATCH, conf=0.5)
+
+        # Track embedding calls
+        called = []
+        original_verify = v._emb_verifier.verify
+        def spy(**kw):
+            called.append(True)
+            return original_verify(**kw)
+        v._emb_verifier.verify = spy
+
+        rel = _make_rel()
+        result = v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
+        # Embedding SHOULD have been called because text match was inconclusive
+        assert len(called) == 1
+
+    def test_decisive_fail_skips_later_stages(self):
+        """A decisive FAIL from TextMatch (confidence < escalation_lower) should skip remaining stages."""
+        cfg = CascadingVerifierConfig(
+            enable_embedding=True,
+            enable_llm=False,
+            escalation_lower=0.3,
+        )
+        v = CascadingVerifier(config=cfg)
+
+        # Patch text verifier to return a decisive FAIL (confidence 0.1 < 0.3)
+        v._text_verifier.verify = lambda **kw: self._fail_result(VerificationStage.TEXT_MATCH, conf=0.1)
+
+        called = []
+        original_verify = v._emb_verifier.verify
+        def spy(**kw):
+            called.append(True)
+            return original_verify(**kw)
+        v._emb_verifier.verify = spy
+
+        rel = _make_rel()
+        result = v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
+        assert len(called) == 0
+        assert result.failed
 
     def test_no_stages_enabled_returns_failed(self):
         cfg = CascadingVerifierConfig(
@@ -375,16 +430,15 @@ class TestCascadingVerifier:
         assert result.failed
         assert result.confidence == 0.0
 
-    def test_majority_vote_two_pass_one_fail(self):
-        """2 passes, 1 fail → PASSED by majority."""
+    def test_weighted_confidence_pass(self):
+        """Single stage passes with high confidence → weighted confidence ≥ threshold → PASSED."""
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=False)
         v = CascadingVerifier(config=cfg)
 
-        # Patch text verifier to return PASSED
+        # Patch text verifier to return PASSED with high confidence
         v._text_verifier.verify = lambda **kw: self._pass_result(VerificationStage.TEXT_MATCH)
 
         result = v.verify(_make_rel(), "ctx")
-        # Only one stage ran — but it passed → majority pass
         assert result.passed
 
     def test_stage_results_included_in_cascading_result(self):

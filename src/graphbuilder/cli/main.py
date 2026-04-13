@@ -1047,22 +1047,26 @@ def export(ctx: click.Context, fmt: str, output: Optional[str], title: str,
               help='Disable the embedding stage (no sentence-transformers needed).')
 @click.option('--no-llm', is_flag=True, default=False,
               help='Disable the LLM stage.')
-@click.option('--early-exit-pass', is_flag=True, default=False,
-              help='Stop pipeline as soon as a stage passes.')
-@click.option('--early-exit-fail', is_flag=True, default=False,
-              help='Stop pipeline as soon as a stage fails.')
+@click.option('--escalation-lower', default=0.3, show_default=True, type=float,
+              help='Confidence below this is a decisive FAIL (skips later stages).')
+@click.option('--escalation-upper', default=0.7, show_default=True, type=float,
+              help='Confidence at or above this is a decisive PASS (skips later stages).')
 @click.option('--threshold', default=0.5, show_default=True, type=float,
               help='Cosine similarity threshold for the embedding stage.')
 @click.option('--context-file', default=None,
               help='JSON file mapping relationship_id → context string.')
 @click.pass_context
 def verify(ctx: click.Context, output: str, no_embedding: bool, no_llm: bool,
-           early_exit_pass: bool, early_exit_fail: bool,
+           escalation_lower: float, escalation_upper: float,
            threshold: float, context_file: Optional[str]) -> None:
     """Verify relationships in the graph using the cascading pipeline.
 
     \b
-    Runs up to three stages for each relationship:
+    Stages run in order of increasing cost.  Each stage only runs if the
+    previous stage's confidence falls within the uncertainty band
+    [escalation-lower, escalation-upper].  A decisive result at any
+    stage terminates the cascade early.
+
       1. TextMatch  — lexical term presence check
       2. Embedding  — cosine similarity via sentence-transformers
       3. LLM        — structured LLM prompt with reasoning trace
@@ -1092,8 +1096,8 @@ def verify(ctx: click.Context, output: str, no_embedding: bool, no_llm: bool,
                 embedding=emb_cfg,
                 enable_embedding=not no_embedding,
                 enable_llm=not no_llm,
-                early_exit_on_pass=early_exit_pass,
-                early_exit_on_fail=early_exit_fail,
+                escalation_lower=escalation_lower,
+                escalation_upper=escalation_upper,
             )
 
             config = app.config

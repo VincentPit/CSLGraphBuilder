@@ -55,7 +55,7 @@ Neo4j Knowledge Graph
   Relationship.desc_embedding← 384-d float[] vector index (cosine)
         │
         ▼
-Relationship Verification Pipeline (cascading, majority vote)
+Relationship Verification Pipeline (cascading with escalation bands)
   Stage 1 — TextMatchVerifier     ← regex / exact string pattern match
   Stage 2 — EmbeddingVerifier     ← cosine similarity + Neo4j vector search
   Stage 3 — LLMVerifier           ← structured LLM prompt with reasoning trace
@@ -79,7 +79,7 @@ REST API (FastAPI)  ←→  Next.js 14 Frontend (React, Tailwind, react-force-gr
 - **LLM entity & relationship extraction** — GPT-4 powered extraction with configurable schema constraints (`allowed_nodes`, `allowed_relationships`, `strict_mode`)
 - **Two-stage LLM deduplication** — Vector pre-filter (low threshold, cheap) followed by LLM confirmation for domain-aware synonym resolution across abbreviations, alternate names, and scientific notation
 - **Neo4j vector search** — Native vector indexes on entity names and relationship descriptions for fast approximate nearest-neighbour queries
-- **Cascading verification pipeline** — Three-stage (text match → embedding → LLM) verification with configurable thresholds, early exit, and majority voting
+- **Cascading verification pipeline** — Three-stage (text match → embedding → LLM) verification with confidence-based escalation; cheap stages run first and expensive stages only fire when earlier results are inconclusive
 - **Conflict detection** — Automatic identification of contradictory relationships (e.g. INHIBITS vs ACTIVATES between the same entity pair) with severity scoring
 - **Provenance tracking** — Every entity and relationship links back to source documents, chunks, and extraction metadata
 - **Source trust** — Configurable trust levels per source; higher-trust sources win in merge conflicts
@@ -286,12 +286,11 @@ graphbuilder verify --context-file context.txt
 graphbuilder verify --no-llm
 graphbuilder verify --no-embedding --no-llm          # text-match only
 
+# Tune escalation band (controls when later stages are triggered)
+graphbuilder verify --escalation-lower 0.2 --escalation-upper 0.8
+
 # Tune embedding threshold
 graphbuilder verify --threshold 0.6
-
-# Early exit strategies
-graphbuilder verify --early-exit-pass                 # stop on first pass
-graphbuilder verify --early-exit-fail                 # stop on first fail
 ```
 
 ### `visualize`

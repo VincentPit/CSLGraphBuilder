@@ -34,8 +34,8 @@ async def run_verification(
         enable_text_match=True,
         enable_embedding=request.enable_embedding,
         enable_llm=request.enable_llm,
-        early_exit_on_pass=request.early_exit_on_pass,
-        early_exit_on_fail=request.early_exit_on_fail,
+        escalation_lower=request.escalation_lower,
+        escalation_upper=request.escalation_upper,
     )
     ver_cfg = VerificationConfig(
         cascading=cascading_cfg,
@@ -152,8 +152,8 @@ async def verify_text(
         enable_text_match=True,
         enable_embedding=request.enable_embedding,
         enable_llm=request.enable_llm,
-        early_exit_on_pass=request.early_exit_on_pass,
-        early_exit_on_fail=request.early_exit_on_fail,
+        escalation_lower=request.escalation_lower,
+        escalation_upper=request.escalation_upper,
     )
     ver_cfg = TextVerificationConfig(
         cascading=cascading_cfg,

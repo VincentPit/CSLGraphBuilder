@@ -62,8 +62,8 @@ class VerificationRunRequest(BaseModel):
     enable_embedding: bool = False
     enable_llm: bool = False
     embedding_threshold: float = Field(0.5, ge=0.0, le=1.0)
-    early_exit_on_pass: bool = False
-    early_exit_on_fail: bool = False
+    escalation_lower: float = Field(0.3, ge=0.0, le=1.0, description="Confidence below this is a decisive FAIL")
+    escalation_upper: float = Field(0.7, ge=0.0, le=1.0, description="Confidence at or above this is a decisive PASS")
     context_map: Dict[str, str] = Field(
         default_factory=dict,
         description="Optional map of relationship_id → supporting context string",
@@ -108,8 +108,8 @@ class TextVerificationRequest(BaseModel):
     enable_embedding: bool = False
     enable_llm: bool = False
     embedding_threshold: float = Field(0.5, ge=0.0, le=1.0)
-    early_exit_on_pass: bool = False
-    early_exit_on_fail: bool = False
+    escalation_lower: float = Field(0.3, ge=0.0, le=1.0, description="Confidence below this is a decisive FAIL")
+    escalation_upper: float = Field(0.7, ge=0.0, le=1.0, description="Confidence at or above this is a decisive PASS")
     max_candidates: int = Field(20, ge=1, le=100)
 
 

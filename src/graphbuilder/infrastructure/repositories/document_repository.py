@@ -54,6 +54,11 @@ class DocumentRepositoryInterface(ABC):
         """Get all chunks for a document."""
         pass
 
+    @abstractmethod
+    async def save_chunks_with_links(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """Save a batch of chunks and create NEXT_CHUNK linked-list edges between them."""
+        pass
+
 
 class Neo4jDocumentRepository(DocumentRepositoryInterface):
     """
@@ -209,6 +214,72 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
                 return chunk
             else:
                 raise RuntimeError(f"Failed to save chunk: {chunk.id}")
+
+    async def save_chunks_with_links(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """Save a batch of ordered chunks, create HAS_CHUNK + NEXT_CHUNK edges."""
+        if not chunks:
+            return []
+
+        # Sort by chunk_index to guarantee correct ordering
+        sorted_chunks = sorted(chunks, key=lambda c: c.chunk_index)
+
+        async with self.driver.session() as session:
+            # 1) Create all chunk nodes and HAS_CHUNK edges
+            batch_data = []
+            for chunk in sorted_chunks:
+                props = chunk.to_dict()
+                props.pop('id', None)
+                batch_data.append({
+                    'chunk_id': chunk.id,
+                    'document_id': chunk.document_id,
+                    'properties': props,
+                })
+
+            create_query = """
+            UNWIND $batch AS data
+            MATCH (d:Document {id: data.document_id})
+            MERGE (c:DocumentChunk {id: data.chunk_id})
+            SET c += data.properties, c.updated_at = datetime()
+            MERGE (d)-[:HAS_CHUNK]->(c)
+            """
+            await session.run(create_query, {'batch': batch_data})
+
+            # 2) FIRST_CHUNK edge
+            first_chunk = sorted_chunks[0]
+            await session.run(
+                """
+                MATCH (d:Document {id: $doc_id})
+                MATCH (c:DocumentChunk {id: $chunk_id})
+                MERGE (d)-[:FIRST_CHUNK]->(c)
+                """,
+                {'doc_id': first_chunk.document_id, 'chunk_id': first_chunk.id},
+            )
+
+            # 3) NEXT_CHUNK linked-list edges
+            if len(sorted_chunks) > 1:
+                link_data = [
+                    {
+                        'prev_id': sorted_chunks[i].id,
+                        'next_id': sorted_chunks[i + 1].id,
+                    }
+                    for i in range(len(sorted_chunks) - 1)
+                ]
+                await session.run(
+                    """
+                    UNWIND $links AS link
+                    MATCH (prev:DocumentChunk {id: link.prev_id})
+                    MATCH (next:DocumentChunk {id: link.next_id})
+                    MERGE (prev)-[:NEXT_CHUNK]->(next)
+                    """,
+                    {'links': link_data},
+                )
+
+        self.logger.info(
+            "Saved %d chunks with linked-list edges for document %s",
+            len(sorted_chunks),
+            sorted_chunks[0].document_id,
+        )
+        return sorted_chunks
     
     async def get_chunks_by_document_id(self, document_id: str) -> List[DocumentChunk]:
         """Get all chunks for a document ordered by chunk index."""

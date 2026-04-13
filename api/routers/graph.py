@@ -31,6 +31,8 @@ def _entity_to_response(e) -> EntityResponse:
         curated=ann.get("curated", False),
         rejected=ann.get("rejected", False),
         tags=tags,
+        source_chunk_ids=list(getattr(e, "source_chunk_ids", []) or []),
+        source_document_ids=list(getattr(e, "source_document_ids", []) or []),
         created_at=e.metadata.created_at,
         updated_at=e.metadata.updated_at,
     )
@@ -48,6 +50,8 @@ def _rel_to_response(r) -> RelationshipResponse:
         curated=ann.get("curated", False),
         verification_passed=ann.get("verification_passed"),
         verification_confidence=ann.get("verification_confidence"),
+        source_chunk_ids=list(getattr(r, "source_chunk_ids", []) or []),
+        source_document_ids=list(getattr(r, "source_document_ids", []) or []),
         created_at=r.metadata.created_at,
         updated_at=r.metadata.updated_at,
     )

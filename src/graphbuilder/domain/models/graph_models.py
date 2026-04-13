@@ -154,6 +154,8 @@ class GraphEntity(DomainEntity):
     properties: Dict[str, Any] = field(default_factory=dict)
     aliases: Set[str] = field(default_factory=set)
     external_ids: Dict[str, str] = field(default_factory=dict)
+    source_chunk_ids: List[str] = field(default_factory=list)
+    source_document_ids: List[str] = field(default_factory=list)
     
     def __post_init__(self):
         """Post-initialization setup."""
@@ -187,6 +189,14 @@ class GraphEntity(DomainEntity):
         self.external_ids[system] = external_id
         self.metadata.update()
     
+    def add_source_chunk(self, chunk_id: str, document_id: Optional[str] = None) -> None:
+        """Record that this entity was extracted from a document chunk."""
+        if chunk_id and chunk_id not in self.source_chunk_ids:
+            self.source_chunk_ids.append(chunk_id)
+        if document_id and document_id not in self.source_document_ids:
+            self.source_document_ids.append(document_id)
+        self.metadata.update()
+    
     def merge_with(self, other: 'GraphEntity') -> 'GraphEntity':
         """Merge this entity with another entity."""
         if self.entity_type != other.entity_type:
@@ -213,6 +223,18 @@ class GraphEntity(DomainEntity):
         merged_entity.external_ids.update(self.external_ids)
         merged_entity.external_ids.update(other.external_ids)
         
+        # Merge provenance
+        seen_chunks = set(merged_entity.source_chunk_ids)
+        for cid in self.source_chunk_ids + other.source_chunk_ids:
+            if cid not in seen_chunks:
+                merged_entity.source_chunk_ids.append(cid)
+                seen_chunks.add(cid)
+        seen_docs = set(merged_entity.source_document_ids)
+        for did in self.source_document_ids + other.source_document_ids:
+            if did not in seen_docs:
+                merged_entity.source_document_ids.append(did)
+                seen_docs.add(did)
+        
         # Update metadata
         merged_entity.metadata.tags.update(self.metadata.tags)
         merged_entity.metadata.tags.update(other.metadata.tags)
@@ -231,6 +253,8 @@ class GraphEntity(DomainEntity):
             "properties": self.properties,
             "aliases": list(self.aliases),
             "external_ids": self.external_ids,
+            "source_chunk_ids": self.source_chunk_ids,
+            "source_document_ids": self.source_document_ids,
             "metadata": {
                 "created_at": self.metadata.created_at.isoformat(),
                 "updated_at": self.metadata.updated_at.isoformat(),
@@ -258,6 +282,8 @@ class GraphRelationship(DomainEntity):
     properties: Dict[str, Any] = field(default_factory=dict)
     strength: float = 1.0  # Relationship strength (0.0 - 1.0)
     temporal_validity: Optional[Dict[str, datetime]] = None  # start_date, end_date
+    source_chunk_ids: List[str] = field(default_factory=list)
+    source_document_ids: List[str] = field(default_factory=list)
     
     def __post_init__(self):
         """Post-initialization setup."""
@@ -287,6 +313,14 @@ class GraphRelationship(DomainEntity):
     def add_property(self, key: str, value: Any) -> None:
         """Add or update a property."""
         self.properties[key] = value
+        self.metadata.update()
+    
+    def add_source_chunk(self, chunk_id: str, document_id: Optional[str] = None) -> None:
+        """Record that this relationship was extracted from a document chunk."""
+        if chunk_id and chunk_id not in self.source_chunk_ids:
+            self.source_chunk_ids.append(chunk_id)
+        if document_id and document_id not in self.source_document_ids:
+            self.source_document_ids.append(document_id)
         self.metadata.update()
     
     def set_temporal_validity(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> None:
@@ -328,6 +362,8 @@ class GraphRelationship(DomainEntity):
             "description": self.description,
             "properties": self.properties,
             "strength": self.strength,
+            "source_chunk_ids": self.source_chunk_ids,
+            "source_document_ids": self.source_document_ids,
             "metadata": {
                 "created_at": self.metadata.created_at.isoformat(),
                 "updated_at": self.metadata.updated_at.isoformat(),

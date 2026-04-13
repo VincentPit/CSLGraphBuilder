@@ -133,6 +133,7 @@ class ProcessingConfiguration:
     chunk_size: int = field(default_factory=lambda: int(os.getenv("PROCESSING_CHUNK_SIZE", "512")))
     chunk_overlap: int = field(default_factory=lambda: int(os.getenv("PROCESSING_CHUNK_OVERLAP", "50")))
     max_chunks_per_document: int = field(default_factory=lambda: int(os.getenv("PROCESSING_MAX_CHUNKS", "1000")))
+    chunking_strategy: str = field(default_factory=lambda: os.getenv("PROCESSING_CHUNKING_STRATEGY", "semantic"))  # "semantic" or "fixed"
     
     # Language detection and processing
     auto_detect_language: bool = field(default_factory=lambda: os.getenv("PROCESSING_AUTO_DETECT_LANG", "true").lower() == "true")

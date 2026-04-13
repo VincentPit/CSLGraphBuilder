@@ -69,6 +69,10 @@ class GraphRepositoryInterface(ABC):
         """Return all relationships as {id: relationship} dict."""
         raise NotImplementedError
 
+    async def search_entities_by_text(self, terms: List[str], limit: int = 50) -> Dict[str, 'GraphEntity']:
+        """Search entities whose name or description contains any of the given terms."""
+        raise NotImplementedError
+
 
 class Neo4jGraphRepository(GraphRepositoryInterface):
     """
@@ -117,14 +121,14 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                     self.logger.debug(f"Schema creation result: {str(e)}")
     
     async def save_entity(self, entity: GraphEntity) -> GraphEntity:
-        """Save entity to Neo4j graph database."""
+        """Save entity to Neo4j graph database with provenance tracking."""
         
         async with self.driver.session() as session:
             # Check for existing entity with same name and type
             existing_query = """
             MATCH (e:Entity)
             WHERE e.name = $name AND e.entity_type = $entity_type
-            RETURN e.id as existing_id
+            RETURN e.id as existing_id, e.source_chunk_ids as existing_chunks, e.source_document_ids as existing_docs
             """
             
             result = await session.run(existing_query, {
@@ -135,11 +139,20 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             existing_record = await result.single()
             
             if existing_record:
-                # Update existing entity
+                # Update existing entity — merge provenance
                 existing_id = existing_record['existing_id']
+                existing_chunks = existing_record.get('existing_chunks') or []
+                existing_docs = existing_record.get('existing_docs') or []
+
+                # Merge chunk/doc IDs (deduplicated)
+                merged_chunks = list(dict.fromkeys(existing_chunks + entity.source_chunk_ids))
+                merged_docs = list(dict.fromkeys(existing_docs + entity.source_document_ids))
+
                 update_query = """
                 MATCH (e:Entity {id: $existing_id})
                 SET e += $properties,
+                    e.source_chunk_ids = $source_chunk_ids,
+                    e.source_document_ids = $source_document_ids,
                     e.updated_at = datetime(),
                     e.version = e.version + 1
                 RETURN e
@@ -147,13 +160,28 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 
                 properties = entity.to_dict()
                 properties.pop('id', None)
+                properties.pop('source_chunk_ids', None)
+                properties.pop('source_document_ids', None)
                 
                 await session.run(update_query, {
                     'existing_id': existing_id,
-                    'properties': properties
+                    'properties': properties,
+                    'source_chunk_ids': merged_chunks,
+                    'source_document_ids': merged_docs,
                 })
+
+                # Create EXTRACTED_FROM edges for new chunks
+                for chunk_id in entity.source_chunk_ids:
+                    if chunk_id not in existing_chunks:
+                        await session.run(
+                            "MATCH (e:Entity {id: $eid}), (c:DocumentChunk {id: $cid}) "
+                            "MERGE (e)-[:EXTRACTED_FROM]->(c)",
+                            {"eid": existing_id, "cid": chunk_id},
+                        )
                 
                 entity.id = existing_id
+                entity.source_chunk_ids = merged_chunks
+                entity.source_document_ids = merged_docs
                 self.logger.debug(f"Updated existing entity: {entity.id}")
                 
             else:
@@ -161,6 +189,8 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 create_query = """
                 CREATE (e:Entity {id: $id})
                 SET e += $properties,
+                    e.source_chunk_ids = $source_chunk_ids,
+                    e.source_document_ids = $source_document_ids,
                     e.created_at = datetime(),
                     e.updated_at = datetime(),
                     e.version = 1
@@ -169,12 +199,24 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 
                 properties = entity.to_dict()
                 properties.pop('id', None)
+                properties.pop('source_chunk_ids', None)
+                properties.pop('source_document_ids', None)
                 properties['content_hash'] = entity.get_hash()
                 
                 await session.run(create_query, {
                     'id': entity.id,
-                    'properties': properties
+                    'properties': properties,
+                    'source_chunk_ids': entity.source_chunk_ids,
+                    'source_document_ids': entity.source_document_ids,
                 })
+
+                # Create EXTRACTED_FROM edges
+                for chunk_id in entity.source_chunk_ids:
+                    await session.run(
+                        "MATCH (e:Entity {id: $eid}), (c:DocumentChunk {id: $cid}) "
+                        "MERGE (e)-[:EXTRACTED_FROM]->(c)",
+                        {"eid": entity.id, "cid": chunk_id},
+                    )
                 
                 self.logger.debug(f"Created new entity: {entity.id}")
         
@@ -199,7 +241,12 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             return None
     
     async def save_relationship(self, relationship: GraphRelationship) -> GraphRelationship:
-        """Save relationship to Neo4j graph database."""
+        """Save relationship to Neo4j graph database with provenance tracking.
+        
+        If a relationship between the same source/target with the same type
+        already exists, merges provenance (source chunks) instead of creating
+        a duplicate.
+        """
         
         async with self.driver.session() as session:
             # Check if entities exist
@@ -216,29 +263,94 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             entities_record = await result.single()
             if not entities_record:
                 raise ValueError(f"Source or target entity not found for relationship {relationship.id}")
-            
-            # Create relationship
-            create_query = """
-            MATCH (source:Entity {id: $source_id}), (target:Entity {id: $target_id})
-            MERGE (source)-[r:RELATES {id: $relationship_id}]->(target)
-            SET r += $properties,
-                r.created_at = datetime(),
-                r.updated_at = datetime(),
-                r.version = 1
-            RETURN r
+
+            # Check for existing relationship between same entities with same type
+            existing_query = """
+            MATCH (source:Entity {id: $source_id})-[r:RELATES]->(target:Entity {id: $target_id})
+            WHERE r.relationship_type = $rel_type
+            RETURN r.id as existing_id, r.source_chunk_ids as existing_chunks, 
+                   r.source_document_ids as existing_docs, r.description as existing_desc
             """
-            
-            properties = relationship.to_dict()
-            properties.pop('id', None)
-            
-            await session.run(create_query, {
+            existing_result = await session.run(existing_query, {
                 'source_id': relationship.source_entity_id,
                 'target_id': relationship.target_entity_id,
-                'relationship_id': relationship.id,
-                'properties': properties
+                'rel_type': relationship.relationship_type.value,
             })
-            
-            self.logger.debug(f"Created relationship: {relationship.id}")
+            existing_record = await existing_result.single()
+
+            if existing_record:
+                # Merge provenance into existing relationship
+                existing_id = existing_record['existing_id']
+                existing_chunks = existing_record.get('existing_chunks') or []
+                existing_docs = existing_record.get('existing_docs') or []
+                merged_chunks = list(dict.fromkeys(existing_chunks + relationship.source_chunk_ids))
+                merged_docs = list(dict.fromkeys(existing_docs + relationship.source_document_ids))
+
+                update_query = """
+                MATCH ()-[r:RELATES {id: $existing_id}]->()
+                SET r.source_chunk_ids = $source_chunk_ids,
+                    r.source_document_ids = $source_document_ids,
+                    r.updated_at = datetime(),
+                    r.version = r.version + 1
+                RETURN r
+                """
+                await session.run(update_query, {
+                    'existing_id': existing_id,
+                    'source_chunk_ids': merged_chunks,
+                    'source_document_ids': merged_docs,
+                })
+
+                # Create EXTRACTED_FROM edges for new chunks
+                for chunk_id in relationship.source_chunk_ids:
+                    if chunk_id not in existing_chunks:
+                        await session.run(
+                            "MATCH ()-[r:RELATES {id: $rid}]->(), (c:DocumentChunk {id: $cid}) "
+                            "WITH r, c MATCH (s:Entity {id: r.source_entity_id}) "
+                            "MERGE (s)-[:REL_EXTRACTED_FROM {relationship_id: $rid}]->(c)",
+                            {"rid": existing_id, "cid": chunk_id},
+                        )
+
+                relationship.id = existing_id
+                relationship.source_chunk_ids = merged_chunks
+                relationship.source_document_ids = merged_docs
+                self.logger.debug(f"Merged provenance into existing relationship: {existing_id}")
+            else:
+                # Create new relationship
+                create_query = """
+                MATCH (source:Entity {id: $source_id}), (target:Entity {id: $target_id})
+                MERGE (source)-[r:RELATES {id: $relationship_id}]->(target)
+                SET r += $properties,
+                    r.source_chunk_ids = $source_chunk_ids,
+                    r.source_document_ids = $source_document_ids,
+                    r.created_at = datetime(),
+                    r.updated_at = datetime(),
+                    r.version = 1
+                RETURN r
+                """
+                
+                properties = relationship.to_dict()
+                properties.pop('id', None)
+                properties.pop('source_chunk_ids', None)
+                properties.pop('source_document_ids', None)
+                
+                await session.run(create_query, {
+                    'source_id': relationship.source_entity_id,
+                    'target_id': relationship.target_entity_id,
+                    'relationship_id': relationship.id,
+                    'properties': properties,
+                    'source_chunk_ids': relationship.source_chunk_ids,
+                    'source_document_ids': relationship.source_document_ids,
+                })
+
+                # Create EXTRACTED_FROM edges for chunks
+                for chunk_id in relationship.source_chunk_ids:
+                    await session.run(
+                        "MATCH (e:Entity {id: $eid}), (c:DocumentChunk {id: $cid}) "
+                        "MERGE (e)-[:REL_EXTRACTED_FROM {relationship_id: $rid}]->(c)",
+                        {"eid": relationship.source_entity_id, "rid": relationship.id, "cid": chunk_id},
+                    )
+                
+                self.logger.debug(f"Created relationship: {relationship.id}")
             return relationship
     
     async def get_relationship_by_id(self, relationship_id: str) -> Optional[GraphRelationship]:
@@ -404,6 +516,30 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                     self.logger.debug("Skipping relationship: %s", exc)
             return rels
 
+    async def search_entities_by_text(self, terms: List[str], limit: int = 50) -> Dict[str, GraphEntity]:
+        """Search entities using the full-text index on name/description."""
+        if not terms:
+            return {}
+
+        # Build a Lucene query: term1 OR term2 OR ...
+        lucene_query = " OR ".join(terms)
+        query = (
+            "CALL db.index.fulltext.queryNodes('entity_search', $query, {limit: $limit}) "
+            "YIELD node, score "
+            "RETURN node"
+        )
+        async with self.driver.session() as session:
+            result = await session.run(query, {"query": lucene_query, "limit": limit})
+            entities = {}
+            async for record in result:
+                data = dict(record['node'])
+                try:
+                    entity = self._create_entity_from_data(data)
+                    entities[entity.id] = entity
+                except Exception as exc:
+                    self.logger.debug("Skipping entity from search: %s", exc)
+            return entities
+
     async def get_graph_statistics(self) -> Dict[str, Any]:
         """Get comprehensive graph statistics."""
         
@@ -507,6 +643,8 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             properties=data.get('properties', {}) if isinstance(data.get('properties'), dict) else {},
             aliases=set(data.get('aliases', [])) if data.get('aliases') else set(),
             external_ids=data.get('external_ids', {}) if isinstance(data.get('external_ids'), dict) else {},
+            source_chunk_ids=list(data.get('source_chunk_ids') or []),
+            source_document_ids=list(data.get('source_document_ids') or []),
         )
         entity.id = data.get('id', entity.id)
         
@@ -535,6 +673,8 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             description=data.get('description'),
             properties=data.get('properties', {}) if isinstance(data.get('properties'), dict) else {},
             strength=data.get('strength', 1.0),
+            source_chunk_ids=list(data.get('source_chunk_ids') or []),
+            source_document_ids=list(data.get('source_document_ids') or []),
         )
         relationship.id = data.get('id', relationship.id)
         
@@ -652,6 +792,20 @@ class InMemoryGraphRepository(GraphRepositoryInterface):
 
     async def get_all_relationships(self) -> Dict[str, GraphRelationship]:
         return dict(self.relationships)
+
+    async def search_entities_by_text(self, terms: List[str], limit: int = 50) -> Dict[str, GraphEntity]:
+        """Search entities by substring match on name/description (in-memory fallback)."""
+        if not terms:
+            return {}
+        lower_terms = [t.lower() for t in terms]
+        matches: Dict[str, GraphEntity] = {}
+        for eid, ent in self.entities.items():
+            text = f"{ent.name} {ent.description or ''}".lower()
+            if any(t in text for t in lower_terms):
+                matches[eid] = ent
+                if len(matches) >= limit:
+                    break
+        return matches
     
     def _calculate_name_similarity(self, name1: str, name2: str) -> float:
         """Calculate simple name similarity score."""

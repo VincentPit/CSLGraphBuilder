@@ -4,7 +4,11 @@ from fastapi import APIRouter, Depends
 
 from ..auth import require_api_key
 from ..dependencies import get_app_config, get_graph_repo
-from ..schemas.curation import VerificationReportResponse, VerificationEntryResponse, VerificationStageResult, VerificationRunRequest
+from ..schemas.curation import (
+    VerificationReportResponse, VerificationEntryResponse, VerificationStageResult, VerificationRunRequest,
+    TextVerificationRequest, TextVerificationResponse, TextVerificationEntryResponse, TextVerificationStageResult,
+)
+from ..schemas.graph import ConflictCheckRequest, ConflictCheckResponse, ConflictEntryResponse
 
 router = APIRouter(prefix="/verification", tags=["verification"])
 
@@ -89,4 +93,177 @@ async def run_verification(
         failed=result.data.get("failed", 0) if result.data else 0,
         skipped=result.data.get("skipped", 0) if result.data else 0,
         report=entries,
+    )
+
+
+@router.post("/text", response_model=TextVerificationResponse)
+async def verify_text(
+    request: TextVerificationRequest,
+    config=Depends(get_app_config),
+    graph_repo=Depends(get_graph_repo),
+    _=Depends(require_api_key),
+):
+    """Verify a free-text description against the knowledge graph."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from graphbuilder.application.use_cases.text_verification import (
+        TextVerificationUseCase, TextVerificationConfig, extract_search_terms,
+    )
+    from graphbuilder.core.verification.cascading import CascadingVerifierConfig
+    from graphbuilder.domain.models.graph_models import KnowledgeGraph
+
+    # Extract search terms and find candidate entities
+    terms = extract_search_terms(request.text)
+    if not terms:
+        return TextVerificationResponse(
+            query_text=request.text,
+            total_candidates=0,
+            verified=0,
+            not_verified=0,
+            skipped=0,
+            best_confidence=0.0,
+            entries=[],
+        )
+
+    matched_entities = await graph_repo.search_entities_by_text(terms, limit=50)
+
+    # Find relationships connected to matched entities
+    kg = KnowledgeGraph()
+    kg.entities = matched_entities
+    matched_entity_ids = set(matched_entities.keys())
+
+    all_rels = await graph_repo.get_all_relationships()
+    for rel in all_rels.values():
+        if rel.source_entity_id in matched_entity_ids or rel.target_entity_id in matched_entity_ids:
+            kg.relationships[rel.id] = rel
+
+    # Pull in any missing entities referenced by relationships
+    all_entities = await graph_repo.get_all_entities()
+    for rel in kg.relationships.values():
+        for eid in (rel.source_entity_id, rel.target_entity_id):
+            if eid not in kg.entities and eid in all_entities:
+                kg.entities[eid] = all_entities[eid]
+
+    cascading_cfg = CascadingVerifierConfig(
+        enable_text_match=True,
+        enable_embedding=request.enable_embedding,
+        enable_llm=request.enable_llm,
+        early_exit_on_pass=request.early_exit_on_pass,
+        early_exit_on_fail=request.early_exit_on_fail,
+    )
+    ver_cfg = TextVerificationConfig(
+        cascading=cascading_cfg,
+        max_candidates=request.max_candidates,
+    )
+
+    use_case = TextVerificationUseCase(kg)
+    report = use_case.execute(request.text, ver_cfg)
+
+    entries = [
+        TextVerificationEntryResponse(
+            relationship_id=e.relationship_id,
+            source_entity_id=e.source_entity_id,
+            target_entity_id=e.target_entity_id,
+            source_entity_name=e.source_entity_name,
+            target_entity_name=e.target_entity_name,
+            relationship_type=e.relationship_type,
+            relationship_description=e.relationship_description,
+            status=e.status,
+            confidence=e.confidence,
+            reasoning=e.reasoning,
+            stage_results=[
+                TextVerificationStageResult(**s) for s in e.stage_results
+            ],
+        )
+        for e in report.entries
+    ]
+
+    return TextVerificationResponse(
+        query_text=report.query_text,
+        total_candidates=report.total_candidates,
+        verified=report.verified,
+        not_verified=report.not_verified,
+        skipped=report.skipped,
+        best_confidence=report.best_confidence,
+        entries=entries,
+    )
+
+
+@router.post("/conflicts", response_model=ConflictCheckResponse)
+async def check_conflicts(
+    request: ConflictCheckRequest,
+    config=Depends(get_app_config),
+    graph_repo=Depends(get_graph_repo),
+    _=Depends(require_api_key),
+):
+    """Check a free-text claim for conflicts against existing knowledge graph."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from graphbuilder.application.use_cases.text_verification import extract_search_terms
+    from graphbuilder.application.use_cases.conflict_detection import KnowledgeConflictDetector
+    from graphbuilder.domain.models.graph_models import (
+        KnowledgeGraph, GraphRelationship, RelationshipType, Metadata,
+    )
+
+    # Build a KnowledgeGraph from existing data
+    kg = KnowledgeGraph()
+    all_entities = await graph_repo.get_all_entities()
+    all_rels = await graph_repo.get_all_relationships()
+    kg.entities = dict(all_entities)
+    kg.relationships = dict(all_rels)
+
+    # Create a synthetic relationship from the user's claim
+    terms = extract_search_terms(request.text)
+
+    # Find entities matching the terms to build candidate pairs
+    matched_entity_ids = set()
+    for eid, ent in kg.entities.items():
+        name_lower = ent.name.lower()
+        for term in terms:
+            if term.lower() in name_lower:
+                matched_entity_ids.add(eid)
+                break
+
+    # Build synthetic new relationships between matched entity pairs
+    from itertools import combinations
+    new_rels: list[GraphRelationship] = []
+    matched_list = list(matched_entity_ids)
+
+    for i, src_id in enumerate(matched_list):
+        for tgt_id in matched_list[i + 1:]:
+            new_rels.append(GraphRelationship(
+                source_entity_id=src_id,
+                target_entity_id=tgt_id,
+                relationship_type=RelationshipType.RELATED_TO,
+                description=request.text,
+                strength=1.0,
+                metadata=Metadata(),
+            ))
+
+    detector = KnowledgeConflictDetector(kg)
+    report = detector.check_conflicts(
+        new_rels,
+        use_llm=request.use_llm,
+    )
+
+    return ConflictCheckResponse(
+        total_checked=report.total_checked,
+        conflicts_found=report.conflicts_found,
+        conflicts=[
+            ConflictEntryResponse(
+                conflict_type=c.conflict_type,
+                severity=c.severity,
+                existing_relationship_id=c.existing_relationship_id,
+                existing_relationship_type=c.existing_relationship_type,
+                existing_description=c.existing_description,
+                existing_source_chunk_ids=c.existing_source_chunk_ids,
+                new_relationship_type=c.new_relationship_type,
+                new_description=c.new_description,
+                new_source_chunk_ids=c.new_source_chunk_ids,
+                source_entity_name=c.source_entity_name,
+                target_entity_name=c.target_entity_name,
+                reasoning=c.reasoning,
+            )
+            for c in report.conflicts
+        ],
     )

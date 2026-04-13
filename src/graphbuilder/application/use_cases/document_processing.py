@@ -347,9 +347,12 @@ class ProcessDocumentUseCase(UseCase):
         content = content_result.data.get("content", "")
         chunks = self._create_content_chunks(content, document.id, task.configuration)
         
-        # Save chunks
-        for chunk in chunks:
-            await self.document_repo.save_chunk(chunk)
+        # Save chunks with linked-list edges
+        if hasattr(self.document_repo, 'save_chunks_with_links'):
+            await self.document_repo.save_chunks_with_links(chunks)
+        else:
+            for chunk in chunks:
+                await self.document_repo.save_chunk(chunk)
         
         # Update document
         document.total_chunks = len(chunks)
@@ -374,7 +377,22 @@ class ProcessDocumentUseCase(UseCase):
         config: Dict[str, Any]
     ) -> List[DocumentChunk]:
         """Create content chunks from document content."""
-        
+
+        strategy = config.get("chunking_strategy", "semantic")
+
+        if strategy == "semantic":
+            from graphbuilder.core.processing.semantic_chunker import (
+                SemanticChunker, SemanticChunkerConfig,
+            )
+            chunker_cfg = SemanticChunkerConfig(
+                max_chunk_tokens=config.get("chunk_size", 512),
+                min_chunk_tokens=30,
+                similarity_threshold=config.get("similarity_threshold", 0.5),
+            )
+            chunker = SemanticChunker(chunker_cfg)
+            return chunker.chunk(content, document_id)
+
+        # Fallback: fixed-size character window
         chunk_size = config.get("chunk_size", 1000)
         overlap_size = config.get("overlap_size", 100)
         
@@ -432,13 +450,15 @@ class ProcessDocumentUseCase(UseCase):
                 if extraction_result.success:
                     entities = extraction_result.data.get("entities", [])
                     
-                    # Save entities
+                    # Save entities with provenance
                     for entity_data in entities:
                         entity = GraphEntity(
                             name=entity_data.get("name"),
                             entity_type=EntityType(entity_data.get("type", "CONCEPT")),
                             description=entity_data.get("description"),
-                            properties=entity_data.get("properties", {})
+                            properties=entity_data.get("properties", {}),
+                            source_chunk_ids=[chunk.id],
+                            source_document_ids=[chunk.document_id],
                         )
                         await self.graph_repo.save_entity(entity)
                         total_entities += 1

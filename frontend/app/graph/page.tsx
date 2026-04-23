@@ -77,9 +77,17 @@ export default function GraphPage() {
   const [search, setSearch] = useState('');
   const [activeTypes, setActiveTypes] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Entity | null>(null);
+  // Anchor position of the floating inspector — pixels relative to the
+  // canvas container. Re-computed on every animation frame while a node
+  // is selected so the popover stays glued to the node through drag /
+  // pan / zoom / simulation tick.
+  const [popoverPos, setPopoverPos] = useState<{ x: number; y: number } | null>(null);
   const [width, setWidth] = useState(900);
   const containerRef = useRef<HTMLDivElement>(null);
   const fgRef = useRef<any>(null);
+  // Holds the actual force-graph node object (with live x/y) — distinct
+  // from the React `selected` Entity (which is the persisted record).
+  const selectedNodeRef = useRef<any>(null);
 
   // Track container width for the force graph to size to its parent
   useEffect(() => {
@@ -90,6 +98,36 @@ export default function GraphPage() {
     ro.observe(containerRef.current);
     return () => ro.disconnect();
   }, []);
+
+  // Glue the popover to the selected node. The force-graph instance gives
+  // us a `graph2ScreenCoords(x, y)` helper that returns canvas-space
+  // pixels. We poll it on every animation frame — cheaper than wiring up
+  // every onZoom / onPan / onTick / onDrag callback the library exposes,
+  // and immune to any we forget. Loop tears down the moment `selected`
+  // clears.
+  useEffect(() => {
+    if (!selected || !selectedNodeRef.current) {
+      setPopoverPos(null);
+      return;
+    }
+    let raf = 0;
+    let alive = true;
+    const tick = () => {
+      if (!alive) return;
+      const fg = fgRef.current;
+      const node = selectedNodeRef.current;
+      if (fg?.graph2ScreenCoords && typeof node?.x === 'number') {
+        const p = fg.graph2ScreenCoords(node.x, node.y);
+        setPopoverPos({ x: p.x, y: p.y });
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => {
+      alive = false;
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [selected]);
 
   // All entity types found in the loaded graph (for the legend rows).
   const allTypes = useMemo(() => {
@@ -292,12 +330,35 @@ export default function GraphPage() {
                   ctx.fillText(node.name, node.x, node.y + r + 2);
                 }
               }}
-              onNodeClick={(n: any) => setSelected(n.raw)}
-              onBackgroundClick={() => setSelected(null)}
+              onNodeClick={(n: any) => {
+                selectedNodeRef.current = n;
+                setSelected(n.raw);
+              }}
+              onBackgroundClick={() => {
+                selectedNodeRef.current = null;
+                setSelected(null);
+              }}
               width={Math.max(width, 400)}
               height={640}
               backgroundColor="#fafbff"
               cooldownTicks={120}
+            />
+          )}
+
+          {/* Floating inspector — anchored to the selected node, follows
+              it through pan / zoom / drag. Constrained inside the canvas
+              container so it can't escape into the legend column. */}
+          {selected && popoverPos && (
+            <FloatingInspector
+              entity={selected}
+              anchor={popoverPos}
+              container={containerRef.current}
+              relationships={filteredRels}
+              entitiesById={entData?.items}
+              onClose={() => {
+                selectedNodeRef.current = null;
+                setSelected(null);
+              }}
             />
           )}
         </div>
@@ -383,97 +444,226 @@ export default function GraphPage() {
             )}
           </div>
 
-          {/* ── Inspector ────────────────────────────────────────────── */}
-          <div className="card p-4">
-          {selected ? (
-            <div className="space-y-3 fade-up">
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: 'var(--text-muted)' }}>
-                    Selected entity
-                  </p>
-                  <p className="text-base font-semibold mt-0.5" style={{ color: 'var(--text-primary)' }}>
-                    {selected.name}
-                  </p>
-                </div>
-                <button
-                  onClick={() => setSelected(null)}
-                  className="text-slate-400 hover:text-slate-600"
-                  title="Clear"
-                >
-                  <X size={14} />
-                </button>
-              </div>
-              <span
-                className="badge"
-                style={{
-                  background: `${entityColor(selected.entity_type)}15`,
-                  color: entityColor(selected.entity_type),
-                  border: `1px solid ${entityColor(selected.entity_type)}40`,
-                }}
-              >
-                {selected.entity_type}
-              </span>
-              {selected.description && (
-                <p className="text-[12px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                  {selected.description}
+          {/* Inspector lives inline only when nothing is selected — it
+              becomes a hint card. Once a node is clicked, the popover
+              floats over the canvas instead. */}
+          {!selected && (
+            <div className="card p-4">
+              <div className="empty-state">
+                <span className="empty-icon">
+                  <Network size={20} />
+                </span>
+                <p className="text-[12.5px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+                  Click a node to inspect
                 </p>
-              )}
-              {selected.source_document_ids?.length > 0 && (
-                <div>
-                  <p className="text-[10px] uppercase tracking-wider font-semibold mb-1" style={{ color: 'var(--text-muted)' }}>
-                    Sources
-                  </p>
-                  <p className="text-[11px] font-mono opacity-70">
-                    {selected.source_document_ids.length} document{selected.source_document_ids.length === 1 ? '' : 's'}
-                  </p>
-                </div>
-              )}
-              <div>
-                <p className="text-[10px] uppercase tracking-wider font-semibold mb-1.5" style={{ color: 'var(--text-muted)' }}>
-                  Connected via
+                <p className="text-[10.5px]">
+                  A details card will pop up next to the node showing its
+                  type, description, sources, and neighbours.
                 </p>
-                <ul className="space-y-1 max-h-48 overflow-y-auto">
-                  {filteredRels
-                    .filter((r) => r.source_entity_id === selected.id || r.target_entity_id === selected.id)
-                    .slice(0, 12)
-                    .map((r) => {
-                      const otherId =
-                        r.source_entity_id === selected.id ? r.target_entity_id : r.source_entity_id;
-                      const other = entData?.items.find((e) => e.id === otherId);
-                      return (
-                        <li
-                          key={r.id}
-                          className="text-[11.5px] px-2 py-1.5 rounded-md flex items-center gap-1.5"
-                          style={{ background: 'var(--bg-muted)' }}
-                        >
-                          <span className="opacity-60">{r.relationship_type}</span>
-                          <span className="font-medium truncate" style={{ color: 'var(--text-primary)' }}>
-                            {other?.name ?? otherId.slice(0, 8)}
-                          </span>
-                        </li>
-                      );
-                    })}
-                </ul>
               </div>
-            </div>
-          ) : (
-            <div className="empty-state">
-              <span className="empty-icon">
-                <Network size={20} />
-              </span>
-              <p className="text-[12.5px] font-medium" style={{ color: 'var(--text-secondary)' }}>
-                Click a node to inspect
-              </p>
-              <p className="text-[10.5px]">
-                Type, description, source documents, and the entity's
-                neighbours will appear here.
-              </p>
             </div>
           )}
-          </div>
         </div>
       </div>
     </div>
   );
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   FloatingInspector — small popover anchored to a graph node.
+
+   - Absolutely positioned inside the canvas card (which is `relative`).
+   - On mount + every layout pass, measures itself and clamps placement
+     so it stays inside the container: prefers right-of-node, flips
+     left if it would overflow; same logic vertically.
+   - Visual: thin connector line + dot pointing back at the node so
+     the relationship between popover and node stays clear under heavy
+     panning.
+   ───────────────────────────────────────────────────────────────── */
+function FloatingInspector({
+  entity,
+  anchor,
+  container,
+  relationships,
+  entitiesById,
+  onClose,
+}: {
+  entity: Entity;
+  anchor: { x: number; y: number };
+  container: HTMLElement | null;
+  relationships: Relationship[];
+  entitiesById?: Entity[];
+  onClose: () => void;
+}) {
+  const popRef = useRef<HTMLDivElement>(null);
+  const [placement, setPlacement] = useState<{
+    left: number;
+    top: number;
+    side: 'right' | 'left';
+  }>({ left: anchor.x + 18, top: anchor.y - 60, side: 'right' });
+
+  // Reposition every time the anchor moves (we re-render via the rAF
+  // loop in the parent).
+  useEffect(() => {
+    const pop = popRef.current;
+    if (!pop || !container) return;
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    const pw = pop.offsetWidth;
+    const ph = pop.offsetHeight;
+    const margin = 8;
+    const offset = 18;
+
+    // Prefer right of the node; flip if it would overflow.
+    let side: 'right' | 'left' = 'right';
+    let left = anchor.x + offset;
+    if (left + pw + margin > cw) {
+      side = 'left';
+      left = anchor.x - offset - pw;
+    }
+    // Clamp within container horizontally as a final safety net.
+    left = Math.max(margin, Math.min(left, cw - pw - margin));
+
+    // Vertically centre on the node, then clamp.
+    let top = anchor.y - ph / 2;
+    top = Math.max(margin, Math.min(top, ch - ph - margin));
+
+    setPlacement({ left, top, side });
+  }, [anchor.x, anchor.y, container, entity.id]);
+
+  const color = entityColorLocal(entity.entity_type);
+  const neighbours = relationships
+    .filter((r) => r.source_entity_id === entity.id || r.target_entity_id === entity.id)
+    .slice(0, 8);
+
+  return (
+    <>
+      {/* Connector line: thin red dotted segment from node to popover */}
+      <svg
+        className="absolute pointer-events-none"
+        style={{ left: 0, top: 0, width: '100%', height: '100%' }}
+      >
+        <line
+          x1={anchor.x}
+          y1={anchor.y}
+          x2={placement.side === 'right' ? placement.left : placement.left + 280}
+          y2={placement.top + 24}
+          stroke="rgba(213,33,44,0.45)"
+          strokeWidth={1.5}
+          strokeDasharray="3 3"
+        />
+        <circle cx={anchor.x} cy={anchor.y} r={4} fill="rgba(213,33,44,0.85)" />
+      </svg>
+
+      <div
+        ref={popRef}
+        className="absolute card p-3.5 fade-up"
+        style={{
+          left: `${placement.left}px`,
+          top: `${placement.top}px`,
+          width: 280,
+          zIndex: 20,
+          boxShadow: '0 12px 30px -6px rgba(15,23,42,0.18), 0 4px 10px -4px rgba(15,23,42,0.10)',
+        }}
+        // Background-click to close shouldn't fire when clicking inside.
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-2 mb-2">
+          <div className="min-w-0">
+            <p
+              className="text-[10px] uppercase tracking-wider font-semibold"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              Selected
+            </p>
+            <p
+              className="text-[15px] font-semibold leading-tight truncate"
+              style={{ color: 'var(--text-primary)' }}
+              title={entity.name}
+            >
+              {entity.name}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-slate-400 hover:text-slate-700 -m-1 p-1 rounded"
+            title="Close (or click background)"
+          >
+            <X size={14} />
+          </button>
+        </div>
+
+        <span
+          className="badge mb-2 inline-flex"
+          style={{
+            background: `${color}15`,
+            color,
+            border: `1px solid ${color}40`,
+          }}
+        >
+          {entity.entity_type}
+        </span>
+
+        {entity.description && (
+          <p
+            className="text-[11.5px] leading-relaxed mb-2 line-clamp-3"
+            style={{ color: 'var(--text-secondary)' }}
+          >
+            {entity.description}
+          </p>
+        )}
+
+        {entity.source_document_ids?.length > 0 && (
+          <p
+            className="text-[10.5px] mb-2"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            {entity.source_document_ids.length} source document{entity.source_document_ids.length === 1 ? '' : 's'}
+          </p>
+        )}
+
+        {neighbours.length > 0 && (
+          <div>
+            <p
+              className="text-[10px] uppercase tracking-wider font-semibold mb-1"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              {neighbours.length} connection{neighbours.length === 1 ? '' : 's'}
+            </p>
+            <ul className="space-y-1 max-h-32 overflow-y-auto">
+              {neighbours.map((r) => {
+                const otherId =
+                  r.source_entity_id === entity.id
+                    ? r.target_entity_id
+                    : r.source_entity_id;
+                const other = entitiesById?.find((e) => e.id === otherId);
+                return (
+                  <li
+                    key={r.id}
+                    className="text-[11px] px-2 py-1 rounded-md flex items-center gap-1.5 truncate"
+                    style={{ background: 'var(--bg-muted)' }}
+                  >
+                    <span className="opacity-60 shrink-0">
+                      {r.relationship_type}
+                    </span>
+                    <span
+                      className="font-medium truncate"
+                      style={{ color: 'var(--text-primary)' }}
+                    >
+                      {other?.name ?? otherId.slice(0, 8)}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// Local copy so the popover doesn't depend on hoisting order.
+function entityColorLocal(type: string): string {
+  return TYPE_COLORS[type.toUpperCase()] ?? '#94a3b8';
 }

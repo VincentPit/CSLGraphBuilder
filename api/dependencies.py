@@ -4,9 +4,21 @@ import logging
 import sys
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
+
+# Auto-load <repo>/.env so users can drop their LLM_API_KEY etc. into a file
+# instead of exporting in every shell. Silent no-op if dotenv isn't installed
+# or the file is absent.
+try:
+    from dotenv import load_dotenv
+    _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+    if _ENV_PATH.exists():
+        load_dotenv(_ENV_PATH, override=False)
+except ImportError:
+    pass
 
 # Make sure the src/ package is importable when running from repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -57,6 +69,15 @@ def get_app_config() -> GraphBuilderConfig:
 
 
 _graph_repo_instance: GraphRepositoryInterface | None = None
+_neo4j_driver = None  # shared across graph + document repos
+
+
+def _get_neo4j_driver():
+    """Lazily create a single Neo4j driver shared by all repos."""
+    global _neo4j_driver
+    if _neo4j_driver is None:
+        _neo4j_driver = _create_neo4j_driver()
+    return _neo4j_driver
 
 
 async def get_graph_repo(
@@ -64,11 +85,8 @@ async def get_graph_repo(
 ) -> GraphRepositoryInterface:
     global _graph_repo_instance
     if _graph_repo_instance is None:
-        db_provider = os.getenv("DATABASE_PROVIDER", "in_memory")
-        neo4j_driver = None
-        if db_provider == "neo4j":
-            neo4j_driver = _create_neo4j_driver()
-        _graph_repo_instance = create_graph_repository(config, neo4j_driver=neo4j_driver)
+        driver = _get_neo4j_driver() if config.database.provider == "neo4j" else None
+        _graph_repo_instance = create_graph_repository(config, neo4j_driver=driver)
         logger.info("Graph repo initialised: %s", type(_graph_repo_instance).__name__)
     return _graph_repo_instance
 
@@ -76,7 +94,8 @@ async def get_graph_repo(
 async def get_document_repo(
     config: Annotated[GraphBuilderConfig, Depends(get_app_config)],
 ):
-    return create_document_repository(config)
+    driver = _get_neo4j_driver() if config.database.provider == "neo4j" else None
+    return create_document_repository(config, neo4j_driver=driver)
 
 
 async def get_llm(

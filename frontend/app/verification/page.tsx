@@ -1,7 +1,7 @@
 'use client';
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { runVerification, getRelationships, VerificationReport, Relationship, verifyText, TextVerificationResponse, checkConflicts, ConflictCheckResponse, getPendingReviews, decideReview, PendingReviewItem } from '@/lib/api';
+import { runVerification, getRelationships, VerificationReport, Relationship, verifyText, TextVerificationResponse, checkConflicts, ConflictCheckResponse, getPendingReviews, decideReview, PendingReviewItem, formatApiError } from '@/lib/api';
 import { ShieldCheck, ChevronDown, ChevronUp, Loader2, CheckSquare, Square, AlertCircle, FileText, GitBranch, AlertTriangle, ClipboardList } from 'lucide-react';
 
 function Toggle({ label, desc, checked, onChange }: { label: string; desc: string; checked: boolean; onChange: (v: boolean) => void }) {
@@ -91,7 +91,7 @@ export default function VerificationPage() {
       });
       setReport(result);
     } catch (err: any) {
-      setError(err.response?.data?.detail ?? err.message);
+      setError(formatApiError(err, 'Verification failed'));
     } finally {
       setLoading(false);
     }
@@ -111,7 +111,7 @@ export default function VerificationPage() {
       });
       setTextReport(result);
     } catch (err: any) {
-      setTextError(err.response?.data?.detail ?? err.message);
+      setTextError(formatApiError(err, 'Text verification failed'));
     } finally {
       setTextLoading(false);
     }
@@ -126,7 +126,7 @@ export default function VerificationPage() {
       const result = await checkConflicts({ text: conflictQuery, use_llm: conflictLLM });
       setConflictReport(result);
     } catch (err: any) {
-      setConflictError(err.response?.data?.detail ?? err.message);
+      setConflictError(formatApiError(err, 'Conflict check failed'));
     } finally {
       setConflictLoading(false);
     }

@@ -48,12 +48,37 @@ class DocumentListResponse(BaseModel):
     offset: int
 
 
+class JobEvent(BaseModel):
+    ts: str
+    stage: Optional[str] = None
+    level: str = "info"
+    message: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
 class JobResponse(BaseModel):
     job_id: str
-    status: str  # pending | running | completed | failed
+    kind: str = "document"
+    status: str  # pending | running | completed | failed | cancelled
     message: Optional[str] = None
-    progress: Optional[float] = None  # 0.0 – 1.0
+    progress: float = 0.0
+    stages: List[str] = Field(default_factory=list)
+    current_stage: Optional[str] = None
+    stage_progress: Dict[str, str] = Field(default_factory=dict)
+    events: List[JobEvent] = Field(default_factory=list)
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    cancel_requested: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class JobSummary(BaseModel):
+    job_id: str
+    kind: str
+    status: str
+    message: Optional[str] = None
+    current_stage: Optional[str] = None
+    progress: float = 0.0
     created_at: datetime
     updated_at: datetime

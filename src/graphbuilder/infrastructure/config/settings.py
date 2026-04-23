@@ -52,7 +52,10 @@ class LLMProvider(Enum):
 @dataclass
 class DatabaseConfiguration:
     """Database configuration with connection pooling and optimization settings."""
-    
+
+    # Storage backend ("neo4j" | "in_memory") — read by repository factories.
+    provider: str = field(default_factory=lambda: os.getenv("DATABASE_PROVIDER", "in_memory"))
+
     # Connection settings
     uri: str = field(default_factory=lambda: os.getenv("NEO4J_URI", "bolt://localhost:7687"))
     username: str = field(default_factory=lambda: os.getenv("NEO4J_USER", "neo4j"))
@@ -73,9 +76,11 @@ class DatabaseConfiguration:
 @dataclass
 class LLMConfiguration:
     """Large Language Model configuration with advanced settings."""
-    
-    # Model settings
-    provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "azure_openai"))
+
+    # Model settings — provider is coerced to LLMProvider in __post_init__ so
+    # downstream code (llm_service._initialize_client) can compare against the
+    # enum directly instead of stringly-typed values.
+    provider: Any = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "azure_openai"))
     model_name: str = field(default_factory=lambda: os.getenv("LLM_MODEL_NAME", "gpt-4o"))
     api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
     api_endpoint: Optional[str] = field(default_factory=lambda: os.getenv("LLM_API_ENDPOINT"))
@@ -95,6 +100,28 @@ class LLMConfiguration:
     
     # Fallback models
     fallback_models: List[str] = field(default_factory=lambda: os.getenv("LLM_FALLBACK_MODELS", "").split(",") if os.getenv("LLM_FALLBACK_MODELS") else [])
+
+    # Connection timeout used by the OpenAI / Azure clients (seconds)
+    timeout: int = field(default_factory=lambda: int(os.getenv("LLM_TIMEOUT", "60")))
+
+    # base_url for OpenAI-compatible endpoints (None → official OpenAI)
+    base_url: Optional[str] = field(default_factory=lambda: os.getenv("LLM_BASE_URL"))
+
+    def __post_init__(self) -> None:
+        # Coerce string env value (e.g. "openai") to LLMProvider enum so
+        # `config.llm.provider == LLMProvider.OPENAI` works downstream.
+        if not isinstance(self.provider, LLMProvider):
+            try:
+                self.provider = LLMProvider(str(self.provider).lower())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid LLM_PROVIDER={self.provider!r}. "
+                    f"Allowed: {[p.value for p in LLMProvider]}"
+                ) from exc
+        # Azure expects api_endpoint; if user set AZURE_OPENAI_ENDPOINT instead
+        # of LLM_API_ENDPOINT in .env, honour it.
+        if self.provider == LLMProvider.AZURE_OPENAI and not self.api_endpoint:
+            self.api_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or self.api_endpoint
 
 
 @dataclass

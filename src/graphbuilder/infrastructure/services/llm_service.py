@@ -17,6 +17,7 @@ from enum import Enum
 from ...domain.models.processing_models import ProcessingResult
 from ...domain.models.graph_models import EntityType, RelationshipType
 from ..config.settings import GraphBuilderConfig, LLMProvider
+from .metrics import get_metrics
 
 
 class PromptType(Enum):
@@ -775,9 +776,19 @@ RESPOND WITH VALID JSON:
             )
             
             self.logger.debug(f"LLM call completed: {llm_response.total_tokens} tokens, {processing_time:.2f}s")
-            
+
+            try:
+                await get_metrics().record_llm_call(
+                    prompt_type=request.prompt_type.value,
+                    prompt_tokens=llm_response.prompt_tokens,
+                    completion_tokens=llm_response.completion_tokens,
+                    latency_seconds=processing_time,
+                )
+            except Exception:  # metrics must never break the call path
+                pass
+
             return llm_response
-            
+
         except Exception as e:
             self.logger.error(f"LLM API call error: {str(e)}", exc_info=True)
             raise RuntimeError(f"LLM API call failed: {str(e)}")

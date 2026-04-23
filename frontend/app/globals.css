@@ -2,36 +2,77 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ─────────────────────────────────────────────────────────────────
+   Design tokens — CSL Behring brand palette
+   Primary red (#D5212C) is the corporate identity colour. Danger uses
+   a darker brick tone (#991B1B) so it stays clearly distinct from the
+   brand red used for primary actions, links, and highlights.
+   ───────────────────────────────────────────────────────────────── */
 :root {
-  --bg-app: #f8f9fb;
+  /* Surfaces */
+  --bg-app: #fafafa;
+  --bg-app-tint-1: #fdf3f3;       /* warm wash that complements CSL red */
+  --bg-app-tint-2: #fff7ed;
   --bg-card: #ffffff;
-  --bg-sidebar: #111119;
-  --bg-sidebar-hover: rgba(255,255,255,0.06);
-  --bg-sidebar-active: rgba(99,102,241,0.15);
+  --bg-card-soft: rgba(255, 255, 255, 0.82);
+  --bg-muted: #f4f4f5;
   --bg-input: #ffffff;
-  --bg-muted: #f3f4f6;
-  --border-default: #e2e5ea;
-  --border-subtle: #eef0f3;
-  --border-input: #d1d5dc;
-  --text-primary: #111827;
-  --text-secondary: #6b7280;
-  --text-muted: #9ca3af;
+
+  /* Sidebar — anthracite with red-tinted hover/active */
+  --bg-sidebar: #14141a;
+  --bg-sidebar-grad: linear-gradient(180deg, #18181f 0%, #0d0d12 100%);
+  --bg-sidebar-hover: rgba(255, 255, 255, 0.05);
+  --bg-sidebar-active: rgba(213, 33, 44, 0.22);
+
+  /* Borders */
+  --border-default: #e5e5ea;
+  --border-subtle: #ececf0;
+  --border-input: #d4d4d8;
+  --border-glow: rgba(213, 33, 44, 0.45);
+
+  /* Text */
+  --text-primary: #18181b;
+  --text-secondary: #52525b;
+  --text-muted: #a1a1aa;
   --text-sidebar: #a1a1aa;
   --text-sidebar-active: #ffffff;
-  --accent: #6366f1;
-  --accent-hover: #4f46e5;
-  --accent-muted: rgba(99,102,241,0.1);
-  --success: #10b981;
-  --success-muted: #ecfdf5;
-  --danger: #ef4444;
+
+  /* Brand — CSL Behring red */
+  --accent: #d5212c;
+  --accent-hover: #b01821;
+  --accent-soft: rgba(213, 33, 44, 0.08);
+  --accent-muted: rgba(213, 33, 44, 0.13);
+  --accent-2: #ef4444;            /* warm coral red */
+  --accent-3: #f59e0b;            /* amber, finishes the gradient warmly */
+
+  /* Status — danger uses a darker brick so it doesn't compete with brand */
+  --success: #15803d;
+  --success-soft: rgba(21, 128, 61, 0.10);
+  --success-muted: #f0fdf4;
+  --danger: #991b1b;
+  --danger-soft: rgba(153, 27, 27, 0.10);
   --danger-muted: #fef2f2;
-  --warning: #f59e0b;
+  --warning: #b45309;
   --warning-muted: #fffbeb;
+  --info: #0369a1;
+
+  /* Shape */
   --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
-  --shadow-card: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.03);
+  --shadow-lift: 0 8px 24px -8px rgba(213, 33, 44, 0.20), 0 4px 10px -4px rgba(15, 23, 42, 0.08);
+  --shadow-glow: 0 0 0 1px rgba(213, 33, 44, 0.22), 0 8px 30px -6px rgba(213, 33, 44, 0.30);
+
+  /* Gradients — CSL red → coral → amber */
+  --grad-brand: linear-gradient(135deg, #d5212c 0%, #ef4444 45%, #f59e0b 100%);
+  --grad-brand-soft: linear-gradient(135deg, rgba(213,33,44,.10) 0%, rgba(239,68,68,.08) 50%, rgba(245,158,11,.10) 100%);
+  --grad-success: linear-gradient(135deg, #15803d 0%, #16a34a 100%);
+  --grad-warning: linear-gradient(135deg, #f59e0b 0%, #d5212c 100%);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -39,7 +80,7 @@
 html {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   scroll-behavior: smooth;
-  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss01';
 }
 
 body {
@@ -47,20 +88,74 @@ body {
   background: var(--bg-app);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  position: relative;
+  min-height: 100vh;
 }
 
-/* ── Card surface ──────────────────────────────────────────────── */
+/* Mesh-gradient backdrop — warm CSL-aligned blooms, very subtle */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(circle at 10% 6%, rgba(213,33,44,.10), transparent 45%),
+    radial-gradient(circle at 92% 12%, rgba(245,158,11,.08), transparent 42%),
+    radial-gradient(circle at 78% 92%, rgba(239,68,68,.07), transparent 50%),
+    radial-gradient(circle at 6% 88%, rgba(245,158,11,.06), transparent 45%);
+  pointer-events: none;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Surfaces
+   ───────────────────────────────────────────────────────────────── */
 .card {
   background: var(--bg-card);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
 }
 
-/* ── Form inputs ───────────────────────────────────────────────── */
+.card-hover:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lift);
+  border-color: rgba(99, 102, 241, 0.25);
+}
+
+.card-glass {
+  background: var(--bg-card-soft);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+.card-bordered-grad {
+  position: relative;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+}
+.card-bordered-grad::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  background: var(--grad-brand);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Form
+   ───────────────────────────────────────────────────────────────── */
 .input {
   width: 100%;
-  padding: 9px 12px;
+  padding: 10px 12px;
   font-size: 0.875rem;
   line-height: 1.5;
   color: var(--text-primary);
@@ -68,43 +163,55 @@ body {
   border: 1px solid var(--border-input);
   border-radius: var(--radius-md);
   outline: none;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: border-color 0.18s, box-shadow 0.18s, background 0.18s;
 }
 .input::placeholder { color: var(--text-muted); }
+.input:hover { border-color: #c0c5d3; }
 .input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-muted);
 }
-
-/* Textarea inherits .input */
+.input:disabled { background: var(--bg-muted); cursor: not-allowed; }
 textarea.input { resize: vertical; }
 
-/* ── Primary button ────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────
+   Buttons
+   ───────────────────────────────────────────────────────────────── */
 .btn-primary {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 9px 16px;
+  padding: 10px 18px;
   font-size: 0.875rem;
-  font-weight: 500;
+  font-weight: 600;
   line-height: 1;
   color: #fff;
-  background: var(--accent);
+  background: var(--grad-brand);
+  background-size: 200% 200%;
+  background-position: 0% 50%;
   border: none;
   border-radius: var(--radius-md);
   cursor: pointer;
-  transition: background 0.15s, transform 0.1s;
+  transition: background-position 0.4s ease, transform 0.12s ease, box-shadow 0.18s ease;
+  box-shadow: 0 4px 14px -4px rgba(99, 102, 241, 0.45);
 }
-.btn-primary:hover { background: var(--accent-hover); }
-.btn-primary:active { transform: scale(0.98); }
-.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary:hover {
+  background-position: 100% 50%;
+  box-shadow: 0 8px 22px -6px rgba(99, 102, 241, 0.55);
+}
+.btn-primary:active { transform: scale(0.97); }
+.btn-primary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: var(--text-muted);
+  box-shadow: none;
+}
 
-/* ── Outline / ghost button ────────────────────────────────────── */
 .btn-ghost {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 7px 12px;
+  padding: 8px 12px;
   font-size: 0.8125rem;
   font-weight: 500;
   color: var(--text-secondary);
@@ -114,53 +221,250 @@ textarea.input { resize: vertical; }
   cursor: pointer;
   transition: all 0.15s;
 }
-.btn-ghost:hover { background: var(--bg-muted); color: var(--text-primary); }
+.btn-ghost:hover {
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border-color: rgba(99, 102, 241, 0.35);
+  box-shadow: var(--shadow-sm);
+}
 .btn-ghost.active {
   background: var(--accent-muted);
   color: var(--accent);
   border-color: var(--accent);
 }
+.btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* ── Badge / chip ──────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────
+   Badges / chips
+   ───────────────────────────────────────────────────────────────── */
 .badge {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 3px 8px;
+  padding: 3px 9px;
   font-size: 0.6875rem;
   font-weight: 600;
   letter-spacing: 0.02em;
   border-radius: 999px;
+  line-height: 1.4;
 }
-.badge-success { background: var(--success-muted); color: #065f46; }
-.badge-danger  { background: var(--danger-muted);  color: #991b1b; }
+.badge-success { background: var(--success-soft); color: #047857; }
+.badge-danger  { background: var(--danger-soft);  color: #b91c1c; }
 .badge-warning { background: var(--warning-muted); color: #92400e; }
 .badge-neutral { background: var(--bg-muted);      color: var(--text-secondary); }
+.badge-brand   { background: var(--accent-muted);  color: var(--accent-hover); }
 
-/* ── Label ─────────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────
+   Typography helpers
+   ───────────────────────────────────────────────────────────────── */
 .field-label {
   display: block;
   margin-bottom: 6px;
-  font-size: 0.8125rem;
+  font-size: 0.78125rem;
   font-weight: 500;
   color: var(--text-secondary);
+  letter-spacing: 0.01em;
 }
 
-/* ── Page header ───────────────────────────────────────────────── */
 .page-title {
-  font-size: 1.5rem;
-  font-weight: 600;
-  letter-spacing: -0.025em;
-  color: var(--text-primary);
+  font-size: 1.875rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  background: linear-gradient(135deg, #18181b 0%, #d5212c 100%);
+  -webkit-background-clip: text;
+          background-clip: text;
+  -webkit-text-fill-color: transparent;
+  line-height: 1.15;
 }
 .page-desc {
   font-size: 0.9375rem;
   color: var(--text-secondary);
-  margin-top: 4px;
+  margin-top: 6px;
+  line-height: 1.55;
+  max-width: 56ch;
 }
 
-/* ── Scrollbars ────────────────────────────────────────────────── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
+.text-gradient {
+  background: var(--grad-brand);
+  -webkit-background-clip: text;
+          background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Animations
+   ───────────────────────────────────────────────────────────────── */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fade-up 0.32s ease both; }
+
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 rgba(213, 33, 44, 0.50); }
+  70%  { box-shadow: 0 0 0 10px rgba(213, 33, 44, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(213, 33, 44, 0); }
+}
+.pulse-ring { animation: pulse-ring 1.6s ease-out infinite; }
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+.pulse-soft { animation: pulse-soft 1.8s ease-in-out infinite; }
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-muted) 0%,
+    rgba(255, 255, 255, 0.85) 50%,
+    var(--bg-muted) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+  border-radius: var(--radius-sm);
+}
+
+@keyframes drift {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50%      { transform: translate3d(8px, -10px, 0) scale(1.02); }
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+.spin-slow { animation: spin-slow 8s linear infinite; }
+
+@keyframes gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50%      { background-position: 100% 50%; }
+}
+.bg-animated {
+  background-size: 200% 200%;
+  animation: gradient-shift 6s ease infinite;
+}
+
+/* Stagger helper for animating in lists */
+.stagger > * { animation: fade-up 0.4s ease both; }
+.stagger > *:nth-child(1) { animation-delay: 0.02s; }
+.stagger > *:nth-child(2) { animation-delay: 0.06s; }
+.stagger > *:nth-child(3) { animation-delay: 0.10s; }
+.stagger > *:nth-child(4) { animation-delay: 0.14s; }
+.stagger > *:nth-child(5) { animation-delay: 0.18s; }
+.stagger > *:nth-child(6) { animation-delay: 0.22s; }
+.stagger > *:nth-child(7) { animation-delay: 0.26s; }
+.stagger > *:nth-child(8) { animation-delay: 0.30s; }
+
+/* ─────────────────────────────────────────────────────────────────
+   Scrollbars
+   ───────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #d1d5dc; border-radius: 999px; }
-::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.12);
+  border-radius: 999px;
+  transition: background 0.15s;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(15, 23, 42, 0.24); }
+
+/* Focus ring (keyboard) */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   CSS-only tooltip — wrap any element in <span class="tip" data-tip="…">.
+   Renders a small dark bubble above the element on hover/focus.
+   ───────────────────────────────────────────────────────────────── */
+.tip {
+  position: relative;
+  display: inline-flex;
+}
+.tip[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  padding: 5px 9px;
+  background: #18181b;
+  color: #fafafa;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 50;
+}
+.tip[data-tip]::before {
+  content: '';
+  position: absolute;
+  bottom: calc(100% + 3px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: #18181b;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  z-index: 50;
+}
+.tip:hover::after,
+.tip:focus-within::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.tip:hover::before,
+.tip:focus-within::before {
+  opacity: 1;
+}
+
+/* Help-icon glyph used inline next to control labels */
+.help-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--bg-muted);
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 700;
+  cursor: help;
+  transition: all 0.15s;
+}
+.help-icon:hover {
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+
+/* Empty-state surface — used on dashboards / queues with no data */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 20px;
+  text-align: center;
+  color: var(--text-muted);
+}
+.empty-state .empty-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  background: var(--accent-muted);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}

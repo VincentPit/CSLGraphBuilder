@@ -119,9 +119,24 @@ OT_RELATIONSHIPS = [
     ("ot-r16", "ot-g5", "ot-pw1", "INFLUENCES",   0.60, "BRAF cross-talks with JAK-STAT signalling in haematological malignancies."),
 ]
 
+# ---------------------------------------------------------------------------
+# Cross-source relationships — link PubMed and Open Targets sub-graphs so the
+# combined graph is connected and the force-graph viewer shows interplay.
+# ---------------------------------------------------------------------------
+CROSS_RELATIONSHIPS = [
+    ("xr-1", "pm-g5",  "ot-d1", "RELATED_TO",  0.70, "TNF signalling drives mucosal inflammation in ulcerative colitis (cross-source)."),
+    ("xr-2", "pm-g5",  "ot-pw2", "PART_OF",    0.85, "TNF is an upstream activator of the NF-κB inflammatory pathway."),
+    ("xr-3", "pm-dr4", "ot-d1", "RELATED_TO",  0.80, "Adalimumab (anti-TNF) is approved for moderate-to-severe ulcerative colitis."),
+    ("xr-4", "ot-g1",  "pm-d3", "RELATED_TO",  0.65, "JAK2 contributes to cytokine signalling implicated in rheumatoid arthritis."),
+    ("xr-5", "ot-dr1", "pm-d3", "RELATED_TO",  0.78, "Tofacitinib is also approved for rheumatoid arthritis as a JAK inhibitor."),
+    ("xr-6", "pm-g1",  "ot-pw1", "INFLUENCES", 0.72, "EGFR cross-talks with JAK-STAT signalling in epithelial tumours."),
+    ("xr-7", "ot-g5",  "pm-pw1", "PART_OF",    0.74, "BRAF acts downstream of RAS in the EGFR-RAS-MAPK signalling cascade."),
+    ("xr-8", "pm-pr1", "ot-d4", "RELATED_TO",  0.55, "PD-L1 expression on multiple-myeloma cells contributes to immune escape (emerging evidence)."),
+]
+
 # Combine all seed data
 SEED_ENTITIES = PUBMED_ENTITIES + OT_ENTITIES
-SEED_RELATIONSHIPS = PUBMED_RELATIONSHIPS + OT_RELATIONSHIPS
+SEED_RELATIONSHIPS = PUBMED_RELATIONSHIPS + OT_RELATIONSHIPS + CROSS_RELATIONSHIPS
 
 
 @router.post("/seed", summary="Seed sample biomedical data (dev only)")
@@ -204,6 +219,65 @@ async def seed_graph(graph_repo=Depends(get_graph_repo)):
         "message": f"Seeded {added_e} entities and {added_r} relationships.",
         "total_entities": stats.get("total_entities", added_e),
         "total_relationships": stats.get("total_relationships", added_r),
+    }
+
+
+@router.post("/seed-curation", summary="Tag existing items for the curation queue (dev only)")
+async def seed_curation(graph_repo=Depends(get_graph_repo)):
+    """Mark a sample of existing entities/relationships as ``unverified``,
+    ``flagged``, or ``rejected`` so the Curation page is populated.
+
+    Why we need this: pipeline-extracted items now land as ``unverified``
+    automatically, but seeded reference data (PubMed/OpenTargets dev seed,
+    bulk ingests) is intentionally tagged ``verified`` and won't show up.
+    This route stamps a representative slice of the existing graph with
+    a mix of statuses so the queue, status badges, and approve/reject
+    actions all have something to act on.
+    """
+    if os.getenv("ENVIRONMENT", "development").lower() == "production":
+        raise HTTPException(status_code=403, detail="Disabled in production.")
+
+    all_entities = await graph_repo.get_all_entities()
+    all_rels = await graph_repo.get_all_relationships()
+
+    ent_list = list(all_entities.values())
+    rel_list = list(all_rels.values())
+
+    if not ent_list and not rel_list:
+        return {
+            "message": "Graph is empty — run /dev/seed first or process a document.",
+            "tagged": {"entities": 0, "relationships": 0},
+        }
+
+    # Round-robin three statuses across the first ~12 of each so the table
+    # shows a representative mix.
+    statuses = ["unverified", "flagged", "rejected"]
+    notes = {
+        "unverified": "Awaiting reviewer confirmation",
+        "flagged": "Low confidence — please double-check sources",
+        "rejected": "Conflicts with curated reference data",
+    }
+
+    tagged_e = 0
+    for i, ent in enumerate(ent_list[:12]):
+        status = statuses[i % len(statuses)]
+        ent.metadata.add_annotation("verification_status", status)
+        ent.metadata.add_annotation("verification_notes", notes[status])
+        await graph_repo.save_entity(ent)
+        tagged_e += 1
+
+    tagged_r = 0
+    for i, rel in enumerate(rel_list[:8]):
+        status = statuses[i % len(statuses)]
+        rel.metadata.add_annotation("verification_status", status)
+        rel.metadata.add_annotation("verification_notes", notes[status])
+        await graph_repo.save_relationship(rel)
+        tagged_r += 1
+
+    return {
+        "message": f"Tagged {tagged_e} entities and {tagged_r} relationships for curation.",
+        "tagged": {"entities": tagged_e, "relationships": tagged_r},
+        "tip": "Open /curation in the frontend to see them.",
     }
 
 

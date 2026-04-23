@@ -117,9 +117,14 @@ class Metadata:
         self.updated_by = updated_by
         self.version += 1
     
-    def add_tag(self, tag: str) -> None:
-        """Add a tag to the metadata."""
-        self.tags.add(tag.strip().lower())
+    def add_tag(self, tag: Optional[str]) -> None:
+        """Add a tag to the metadata. Silently ignores None/blank — callers
+        often pass an optional form field that may be unset."""
+        if not tag:
+            return
+        cleaned = str(tag).strip().lower()
+        if cleaned:
+            self.tags.add(cleaned)
     
     def add_annotation(self, key: str, value: Any) -> None:
         """Add an annotation to the metadata."""

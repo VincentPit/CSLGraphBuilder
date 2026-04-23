@@ -38,9 +38,20 @@ export default function CurationPage() {
 
   return (
     <div className="space-y-8">
-      <header>
+      <header className="space-y-2">
+        <span
+          className="badge badge-brand inline-flex"
+          style={{ background: 'var(--accent-soft)', border: '1px solid rgba(213,33,44,0.25)' }}
+        >
+          <CheckCircle2 size={10} className="opacity-70" />
+          Human-in-the-loop review
+        </span>
         <h1 className="page-title">Curation Queue</h1>
-        <p className="page-desc">Review extracted items before they are promoted to trusted graph content.</p>
+        <p className="page-desc">
+          Review extracted items before they're promoted to trusted graph
+          content. Items only appear here once a verifier flags them — run
+          the Process page or trigger a verification to populate the queue.
+        </p>
       </header>
 
       <div className="flex flex-wrap gap-2">
@@ -60,7 +71,19 @@ export default function CurationPage() {
         {isLoading ? (
           <div className="p-6 text-sm flex items-center gap-2" style={{ color: 'var(--text-muted)' }}><Loader2 size={14} className="animate-spin" /> Loading queue</div>
         ) : (data?.items.length ?? 0) === 0 ? (
-          <div className="p-8 text-sm" style={{ color: 'var(--text-muted)' }}>No items in queue.</div>
+          <div className="empty-state">
+            <span className="empty-icon"><CheckCircle2 size={20} /></span>
+            <p className="text-[12.5px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+              Queue is empty — nothing to review
+            </p>
+            <p className="text-[10.5px]">
+              Items appear here only when a verifier marks them as
+              <span className="badge badge-warning mx-1">flagged</span>
+              or
+              <span className="badge badge-danger mx-1">rejected</span>.
+              Run an extraction or verification to populate the queue.
+            </p>
+          </div>
         ) : (
           <table className="w-full text-sm">
             <thead style={{ background: 'var(--bg-muted)', borderBottom: '1px solid var(--border)' }}>

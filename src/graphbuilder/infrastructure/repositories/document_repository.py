@@ -6,14 +6,54 @@ for document and chunk persistence with advanced querying capabilities.
 """
 
 import asyncio
+import json
 import logging
 from typing import Dict, List, Optional, Any, AsyncGenerator
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
+from enum import Enum
 
 from ...domain.models.graph_models import SourceDocument, DocumentChunk
 from ...domain.models.processing_models import ProcessingStatus
 from ..config.settings import GraphBuilderConfig
+
+
+def _to_neo4j_props(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a dict for Neo4j ``SET node += $properties``.
+
+    Neo4j only accepts primitives + lists of primitives as node properties — no
+    nested maps, no lists of maps, no None values, no enum instances. We:
+    - drop ``None`` keys (they'd come back as missing properties anyway),
+    - JSON-serialise nested dicts and lists-of-dicts (round-trippable),
+    - convert Enum instances to their ``.value``,
+    - convert datetime to ISO strings.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, Enum):
+            out[k] = v.value
+        elif isinstance(v, datetime):
+            out[k] = v.isoformat()
+        elif isinstance(v, dict):
+            # Skip empty maps; serialise non-empty ones as JSON strings.
+            if v:
+                out[k] = json.dumps(v, default=str)
+        elif isinstance(v, list):
+            if not v:
+                out[k] = []
+            elif all(isinstance(item, (str, int, float, bool)) for item in v):
+                out[k] = v
+            else:
+                # List of complex things → JSON string.
+                out[k] = json.dumps(v, default=str)
+        elif isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        else:
+            # Fallback: stringify unknown types so we never crash on save.
+            out[k] = str(v)
+    return out
 
 
 class DocumentRepositoryInterface(ABC):
@@ -109,7 +149,8 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
             
             properties = document.to_dict()
             properties.pop('id', None)  # Remove ID from properties
-            
+            properties = _to_neo4j_props(properties)
+
             result = await session.run(query, {
                 'id': document.id,
                 'properties': properties
@@ -201,7 +242,8 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
             
             properties = chunk.to_dict()
             properties.pop('id', None)
-            
+            properties = _to_neo4j_props(properties)
+
             result = await session.run(query, {
                 'document_id': chunk.document_id,
                 'chunk_id': chunk.id,
@@ -232,7 +274,7 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
                 batch_data.append({
                     'chunk_id': chunk.id,
                     'document_id': chunk.document_id,
-                    'properties': props,
+                    'properties': _to_neo4j_props(props),
                 })
 
             create_query = """
@@ -513,6 +555,16 @@ class InMemoryDocumentRepository(DocumentRepositoryInterface):
         """Get chunks by document ID from memory."""
         chunks = self.chunks.get(document_id, [])
         return sorted(chunks, key=lambda c: c.chunk_index)
+
+    async def save_chunks_with_links(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """In-memory equivalent of the Neo4j batch method.
+
+        Order is preserved by ``chunk_index``; the linked-list edges
+        (FIRST_CHUNK / NEXT_CHUNK) are not modelled in memory.
+        """
+        for chunk in sorted(chunks, key=lambda c: c.chunk_index):
+            await self.save_chunk(chunk)
+        return chunks
 
 
 # Factory function for creating appropriate repository

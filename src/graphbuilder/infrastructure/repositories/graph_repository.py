@@ -6,6 +6,7 @@ for graph entities and relationships with advanced querying capabilities.
 """
 
 import asyncio
+import json
 import logging
 from typing import Dict, List, Optional, Any, Set, Tuple, Sequence
 from datetime import datetime, timezone
@@ -16,6 +17,29 @@ from ...domain.models.graph_models import (
     EntityType, RelationshipType
 )
 from ..config.settings import GraphBuilderConfig
+from .document_repository import _to_neo4j_props  # shared property flattener
+
+
+def _decode_props(value: Any) -> Dict[str, Any]:
+    """Inverse of ``_to_neo4j_props`` for nested-dict fields.
+
+    ``_to_neo4j_props`` JSON-stringifies non-empty maps so Neo4j (which only
+    accepts primitives + arrays of primitives) can store them. On read, the
+    value comes back as a string — parse it back to a dict. Returns an empty
+    dict for None / missing / invalid values so callers can dereference
+    safely.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
 
 
 class GraphRepositoryInterface(ABC):
@@ -239,12 +263,14 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties.pop('id', None)
                 properties.pop('source_chunk_ids', None)
                 properties.pop('source_document_ids', None)
+                properties = _to_neo4j_props(properties)
 
-                # Compute embedding for vector index
+                # Compute embedding for vector index (added after flattening
+                # because the embedding is already a list of primitives).
                 emb = self._embed_text(self._entity_embedding_text(entity))
                 if emb is not None:
                     properties['name_embedding'] = emb
-                
+
                 await session.run(update_query, {
                     'existing_id': existing_id,
                     'properties': properties,
@@ -283,6 +309,7 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties.pop('id', None)
                 properties.pop('source_chunk_ids', None)
                 properties.pop('source_document_ids', None)
+                properties = _to_neo4j_props(properties)
                 properties['content_hash'] = entity.get_hash()
 
                 # Compute embedding for vector index
@@ -382,9 +409,20 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                     relationship, source_name, target_name
                 ))
 
+                # Carry forward any property/metadata updates the caller made
+                # (e.g. setting verification_status on an existing rel for the
+                # curation queue). ``SET r += $properties`` merges flat keys
+                # without disturbing the chunk-id arrays we set explicitly.
+                update_props = relationship.to_dict()
+                update_props.pop('id', None)
+                update_props.pop('source_chunk_ids', None)
+                update_props.pop('source_document_ids', None)
+                update_props = _to_neo4j_props(update_props)
+
                 update_query = """
                 MATCH ()-[r:RELATES {id: $existing_id}]->()
-                SET r.source_chunk_ids = $source_chunk_ids,
+                SET r += $properties,
+                    r.source_chunk_ids = $source_chunk_ids,
                     r.source_document_ids = $source_document_ids,
                     r.desc_embedding = $desc_embedding,
                     r.updated_at = datetime(),
@@ -393,6 +431,7 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 """
                 await session.run(update_query, {
                     'existing_id': existing_id,
+                    'properties': update_props,
                     'source_chunk_ids': merged_chunks,
                     'source_document_ids': merged_docs,
                     'desc_embedding': emb,
@@ -430,6 +469,7 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties.pop('id', None)
                 properties.pop('source_chunk_ids', None)
                 properties.pop('source_document_ids', None)
+                properties = _to_neo4j_props(properties)
 
                 # Compute embedding for vector index
                 emb = self._embed_text(self._relationship_embedding_text(
@@ -801,22 +841,22 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
     
     def _create_entity_from_data(self, data: Dict[str, Any]) -> GraphEntity:
         """Create GraphEntity from database data."""
-        
+
         # Handle enum conversion
         entity_type = EntityType(data.get('entity_type', 'CONCEPT'))
-        
+
         entity = GraphEntity(
             name=data.get('name', ''),
             entity_type=entity_type,
             description=data.get('description'),
-            properties=data.get('properties', {}) if isinstance(data.get('properties'), dict) else {},
+            properties=_decode_props(data.get('properties')),
             aliases=set(data.get('aliases', [])) if data.get('aliases') else set(),
-            external_ids=data.get('external_ids', {}) if isinstance(data.get('external_ids'), dict) else {},
+            external_ids=_decode_props(data.get('external_ids')),
             source_chunk_ids=list(data.get('source_chunk_ids') or []),
             source_document_ids=list(data.get('source_document_ids') or []),
         )
         entity.id = data.get('id', entity.id)
-        
+
         # Restore metadata
         if 'created_at' in data:
             entity.metadata.created_at = self._parse_datetime(data['created_at'])
@@ -828,7 +868,22 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             entity.metadata.confidence_score = data['confidence_score']
         if 'source_trust' in data and data['source_trust']:
             entity.metadata.source_trust = data['source_trust']
-        
+
+        # `metadata` was serialised as a JSON string by ``_to_neo4j_props``
+        # because it's a nested dict. Parse it back so annotations + tags
+        # survive the round-trip — needed for the Curation queue (which
+        # filters by ``annotations.verification_status``).
+        meta_blob = _decode_props(data.get('metadata'))
+        if meta_blob:
+            ann = meta_blob.get('annotations')
+            if isinstance(ann, dict):
+                entity.metadata.annotations.update(ann)
+            tags = meta_blob.get('tags')
+            if isinstance(tags, list):
+                for t in tags:
+                    if t:
+                        entity.metadata.tags.add(t)
+
         return entity
     
     def _create_relationship_from_data(self, data: Dict[str, Any]) -> GraphRelationship:
@@ -842,20 +897,20 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             target_entity_id=data.get('target_entity_id', ''),
             relationship_type=relationship_type,
             description=data.get('description'),
-            properties=data.get('properties', {}) if isinstance(data.get('properties'), dict) else {},
+            properties=_decode_props(data.get('properties')),
             strength=data.get('strength', 1.0),
             source_chunk_ids=list(data.get('source_chunk_ids') or []),
             source_document_ids=list(data.get('source_document_ids') or []),
         )
         relationship.id = data.get('id', relationship.id)
-        
+
         # Handle temporal validity
         if 'temporal_validity' in data and data['temporal_validity']:
             temporal_data = data['temporal_validity']
             start_date = self._parse_datetime(temporal_data.get('start_date')) if temporal_data.get('start_date') else None
             end_date = self._parse_datetime(temporal_data.get('end_date')) if temporal_data.get('end_date') else None
             relationship.set_temporal_validity(start_date, end_date)
-        
+
         # Restore metadata
         if 'created_at' in data:
             relationship.metadata.created_at = self._parse_datetime(data['created_at'])
@@ -867,7 +922,19 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             relationship.metadata.confidence_score = data['confidence_score']
         if 'source_trust' in data and data['source_trust']:
             relationship.metadata.source_trust = data['source_trust']
-        
+
+        # Restore annotations from the JSON-stringified metadata blob.
+        meta_blob = _decode_props(data.get('metadata'))
+        if meta_blob:
+            ann = meta_blob.get('annotations')
+            if isinstance(ann, dict):
+                relationship.metadata.annotations.update(ann)
+            tags = meta_blob.get('tags')
+            if isinstance(tags, list):
+                for t in tags:
+                    if t:
+                        relationship.metadata.tags.add(t)
+
         return relationship
     
     def _parse_datetime(self, dt_value) -> datetime:

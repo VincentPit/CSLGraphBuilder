@@ -108,7 +108,7 @@ class OpenTargetsIngestionUseCase:
                 if a.association_score >= ingestion_config.min_association_score
             ]
 
-            # ── 3. Build domain objects ─────────────────────────────────
+            # ── 3. Build entities ───────────────────────────────────────
             disease_entity = self._build_disease_entity(
                 ingest_result, ingestion_config
             )
@@ -116,21 +116,27 @@ class OpenTargetsIngestionUseCase:
                 self._build_target_entity(assoc, ingestion_config)
                 for assoc in associations
             ]
+
+            # ── 4. Persist entities FIRST. ``save_entity`` deduplicates by
+            #      (name, entity_type) and may mutate ``entity.id`` to point
+            #      at an existing Neo4j record. Relationships must be built
+            #      AFTER saving so they capture the resolved IDs — otherwise
+            #      MATCH (s:Entity {id: …}) finds nothing on the source/target
+            #      and ``save_relationship`` raises ``Source or target entity
+            #      not found``.
+            await self.graph_repo.save_entity(disease_entity)
+            entities_saved = 1
+            for entity in target_entities:
+                await self.graph_repo.save_entity(entity)
+                entities_saved += 1
+
+            # ── 5. Build relationships now that IDs are resolved ────────
             relationships = [
                 self._build_relationship(disease_entity, te, assoc)
                 for te, assoc in zip(target_entities, associations)
             ]
 
-            # ── 4. Persist ──────────────────────────────────────────────
-            await self.graph_repo.save_entity(disease_entity)
-
-            entities_saved = 1
             rels_saved = 0
-
-            for entity in target_entities:
-                await self.graph_repo.save_entity(entity)
-                entities_saved += 1
-
             for rel in relationships:
                 await self.graph_repo.save_relationship(rel)
                 rels_saved += 1

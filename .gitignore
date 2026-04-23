@@ -28,8 +28,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Python venv lib dirs — anchored to root so they don't catch frontend/lib/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -58,6 +59,7 @@ htmlcov/
 frontend/.next/
 frontend/out/
 frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
 node_modules/
 npm-debug.log*
 yarn-debug.log*

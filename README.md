@@ -2,6 +2,8 @@
 
 An enterprise knowledge graph construction pipeline for CSL Behring. Ingests documents (URLs, PDFs, JSON, plain text), extracts biomedical entities and relationships via LLM, and persists them into a Neo4j graph database with LLM-powered deduplication, cascading verification, conflict detection, and provenance tracking. Ships with a FastAPI backend, a Next.js 14 frontend, and Docker Compose for one-command deployment.
 
+> **v2.1 — workflow & UI upgrade.** Document processing now runs through a stage-aware pipeline (`fetch → chunk → entities → relationships → finalize`) with bounded **parallel chunk extraction**, process-wide **LLM dedup + embedding caches**, **cooperative cancellation**, structured **per-stage SSE progress events**, and a **`/health/metrics`** endpoint exposing call volume, token usage, latency, and cache hit rates. The frontend renders all of this as a live **stage timeline** with a cancel button, plus a new **Job History** page and a **Pipeline Performance** widget on the dashboard.
+
 ---
 
 ## Table of Contents
@@ -27,25 +29,15 @@ An enterprise knowledge graph construction pipeline for CSL Behring. Ingests doc
 Input (URL / File / Text / Open Targets API / PubMed / Web Crawl)
         │
         ▼
-ContentExtractorService          ← aiohttp, BeautifulSoup, PyMuPDF, UnstructuredFileLoader
+DocumentExtractionPipeline           ← ordered stages with progress callbacks + cancel
+  Stage 1  fetch         ← aiohttp + BeautifulSoup; or use pre-supplied content
+  Stage 2  chunk         ← SemanticChunker; FIRST_CHUNK / NEXT_CHUNK linked list
+  Stage 3  entities      ← parallel per-chunk LLM extraction (asyncio.Semaphore)
+                            └─ vector pre-filter → cache-aware LLM dedup
+  Stage 4  relationships ← parallel per-chunk LLM extraction
+                            └─ vector pre-filter → cache-aware LLM dedup
+  Stage 5  finalize      ← persist counts + status to source document
         │
-        ▼
-Semantic Chunking                ← configurable chunk_size + overlap
-        │
-        ▼
-Chunk Graph (Neo4j)              ← SHA-1 IDs; FIRST_CHUNK / NEXT_CHUNK linked list
-        │
-        ▼
-LLM Extraction (LLMGraphTransformer)
-  ├── allowed_nodes filter        ← restrict extracted node types (optional)
-  ├── allowed_relationships filter← restrict extracted relationship types (optional)
-  └── strict_mode                 ← reject entities not in allowed lists
-        │
-        ▼
-LLM-Powered Deduplication (two-stage)
-  Stage 1 — Vector pre-filter     ← low-threshold cosine search (sentence-transformers)
-  Stage 2 — LLM confirmation      ← domain-aware synonym / abbreviation resolution
-        │                            (e.g. "TNF-alpha" ≈ "Tumor Necrosis Factor Alpha")
         ▼
 Neo4j Knowledge Graph
   Document → [:FIRST_CHUNK] → Chunk → [:NEXT_CHUNK] → Chunk
@@ -68,25 +60,39 @@ Conflict Detection + Curation
   └── Human-in-the-loop approve / reject / correct
         │
         ▼
-REST API (FastAPI)  ←→  Next.js 14 Frontend (React, Tailwind, react-force-graph-2d)
+Cross-cutting
+  ├── PipelineMetrics      ← LLM calls, tokens, latency, cache hit rate
+  ├── LLMDedupCache        ← skip repeat dedup LLM calls within & across runs
+  ├── EmbeddingCache       ← skip repeat sentence-transformer encodes
+  └── Job store            ← stage progress, append-only event log, cancel flag
+        │
+        ▼
+REST API (FastAPI, SSE)  ←→  Next.js 14 Frontend (stage timeline, metrics widget)
 ```
 
 ---
 
 ## Key Features
 
-- **Multi-source ingestion** — URLs, files, raw text, Open Targets API, PubMed, and web crawling with configurable depth and domain restrictions
-- **LLM entity & relationship extraction** — GPT-4 powered extraction with configurable schema constraints (`allowed_nodes`, `allowed_relationships`, `strict_mode`)
-- **Two-stage LLM deduplication** — Vector pre-filter (low threshold, cheap) followed by LLM confirmation for domain-aware synonym resolution across abbreviations, alternate names, and scientific notation
-- **Neo4j vector search** — Native vector indexes on entity names and relationship descriptions for fast approximate nearest-neighbour queries
-- **Cascading verification pipeline** — Three-stage (text match → embedding → LLM) verification with confidence-based escalation; cheap stages run first and expensive stages only fire when earlier results are inconclusive
-- **Conflict detection** — Automatic identification of contradictory relationships (e.g. INHIBITS vs ACTIVATES between the same entity pair) with severity scoring
-- **Provenance tracking** — Every entity and relationship links back to source documents, chunks, and extraction metadata
-- **Source trust** — Configurable trust levels per source; higher-trust sources win in merge conflicts
-- **Curation workflow** — Queue-based human review with approve / reject / correct actions and full audit trail
-- **Web crawler with cache** — Crawls web pages with domain restrictions, page limits, and disk-based cache to avoid re-fetching
-- **Real-time job tracking** — Background processing with SSE streaming for live progress updates
-- **Export** — JSON, Cytoscape, GraphML, and interactive HTML graph exports
+- **Stage-aware extraction pipeline** — Each document flows through five named stages (`fetch`, `chunk`, `entities`, `relationships`, `finalize`) with structured per-stage progress callbacks. The frontend renders this as a live timeline.
+- **Parallel chunk processing** — Per-document entity & relationship extraction runs chunks concurrently with a bounded `asyncio.Semaphore` (capped by `parallel_workers`). Multi-chunk documents extract roughly N× faster.
+- **LLM dedup cache** — Process-wide LRU keyed by the `(new entities, candidate entities)` signature. Repeat dedup calls within and across runs become free.
+- **Embedding cache** — Process-wide LRU on entity-name embeddings; eliminates redundant sentence-transformer encodes during vector pre-filtering.
+- **Cooperative cancellation** — `POST /documents/jobs/{id}/cancel` flips a flag; the pipeline polls between chunk batches and aborts cleanly with status `cancelled`.
+- **Pipeline metrics endpoint** — `GET /health/metrics` exposes LLM call volume by type, prompt/completion tokens, average latency, cache hit rate, embedding hit rate, and graph throughput.
+- **Structured SSE event stream** — `GET /documents/jobs/{id}/stream` emits typed `progress` and `done` events containing the full job snapshot (status, current stage, per-stage status map, recent event log).
+- **Unified job model** — Documents, web crawls, PubMed, and Open Targets all share one `Job` shape; the same UI timeline renders for any kind.
+- **Multi-source ingestion** — URLs, files, raw text, Open Targets API, PubMed, and web crawling with configurable depth and domain restrictions.
+- **LLM entity & relationship extraction** — GPT-4 powered extraction with configurable schema constraints (`allowed_nodes`, `allowed_relationships`, `strict_mode`).
+- **Two-stage LLM deduplication** — Vector pre-filter (low threshold, cheap) followed by LLM confirmation for domain-aware synonym resolution across abbreviations, alternate names, and scientific notation.
+- **Neo4j vector search** — Native vector indexes on entity names and relationship descriptions for fast approximate nearest-neighbour queries.
+- **Cascading verification pipeline** — Three-stage (text match → embedding → LLM) verification with confidence-based escalation; cheap stages run first and expensive stages only fire when earlier results are inconclusive.
+- **Conflict detection** — Automatic identification of contradictory relationships (e.g. INHIBITS vs ACTIVATES between the same entity pair) with severity scoring.
+- **Provenance tracking** — Every entity and relationship links back to source documents, chunks, and extraction metadata.
+- **Source trust** — Configurable trust levels per source; higher-trust sources win in merge conflicts.
+- **Curation workflow** — Queue-based human review with approve / reject / correct actions and full audit trail.
+- **Web crawler with cache** — Crawls web pages with domain restrictions, page limits, and disk-based cache to avoid re-fetching.
+- **Export** — JSON, Cytoscape, GraphML, and interactive HTML graph exports.
 
 ---
 
@@ -309,21 +315,41 @@ Base URL: `http://localhost:8000`
 
 All endpoints accept/return JSON. Protect with `X-API-Key` header when `API_KEY` env var is set.
 
-### Health
+### Health & Metrics
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | Liveness check |
-| GET | `/health/ready` | Readiness check (config loaded) |
+| GET | `/health/ready` | Readiness — surfaces configured DB + LLM provider/model |
+| GET | `/health/metrics` | Process-wide pipeline metrics (LLM calls, tokens, latency, cache hit rates, throughput, cache sizes) |
 
-### Documents
+### Documents & Jobs
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/documents/process` | Ingest a document (background job, returns job ID) |
-| GET | `/documents/jobs/{id}` | Poll job status |
-| GET | `/documents/jobs/{id}/stream` | SSE stream of job progress |
-| GET | `/documents` | List ingested documents |
+| POST | `/documents/process` | Kick off the extraction pipeline (returns a job envelope with ordered stages) |
+| GET | `/documents/jobs` | List recent jobs across all kinds (document / web-crawl / pubmed / open-targets) |
+| GET | `/documents/jobs/{id}` | Full job snapshot — status, current stage, per-stage status map, event log, result |
+| POST | `/documents/jobs/{id}/cancel` | Cooperative cancel; pipeline aborts at the next chunk boundary |
+| GET | `/documents/jobs/{id}/stream` | SSE — typed `progress` + `done` events with the full snapshot |
+| GET | `/documents` | List persisted source documents |
+
+The job envelope:
+
+```json
+{
+  "job_id": "…",
+  "kind": "document",
+  "status": "running",
+  "stages": ["fetch", "chunk", "entities", "relationships", "finalize"],
+  "current_stage": "entities",
+  "stage_progress": {"fetch": "completed", "chunk": "completed", "entities": "running", ...},
+  "progress": 0.42,
+  "events": [{"ts": "…", "stage": "entities", "level": "info", "message": "Processed 4/12 chunks", "data": {...}}],
+  "cancel_requested": false,
+  "result": null
+}
+```
 
 **`POST /documents/process` body:**
 ```json
@@ -382,50 +408,60 @@ All endpoints accept/return JSON. Protect with `X-API-Key` header when `API_KEY`
 
 ```
 CSLGraphBuilder/
-├── api/                           # FastAPI application
-│   ├── main.py                    # App factory, CORS, router registration
-│   ├── auth.py                    # X-API-Key guard
-│   ├── dependencies.py            # FastAPI Depends() factories
-│   ├── job_store.py               # In-memory background job tracker
-│   ├── review_store.py            # In-memory conflict review store
-│   ├── routers/                   # health, graph, documents, ingest, curation, verification, export
-│   └── schemas/                   # Pydantic request/response models
-├── frontend/                      # Next.js 14 frontend
+├── api/                                # FastAPI application
+│   ├── main.py                         # App factory, CORS, router registration
+│   ├── auth.py                         # X-API-Key guard
+│   ├── dependencies.py                 # FastAPI Depends() factories
+│   ├── job_store.py                    # Job model w/ stages, events, cancel flag
+│   ├── review_store.py                 # In-memory conflict review store
+│   ├── routers/                        # health (+metrics), graph, documents, ingest, curation, verification, export
+│   └── schemas/                        # Pydantic request/response models
+├── frontend/                           # Next.js 14 frontend
 │   ├── app/
-│   │   ├── page.tsx               # Dashboard
-│   │   ├── graph/                 # Interactive graph viewer (react-force-graph-2d)
-│   │   ├── process/               # Document ingestion form
-│   │   ├── ingest/                # Open Targets / PubMed / Web Crawl ingestion
-│   │   ├── curation/              # Manual curation queue
-│   │   ├── verification/          # Verification + conflict detection + pending reviews
-│   │   └── export/                # Graph export
+│   │   ├── page.tsx                    # Dashboard (graph stats + Pipeline Performance widget + recent jobs)
+│   │   ├── graph/                      # Interactive graph viewer (react-force-graph-2d)
+│   │   ├── process/                    # Document ingestion (stage timeline + cancel + result summary)
+│   │   ├── ingest/                     # Open Targets / PubMed / Web Crawl, all rendered with the shared timeline
+│   │   ├── documents/                  # Job History — split-pane list + live stage timeline
+│   │   ├── curation/                   # Manual curation queue
+│   │   ├── verification/               # Verification + conflict detection + pending reviews
+│   │   └── export/                     # Graph export
 │   ├── components/
-│   │   ├── Nav.tsx                # Sidebar navigation
-│   │   └── Providers.tsx          # React Query provider
-│   └── lib/api.ts                 # Typed API client
-├── src/graphbuilder/              # Installable Python package
-│   ├── cli/main.py                # Click CLI entry point
-│   ├── application/use_cases/     # ProcessDocument, Ingest, Verify, Curate, ConflictDetection, Visualize
-│   ├── core/
-│   │   ├── graph/transformer.py   # LLMGraphTransformer (allowed_nodes/rels, strict_mode)
-│   │   ├── processing/            # Chunking, semantic chunker, FIRST/NEXT_CHUNK graph, vector index
-│   │   ├── schema/extraction.py   # Structured schema extraction from LLM
-│   │   ├── verification/          # TextMatch → Embedding (w/ vector search) → LLM cascading verifiers
-│   │   └── utils/                 # common_functions, constants, visualization
-│   ├── domain/
-│   │   ├── entities/              # SourceNode, UserCredential
-│   │   └── models/                # GraphEntity, GraphRelationship, KnowledgeGraph, ProcessingResult
+│   │   ├── Nav.tsx                     # Sidebar navigation
+│   │   ├── JobTimeline.tsx             # Reusable stage timeline + event log + cancel
+│   │   └── Providers.tsx               # React Query provider
+│   └── lib/
+│       ├── api.ts                      # Typed API client (incl. Job, JobSummary, PipelineMetrics)
+│       └── useJobStream.ts             # SSE subscription with polling fallback
+├── src/graphbuilder/                   # Installable Python package
+│   ├── cli/main.py                     # Click CLI entry point
+│   ├── application/use_cases/
+│   │   ├── document_pipeline.py        # NEW: lean stage-aware orchestrator with caches + cancel + parallel chunks
+│   │   ├── document_processing.py      # Legacy task-state-machine (still covered by tests)
+│   │   ├── pubmed_ingestion.py
+│   │   ├── open_targets_ingestion.py
+│   │   ├── relationship_verification.py
+│   │   ├── text_verification.py
+│   │   ├── conflict_detection.py
+│   │   ├── curation.py
+│   │   └── graph_visualization.py
+│   ├── core/                           # Pure domain algorithms (chunking, transformer, verification cascade)
+│   ├── domain/                         # Models + repository interfaces
 │   └── infrastructure/
-│       ├── config/settings.py     # GraphBuilderConfig (env-var driven)
-│       ├── crawlers/              # web crawler (with cache), sync, json, file crawlers
+│       ├── config/settings.py          # GraphBuilderConfig (env-var driven)
+│       ├── crawlers/                   # web crawler (with cache), sync, json, file crawlers
 │       ├── database/neo4j_client.py
-│       ├── external/              # open_targets_client, pubmed_client
-│       ├── repositories/          # Neo4j + in-memory document/graph repositories (vector search)
-│       └── services/              # llm_service (extraction + dedup), content_extractor
+│       ├── external/                   # open_targets_client, pubmed_client
+│       ├── repositories/               # Neo4j + in-memory document/graph repositories (vector search)
+│       └── services/
+│           ├── llm_service.py          # LLM extraction + dedup; records to PipelineMetrics
+│           ├── content_extractor.py
+│           ├── metrics.py              # NEW: process-wide PipelineMetrics singleton
+│           └── cache.py                # NEW: LLMDedupCache + EmbeddingCache (async LRU)
 ├── tests/
-│   ├── unit/                      # Unit tests (verification, transformer, processor, LLM dedup)
-│   ├── integration/               # Integration tests (document processing, LLM service, extraction)
-│   └── e2e/                       # End-to-end tests (pipeline, live ingest, extraction pipeline)
+│   ├── unit/                           # Unit tests
+│   ├── integration/                    # Includes test_document_pipeline.py covering the new orchestrator
+│   └── e2e/                            # FastAPI TestClient + in-memory graph
 ├── Dockerfile.api
 ├── Dockerfile.frontend
 ├── docker-compose.yml
@@ -433,6 +469,22 @@ CSLGraphBuilder/
 ├── pyproject.toml
 └── requirements.txt
 ```
+
+## Workflow Upgrade Highlights (v2.1)
+
+| Concern | Before | After |
+|---|---|---|
+| Per-chunk LLM extraction | Sequential `for` loop | Bounded parallel `asyncio.gather` (capped by `parallel_workers`) |
+| Repeat dedup calls | Always hit the LLM | Hashed (`new`, `candidates`) signature → in-process LRU; subsequent identical calls are free |
+| Repeat embeddings | Re-encoded every call | Text-keyed LRU |
+| Progress reporting | Single `progress` float updated start/end | Per-stage status map + append-only event log + weighted global progress |
+| SSE | Polled state at 0.5 s, raw dict | Snapshot only when state changes; typed `progress` / `done` events |
+| Cancellation | Not supported | Cooperative — `POST /documents/jobs/{id}/cancel` flips a flag the pipeline polls between chunks |
+| Observability | Logs only | `GET /health/metrics` — calls by type, tokens, avg latency, cache hit rate, throughput |
+| Document-pipeline contract | API-side `SourceDocument(url=..., content=...)` failed at import time | New `DocumentInput` shape; pipeline accepts pre-fetched content or fetches the URL itself |
+| In-memory document repo | `save_chunks_with_links` was abstract | Implemented; pipeline now runs end-to-end without Neo4j |
+| Frontend progress UI | Plain log lines | Shared `JobTimeline` component (stage rail, weighted bar, live event tail, cancel) used by Process / Ingest / Job History |
+| Frontend dashboard | Stats only | + Pipeline Performance widget (auto-refresh 5s) and Recent Jobs panel |
 
 ---
 
@@ -451,7 +503,7 @@ CSLGraphBuilder/
 
 ## Testing
 
-The project has **191 tests** across three tiers:
+The project has **196 tests** across three tiers:
 
 ```bash
 # Run all tests
@@ -466,7 +518,7 @@ python -m pytest tests/e2e/ -v          # FastAPI TestClient + in-memory graph
 | Tier | What it covers |
 |---|---|
 | **Unit** | Verification pipeline (text match, embedding, LLM, cascading), graph transformer, processor, LLM dedup methods, embedding helpers |
-| **Integration** | Document processing use case, LLM service, entity extraction with dedup, relationship extraction with entity resolution |
+| **Integration** | Legacy document processing use case, LLM service, entity extraction with dedup, relationship extraction with entity resolution, **new `DocumentExtractionPipeline`** (stage emission, cooperative cancel, dedup-cache reuse) |
 | **E2E** | Full API pipeline (health → graph → curation → export), PubMed/OpenTargets ingest, extraction pipeline with dedup |
 
 All external dependencies (Neo4j, LLM APIs) are mocked. Tests use `asyncio_mode = "auto"` via pytest-asyncio.

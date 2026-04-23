@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Pre-commit hook: enforces "frontend-only" scope on the frontend-only branch.
+#
+# On every other branch this hook is a no-op, so it's safe to leave enabled
+# globally for the repo (`git config core.hooksPath .githooks`).
+#
+# Allowed paths on `frontend-only`:
+#   - frontend/**
+#   - README.md           (UI/UX documentation tweaks are fine)
+#   - .githooks/**        (the hook itself can evolve)
+#   - .gitignore          (frontend tooling sometimes adds ignores)
+#
+# Anything else is rejected so a backend change can't slip in by accident.
+# Bypass for a one-off emergency:  git commit --no-verify
+
+set -euo pipefail
+
+branch="$(git symbolic-ref --short HEAD 2>/dev/null || echo '')"
+if [[ "$branch" != "frontend-only" ]]; then
+  exit 0
+fi
+
+allowed_patterns=(
+  '^frontend/'
+  '^README\.md$'
+  '^\.githooks/'
+  '^\.gitignore$'
+)
+
+offenders=()
+while IFS= read -r path; do
+  [[ -z "$path" ]] && continue
+  ok=0
+  for p in "${allowed_patterns[@]}"; do
+    if [[ "$path" =~ $p ]]; then
+      ok=1
+      break
+    fi
+  done
+  if (( ok == 0 )); then
+    offenders+=("$path")
+  fi
+done < <(git diff --cached --name-only)
+
+if (( ${#offenders[@]} > 0 )); then
+  red=$'\033[31m'; bold=$'\033[1m'; dim=$'\033[2m'; reset=$'\033[0m'
+  printf '\n%s%s✗ frontend-only branch: refusing to commit non-frontend changes%s\n' "$red" "$bold" "$reset"
+  printf '\n  Disallowed paths in this commit:\n'
+  for f in "${offenders[@]}"; do
+    printf '    %s- %s%s\n' "$red" "$f" "$reset"
+  done
+  printf '\n  Allowed: %sfrontend/**, README.md, .githooks/**, .gitignore%s\n' "$bold" "$reset"
+  printf '  If a backend change is genuinely needed, branch from main instead.\n'
+  printf '  Emergency override: %sgit commit --no-verify%s\n\n' "$dim" "$reset"
+  exit 1
+fi
+
+exit 0

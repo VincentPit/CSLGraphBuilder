@@ -319,13 +319,12 @@ export default function CurationPage() {
             </button>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={() => actBulk('approve')} disabled={mutation.isPending} className="btn-primary">
-              {mutation.isPending ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+            <button onClick={() => actBulk('approve')} disabled={mutation.isPending} className="btn-success">
+              {mutation.isPending ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} strokeWidth={2.6} />}
               Approve {bulkIds.size}
             </button>
-            <button onClick={() => actBulk('reject')} disabled={mutation.isPending} className="btn-ghost"
-              style={{ color: 'var(--danger)', borderColor: 'rgba(153,27,27,0.30)' }}>
-              <XCircle size={13} />
+            <button onClick={() => actBulk('reject')} disabled={mutation.isPending} className="btn-danger">
+              <XCircle size={16} strokeWidth={2.6} />
               Reject {bulkIds.size}
             </button>
           </div>
@@ -622,25 +621,26 @@ function DetailPanel({
         </dl>
       </details>
 
-      <div className="flex items-center gap-2 pt-4" style={{ borderTop: '1px solid var(--border-subtle)' }}>
-        <button onClick={onApprove} disabled={acting} className="btn-primary"
-          title="Mark as human-verified — drops out of the queue.">
-          {acting ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+      <div className="flex items-center gap-2 pt-4 flex-wrap" style={{ borderTop: '2px solid var(--border-subtle)' }}>
+        <button onClick={onApprove} disabled={acting} className="btn-success"
+          title="Mark as human-verified — drops out of the queue. +XP!">
+          {acting ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} strokeWidth={2.6} />}
           Approve
         </button>
-        <button onClick={onReject} disabled={acting} className="btn-ghost"
-          style={{ color: 'var(--danger)', borderColor: 'rgba(153,27,27,0.30)' }}
+        <button onClick={onReject} disabled={acting} className="btn-danger"
           title="Soft-delete — keeps the item for audit but marks it as bad data.">
-          <XCircle size={13} />
+          <XCircle size={16} strokeWidth={2.6} />
           Reject
         </button>
         <button onClick={onEdit} disabled={acting} className="btn-ghost"
           title="Open the inline correct form to edit this item before approval.">
-          <Pencil size={13} />
-          Correct…
+          <Pencil size={14} strokeWidth={2.6} />
+          Correct
         </button>
         {actionError && (
-          <span className="text-[12px] ml-auto" style={{ color: 'var(--danger)' }}>{actionError}</span>
+          <span className="text-[12px] font-bold ml-auto" style={{ color: 'var(--danger)' }}>
+            {actionError}
+          </span>
         )}
       </div>
     </div>

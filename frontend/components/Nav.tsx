@@ -11,25 +11,28 @@ import {
   Download,
   Hexagon,
   Layers,
+  Flame,
 } from 'lucide-react';
 import HealthDot from './HealthDot';
 
-// Each link carries a one-line `tip` so hovering a sidebar item explains
-// what the page does — a small affordance that helps first-time users.
+// Each link gets a tip + a friendly emoji-style label hint to lean into
+// the Duolingo "playful, encouraging" tone. The emoji is kept *out* of
+// the label itself so screen readers don't trip over it; we put it in
+// `prefix` only.
 const groups = [
   {
     label: 'Insight',
     links: [
-      { href: '/',      label: 'Dashboard', icon: LayoutDashboard, tip: 'Live counters, breakdowns, and pipeline metrics' },
-      { href: '/graph', label: 'Graph',     icon: Network,         tip: 'Interactive force-directed knowledge graph' },
+      { href: '/',      label: 'Dashboard',  icon: LayoutDashboard, tip: 'Your daily overview — stats, streaks, recent activity' },
+      { href: '/graph', label: 'Graph',      icon: Network,         tip: 'Explore the knowledge graph visually' },
     ],
   },
   {
-    label: 'Pipeline',
+    label: 'Build',
     links: [
-      { href: '/process',   label: 'Process',     icon: FileText, tip: 'Run the LLM extraction pipeline on a URL or text' },
-      { href: '/ingest',    label: 'Ingest',      icon: Database, tip: 'Open Targets · PubMed · Web crawl' },
-      { href: '/documents', label: 'Job History', icon: Layers,   tip: 'Inspect any past run with stage timeline + log' },
+      { href: '/process',   label: 'Process',     icon: FileText, tip: 'Run a document through the LLM extraction pipeline' },
+      { href: '/ingest',    label: 'Ingest',      icon: Database, tip: 'Pull from Open Targets, PubMed, or crawl the web' },
+      { href: '/documents', label: 'Job History', icon: Layers,   tip: 'Replay any past run with full timeline + log' },
     ],
   },
   {
@@ -47,52 +50,54 @@ export default function Nav() {
 
   return (
     <aside
-      className="w-[232px] min-h-screen flex flex-col sticky top-0"
+      className="w-[240px] min-h-screen flex flex-col sticky top-0"
       style={{ background: 'var(--bg-sidebar-grad)' }}
     >
-      {/* Logo */}
-      <div className="px-5 pt-6 pb-5 flex items-center gap-3">
-        <div className="relative h-9 w-9">
+      {/* Logo — chunkier, with a subtle wobble on hover */}
+      <div className="px-5 pt-6 pb-5 flex items-center gap-3 group">
+        <div className="relative h-11 w-11 group-hover:[&>div]:wobble-loop">
           <div
-            className="absolute inset-0 rounded-xl bg-animated"
+            className="absolute inset-0 rounded-2xl bg-animated"
             style={{
-              backgroundImage:
-                'linear-gradient(135deg,#d5212c 0%,#ef4444 50%,#f59e0b 100%)',
+              backgroundImage: 'linear-gradient(135deg,#d5212c 0%,#ef4444 50%,#f59e0b 100%)',
               backgroundSize: '200% 200%',
+              boxShadow: '0 4px 0 #7a0d14',
             }}
           />
-          <div className="absolute inset-0 rounded-xl flex items-center justify-center">
-            <Hexagon size={16} className="text-white" strokeWidth={2.2} />
+          <div className="absolute inset-0 rounded-2xl flex items-center justify-center">
+            <Hexagon size={20} className="text-white drop-shadow" strokeWidth={2.6} />
           </div>
           <div
-            className="absolute -inset-1 rounded-xl opacity-40 blur-md -z-0"
+            className="absolute -inset-1 rounded-2xl opacity-50 blur-md -z-0"
             style={{
-              background:
-                'linear-gradient(135deg,#d5212c 0%,#ef4444 50%,#f59e0b 100%)',
+              background: 'linear-gradient(135deg,#d5212c 0%,#f59e0b 100%)',
             }}
           />
         </div>
         <div>
-          <p className="text-[14px] font-semibold text-white tracking-tight leading-none">
+          <p
+            className="text-[16px] font-extrabold text-white tracking-tight leading-none"
+            style={{ fontFamily: 'Nunito, sans-serif' }}
+          >
             GraphBuilder
           </p>
           <p
-            className="text-[10px] mt-1 font-medium uppercase tracking-wider"
-            style={{ color: 'rgba(255,255,255,0.40)' }}
+            className="text-[10px] mt-1 font-bold uppercase tracking-widest"
+            style={{ color: 'rgba(255,255,255,0.45)' }}
           >
-            CSL Behring · Knowledge
+            CSL · Knowledge Quest
           </p>
         </div>
       </div>
 
-      <div className="mx-4 h-px" style={{ background: 'rgba(255,255,255,0.06)' }} />
+      <div className="mx-4 h-px" style={{ background: 'rgba(255,255,255,0.08)' }} />
 
       <nav className="px-3 py-4 flex-1 flex flex-col gap-5">
         {groups.map((group) => (
-          <div key={group.label} className="flex flex-col gap-0.5">
+          <div key={group.label} className="flex flex-col gap-1">
             <p
-              className="px-3 mb-1.5 text-[10px] font-semibold uppercase tracking-widest"
-              style={{ color: 'rgba(255,255,255,0.28)' }}
+              className="px-3 mb-1.5 text-[10px] font-extrabold uppercase tracking-widest"
+              style={{ color: 'rgba(255,255,255,0.32)' }}
             >
               {group.label}
             </p>
@@ -103,7 +108,7 @@ export default function Nav() {
                   key={href}
                   href={href}
                   title={tip}
-                  className="group relative flex items-center gap-2.5 px-3 py-2 rounded-lg text-[13px] font-medium transition-all overflow-hidden"
+                  className="group relative flex items-center gap-3 px-3 py-2.5 rounded-xl text-[14px] font-bold transition-all overflow-hidden"
                   style={{
                     color: active ? 'var(--text-sidebar-active)' : 'var(--text-sidebar)',
                     background: active ? 'var(--bg-sidebar-active)' : 'transparent',
@@ -117,20 +122,24 @@ export default function Nav() {
                 >
                   {active && (
                     <span
-                      className="absolute left-0 top-1/2 -translate-y-1/2 h-5 w-[3px] rounded-r-full"
+                      className="absolute left-0 top-1/2 -translate-y-1/2 h-7 w-[4px] rounded-r-full"
                       style={{
-                        background:
-                          'linear-gradient(180deg,#d5212c 0%,#f59e0b 100%)',
+                        background: 'linear-gradient(180deg,#d5212c 0%,#f59e0b 100%)',
                       }}
                     />
                   )}
-                  <Icon
-                    size={15}
+                  <span
+                    className="flex items-center justify-center h-8 w-8 rounded-lg shrink-0 transition-transform group-hover:scale-110"
                     style={{
-                      opacity: active ? 1 : 0.55,
-                      color: active ? '#fca5a5' : 'currentColor',
+                      background: active ? 'rgba(255,255,255,0.10)' : 'transparent',
                     }}
-                  />
+                  >
+                    <Icon
+                      size={17}
+                      strokeWidth={active ? 2.6 : 2.2}
+                      style={{ color: active ? '#fca5a5' : 'currentColor' }}
+                    />
+                  </span>
                   <span className="relative">{label}</span>
                 </Link>
               );
@@ -140,15 +149,19 @@ export default function Nav() {
       </nav>
 
       <div
-        className="px-5 py-4 flex flex-col gap-2"
-        style={{ borderTop: '1px solid rgba(255,255,255,0.06)' }}
+        className="px-5 py-4 flex flex-col gap-2.5"
+        style={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}
       >
+        <span className="badge badge-streak inline-flex w-fit">
+          <Flame size={11} />
+          On a roll!
+        </span>
         <HealthDot />
         <p
-          className="text-[10px] font-medium"
-          style={{ color: 'rgba(255,255,255,0.22)' }}
+          className="text-[10px] font-bold uppercase tracking-wider"
+          style={{ color: 'rgba(255,255,255,0.28)' }}
         >
-          CSL GraphBuilder v2.1
+          v2.1 · CSL GraphBuilder
         </p>
       </div>
     </aside>

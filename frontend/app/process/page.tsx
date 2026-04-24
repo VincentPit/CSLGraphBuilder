@@ -93,21 +93,24 @@ export default function ProcessPage() {
 
   return (
     <div className="space-y-8 max-w-3xl">
-      <header className="space-y-2">
-        <span
-          className="badge badge-brand inline-flex"
-          style={{ background: 'var(--accent-soft)', border: '1px solid rgba(213,33,44,0.25)' }}
-        >
-          <Loader2 size={10} className="opacity-70" />
-          5 stages · cancel any time
-        </span>
-        <h1 className="page-title">Process Document</h1>
+      <header className="space-y-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span
+            className="badge badge-brand inline-flex"
+            style={{ background: 'var(--accent-soft)', border: '2px solid rgba(213,33,44,0.30)' }}
+          >
+            <Loader2 size={10} className="opacity-80" />
+            5 stages · cancel any time
+          </span>
+          <span className="badge badge-xp"><Sliders size={11} /> Earns XP per chunk</span>
+        </div>
+        <h1 className="page-title">Start a Quest</h1>
         <p className="page-desc">
-          Paste a URL or some text and watch the LLM pipeline run live. Each
-          stage —
-          <span className="text-gradient font-semibold"> fetch · chunk · entities · relationships · finalize</span>
-          {' '}— streams progress, and you can cancel cleanly mid-run. Extracted
-          entities and relationships are saved to the knowledge graph.
+          Paste a URL or some text and watch the LLM pipeline run live. Five
+          stages —
+          <span className="text-gradient font-bold"> fetch · chunk · entities · relationships · finalize</span>
+          {' '}— stream progress in real time. Cancel any time, no penalty.
+          Every entity you extract levels up your knowledge graph!
         </p>
       </header>
 
@@ -211,15 +214,15 @@ export default function ProcessPage() {
             >
               {isRunning ? (
                 <>
-                  <Loader2 size={15} className="animate-spin" /> Processing
+                  <Loader2 size={16} className="animate-spin" /> Processing…
                 </>
               ) : (
-                'Start Extraction'
+                <>Begin Quest →</>
               )}
             </button>
             {job && !isRunning && (
               <button type="button" onClick={reset} className="btn-ghost">
-                Run another
+                New quest
               </button>
             )}
           </div>

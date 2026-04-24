@@ -181,17 +181,18 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
     # ------------------------------------------------------------------
 
     def _get_embedding_model(self):
-        """Lazy-load sentence-transformers model (shared across calls)."""
+        """Return the shared sentence-transformers model from the factory.
+
+        We delegate to ``embedding_factory`` so this repo, the pipeline,
+        the verifier, and the chunker all use the same model instance —
+        and so swapping the model (e.g. SapBERT vs MiniLM) only needs
+        the ``EMBEDDING_MODEL`` env var, not a code change.
+        """
         if self._embedding_model is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-                model_name = "all-MiniLM-L6-v2"
-                self.logger.info("Loading embedding model '%s' for vector index …", model_name)
-                self._embedding_model = SentenceTransformer(model_name)
-                self._embedding_dim = self._embedding_model.get_sentence_embedding_dimension()
-            except ImportError:
-                self.logger.warning("sentence-transformers not installed; vector indexing disabled.")
-                return None
+            from ..services.embedding_factory import get_model, get_embedding_dim
+            self._embedding_model = get_model()
+            if self._embedding_model is not None:
+                self._embedding_dim = get_embedding_dim() or self._embedding_dim
         return self._embedding_model
 
     def _embed_text(self, text: str) -> Optional[List[float]]:

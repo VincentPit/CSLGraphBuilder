@@ -56,11 +56,12 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 # Stage weights for the global progress bar. Roughly mirrors typical
 # wall-clock distribution (chunking is fast, LLM extraction dominates).
 _STAGE_WEIGHTS = {
-    "fetch": 0.05,
-    "chunk": 0.05,
-    "entities": 0.45,
-    "relationships": 0.40,
-    "finalize": 0.05,
+    "fetch": 0.04,
+    "chunk": 0.04,
+    "entities": 0.38,
+    "relationships": 0.34,
+    "verify": 0.16,        # cascading verifier on every new relationship
+    "finalize": 0.04,
 }
 
 

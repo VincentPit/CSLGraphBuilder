@@ -63,6 +63,7 @@ DOCUMENT_STAGES: List[str] = [
     "chunk",
     "entities",
     "relationships",
+    "verify",
     "finalize",
 ]
 

@@ -93,6 +93,11 @@ class PipelineResult:
     entities_merged: int = 0
     relationships_extracted: int = 0
     relationships_merged: int = 0
+    # Verification summary — populated by _stage_verify
+    relationships_verified: int = 0   # auto-approved (verification_status="verified")
+    relationships_flagged: int = 0    # needs human review (status="flagged")
+    relationships_rejected: int = 0   # conflicts with trusted data ("rejected")
+    relationships_unreviewed: int = 0 # cascade was inconclusive but not flag-worthy
     cancelled: bool = False
     duration_seconds: float = 0.0
     error: Optional[str] = None
@@ -107,6 +112,10 @@ class PipelineResult:
             "entities_merged": self.entities_merged,
             "relationships_extracted": self.relationships_extracted,
             "relationships_merged": self.relationships_merged,
+            "relationships_verified": self.relationships_verified,
+            "relationships_flagged": self.relationships_flagged,
+            "relationships_rejected": self.relationships_rejected,
+            "relationships_unreviewed": self.relationships_unreviewed,
             "cancelled": self.cancelled,
             "duration_seconds": round(self.duration_seconds, 2),
             "error": self.error,
@@ -193,15 +202,43 @@ class DocumentExtractionPipeline:
             )
             result.relationships_extracted = rel_summary["extracted"]
             result.relationships_merged = rel_summary["merged"]
+            self._raise_if_cancelled(cancel_check)
+
+            # Stage 5 — auto-verify newly-saved relationships and tag them
+            # verified / flagged / rejected per the configured thresholds so
+            # the curation queue surfaces only the items that actually need
+            # a human eye.
+            if getattr(self.config, "verification", None) and self.config.verification.enabled:
+                await _maybe_await(progress("verify", "Verifying new relationships", 0.0, None))
+                verify_summary = await self._stage_verify(
+                    document, progress, cancel_check
+                )
+                result.relationships_verified   = verify_summary["verified"]
+                result.relationships_flagged    = verify_summary["flagged"]
+                result.relationships_rejected   = verify_summary["rejected"]
+                result.relationships_unreviewed = verify_summary["unreviewed"]
 
             await _maybe_await(progress("finalize", "Persisting summary", 0.5, None))
             await self._stage_finalize(document, result)
             await _maybe_await(progress("finalize", "Done", 1.0, None))
 
+            verify_summary = ""
+            verify_total = (
+                result.relationships_verified
+                + result.relationships_flagged
+                + result.relationships_rejected
+                + result.relationships_unreviewed
+            )
+            if verify_total > 0:
+                verify_summary = (
+                    f" · auto-verify: {result.relationships_verified} verified, "
+                    f"{result.relationships_flagged} flagged, "
+                    f"{result.relationships_rejected} rejected"
+                )
             result.message = (
                 f"Extracted {result.entities_extracted} entities and "
                 f"{result.relationships_extracted} relationships from "
-                f"{result.chunks_created} chunks"
+                f"{result.chunks_created} chunks{verify_summary}"
             )
             await self.metrics.record_document()
 
@@ -747,7 +784,188 @@ class DocumentExtractionPipeline:
         return False
 
     # ------------------------------------------------------------------
-    # Stage 5 — finalize
+    # Stage 5 — auto-verify (cascade → confidence → status)
+    # ------------------------------------------------------------------
+
+    async def _stage_verify(
+        self,
+        document: SourceDocument,
+        progress: ProgressCallback,
+        cancel_check: CancelCheck,
+    ) -> Dict[str, int]:
+        """Run the cascading verifier on every newly-saved relationship and
+        map the (confidence, conflict, source_trust) triple to a
+        ``verification_status`` annotation per the project's standard.
+
+        Why only relationships: the cascading verifier was designed for
+        ``GraphRelationship`` objects (text-match looks for the SUBJ-VERB-OBJ
+        in the source chunk; LLM stage is given source/target names). Entities
+        stay ``unverified`` for human review — adding an entity verifier is a
+        separate task.
+
+        Why we *fetch* unverified rels rather than threading IDs through the
+        relationship stage: simpler, and it picks up any leftover unverified
+        rels from a previous crashed pipeline as a bonus.
+        """
+        from ...core.verification import (
+            CascadingVerifier,
+            CascadingVerifierConfig,
+        )
+
+        cfg = self.config.verification
+
+        # Pull all relationships for this document that are still flagged as
+        # unverified (the default tag set in _stage_relationships).
+        all_rels = await self.graph_repo.get_all_relationships()
+        targets = []
+        for rel in all_rels.values():
+            if document.id not in (rel.source_document_ids or []):
+                continue
+            ann = getattr(getattr(rel, "metadata", None), "annotations", {}) or {}
+            if ann.get("verification_status") in ("unverified", None, ""):
+                targets.append(rel)
+
+        if not targets:
+            await _maybe_await(progress("verify", "Nothing to verify", 1.0, None))
+            return {"verified": 0, "flagged": 0, "rejected": 0, "unreviewed": 0}
+
+        # Build a verifier. Skip the LLM stage in batch mode for speed —
+        # the user can still trigger it from the /verification page.
+        verifier_cfg = CascadingVerifierConfig(
+            enable_llm=not cfg.batch_skip_llm,
+        )
+        verifier = CascadingVerifier(
+            config=verifier_cfg,
+            llm_service=self.llm_service if not cfg.batch_skip_llm else None,
+            graph_repo=self.graph_repo,
+        )
+
+        # Resolve entity-id → name for the verifier kwargs.
+        all_entities = await self.graph_repo.get_all_entities()
+        id_to_name = {e.id: e.name for e in all_entities.values()}
+
+        # Pre-fetch source chunks for all targets in one round-trip so each
+        # verifier call doesn't hit Neo4j.
+        wanted_chunk_ids: set[str] = set()
+        for rel in targets:
+            wanted_chunk_ids.update(rel.source_chunk_ids or [])
+        chunk_text: Dict[str, str] = {}
+        if wanted_chunk_ids and hasattr(self.document_repo, "get_chunks_by_ids"):
+            try:
+                chunks = await self.document_repo.get_chunks_by_ids(list(wanted_chunk_ids))
+                for c in chunks:
+                    chunk_text[c.id] = c.content
+            except Exception as exc:
+                logger.debug("Verify stage: chunk lookup failed (%s)", exc)
+
+        sem = asyncio.Semaphore(max(1, int(cfg.parallel_workers)))
+        counts = {"verified": 0, "flagged": 0, "rejected": 0, "unreviewed": 0}
+        completed = 0
+        lock = asyncio.Lock()
+
+        async def _verify_one(rel) -> None:
+            nonlocal completed
+            self._raise_if_cancelled(cancel_check)
+            async with sem:
+                self._raise_if_cancelled(cancel_check)
+                # Build context from the rel's source chunks (truncated).
+                ctx_parts = [chunk_text[cid] for cid in (rel.source_chunk_ids or []) if cid in chunk_text]
+                context = ("\n\n".join(ctx_parts))[:4000] if ctx_parts else ""
+                src_name = id_to_name.get(rel.source_entity_id)
+                tgt_name = id_to_name.get(rel.target_entity_id)
+
+                # The verifier is sync; run in a thread so the LLM call (if
+                # enabled) doesn't block the event loop.
+                try:
+                    vr = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: verifier.verify(
+                            relationship=rel,
+                            context=context,
+                            source_name=src_name,
+                            target_name=tgt_name,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.debug("Verify failed for rel %s: %s", rel.id, exc)
+                    vr = None
+
+                status, notes = self._classify(vr, rel, cfg)
+                rel.metadata.add_annotation("verification_status", status)
+                if notes:
+                    rel.metadata.add_annotation("verification_notes", notes)
+                if vr is not None:
+                    rel.metadata.add_annotation(
+                        "verification_confidence", round(float(vr.confidence or 0.0), 3)
+                    )
+                try:
+                    await self.graph_repo.save_relationship(rel)
+                except Exception as exc:
+                    logger.warning("Could not persist verification for %s: %s", rel.id, exc)
+
+                async with lock:
+                    counts[status if status in counts else "unreviewed"] += 1
+                    completed += 1
+                    fraction = completed / len(targets)
+                    await _maybe_await(progress(
+                        "verify",
+                        f"Verified {completed}/{len(targets)} "
+                        f"({counts['verified']} verified · {counts['flagged']} flagged · {counts['rejected']} rejected)",
+                        fraction,
+                        {"completed": completed, "total": len(targets), **counts},
+                    ))
+
+        await _gather_with_cancel([_verify_one(r) for r in targets], cancel_check=cancel_check)
+        return counts
+
+    @staticmethod
+    def _classify(
+        verification_result: Any,
+        relationship: Any,
+        cfg: Any,
+    ) -> tuple[str, Optional[str]]:
+        """Map the verifier's output to a ``verification_status`` string.
+
+        Rules — relationship variant of the table in README:
+
+            conflict_detected           → cfg.treat_conflict_as ("rejected")
+            confidence ≥ rel_auto_approve OR
+              (source_trust=="reviewed" AND confidence ≥ trusted_auto_approve)
+                                        → "verified"
+            confidence < rel_flag_below → "flagged"
+            anything else               → "unverified"
+
+        ``verification_result`` may be None if the verifier crashed; we fall
+        back to "unverified" rather than dropping the relationship.
+        """
+        source_trust = getattr(getattr(relationship, "metadata", None), "source_trust", None)
+
+        # Conflict signal: VerificationResult exposes a `conflict_detected`
+        # field on some stages; we also treat an explicit FAILED status as a
+        # soft conflict for now.
+        conflict = False
+        if verification_result is not None:
+            for stage_res in (getattr(verification_result, "stage_results", []) or []):
+                if getattr(stage_res, "conflict_detected", False):
+                    conflict = True
+                    break
+        if conflict:
+            return cfg.treat_conflict_as, "Conflicts with existing trusted data"
+
+        if verification_result is None:
+            return "unverified", "Verifier did not run (error)"
+
+        confidence = float(verification_result.confidence or 0.0)
+        if confidence >= cfg.relationship_auto_approve:
+            return "verified", f"Auto-approved at {confidence:.2f} confidence"
+        if source_trust == "reviewed" and confidence >= cfg.trusted_auto_approve:
+            return "verified", f"Trusted source + {confidence:.2f} confidence"
+        if confidence < cfg.relationship_flag_below:
+            return "flagged", f"Low confidence ({confidence:.2f}) — needs review"
+        return "unverified", f"Inconclusive ({confidence:.2f})"
+
+    # ------------------------------------------------------------------
+    # Stage 6 — finalize
     # ------------------------------------------------------------------
 
     async def _stage_finalize(
@@ -770,20 +988,16 @@ class DocumentExtractionPipeline:
     # Helpers
     # ------------------------------------------------------------------
 
-    _embedding_model = None  # class-level lazy cache
-
     def _get_embedding_model(self):
-        if DocumentExtractionPipeline._embedding_model is None:
-            try:
-                from sentence_transformers import SentenceTransformer
+        """Return the shared sentence-transformers model from the factory.
 
-                DocumentExtractionPipeline._embedding_model = SentenceTransformer(
-                    "all-MiniLM-L6-v2"
-                )
-            except Exception as exc:
-                logger.warning("sentence-transformers unavailable (%s)", exc)
-                return None
-        return DocumentExtractionPipeline._embedding_model
+        Routed through ``embedding_factory`` so the pipeline, graph repo,
+        chunker, and verifier all share one model instance — and so
+        switching to SapBERT (or any other model) is an env var, not a
+        code change. See infrastructure.services.embedding_factory.
+        """
+        from ...infrastructure.services.embedding_factory import get_model
+        return get_model()
 
     async def _embed(self, text: str) -> Optional[list]:
         text = (text or "").strip()

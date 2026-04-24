@@ -188,10 +188,23 @@ class EmbeddingVerifier:
     # ------------------------------------------------------------------
 
     def _get_model(self) -> object:
+        """Resolve the embedding model.
+
+        If the verifier was configured with a custom ``model_name`` we
+        respect it (tests can pin a specific model). Otherwise we delegate
+        to ``embedding_factory.get_model()`` so the verifier shares the
+        same instance — and the same dim — as the rest of the app.
+        """
         name = self._cfg.model_name
+        # Default → use the shared factory (env-driven, biomedical default).
+        if name == EmbeddingConfig.__dataclass_fields__["model_name"].default:
+            from ...infrastructure.services.embedding_factory import get_model
+            shared = get_model()
+            if shared is not None:
+                return shared
+        # Explicit override → load and cache by name as before.
         if name not in _MODEL_CACHE:
             from sentence_transformers import SentenceTransformer  # type: ignore
-
             logger.info("Loading sentence-transformers model '%s' …", name)
             _MODEL_CACHE[name] = SentenceTransformer(name)
         return _MODEL_CACHE[name]

@@ -36,7 +36,9 @@ DocumentExtractionPipeline           ← ordered stages with progress callbacks 
                             └─ vector pre-filter → cache-aware LLM dedup
   Stage 4  relationships ← parallel per-chunk LLM extraction
                             └─ vector pre-filter → cache-aware LLM dedup
-  Stage 5  finalize      ← persist counts + status to source document
+  Stage 5  verify        ← cascading verifier on every new relationship
+                            └─ confidence + conflict + source_trust → status
+  Stage 6  finalize      ← persist counts + status to source document
         │
         ▼
 Neo4j Knowledge Graph
@@ -74,7 +76,9 @@ REST API (FastAPI, SSE)  ←→  Next.js 14 Frontend (stage timeline, metrics wi
 
 ## Key Features
 
-- **Stage-aware extraction pipeline** — Each document flows through five named stages (`fetch`, `chunk`, `entities`, `relationships`, `finalize`) with structured per-stage progress callbacks. The frontend renders this as a live timeline.
+- **Stage-aware extraction pipeline** — Each document flows through six named stages (`fetch`, `chunk`, `entities`, `relationships`, `verify`, `finalize`) with structured per-stage progress callbacks. The frontend renders this as a live timeline.
+- **Auto-verification + curation triage** — After extraction, the cascading verifier runs on every new relationship and tags it `verified`, `flagged`, or `rejected` per a configurable confidence × source-trust matrix. Most items skip the human queue; only the uncertain ones reach a curator. See **Verification Policy** below.
+- **Biomedical embeddings (SapBERT)** — Default sentence-embedding model is `cambridgeltl/SapBERT-from-PubMedBERT-fulltext`, fine-tuned for biomedical entity linking. Override with `EMBEDDING_MODEL` env var; falls back to `all-MiniLM-L6-v2` if SapBERT can't load.
 - **Parallel chunk processing** — Per-document entity & relationship extraction runs chunks concurrently with a bounded `asyncio.Semaphore` (capped by `parallel_workers`). Multi-chunk documents extract roughly N× faster.
 - **LLM dedup cache** — Process-wide LRU keyed by the `(new entities, candidate entities)` signature. Repeat dedup calls within and across runs become free.
 - **Embedding cache** — Process-wide LRU on entity-name embeddings; eliminates redundant sentence-transformer encodes during vector pre-filtering.
@@ -242,6 +246,49 @@ IS_EMBEDDING=true
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 LOG_LEVEL=INFO
 ```
+
+---
+
+## Verification Policy
+
+After extraction, every new relationship runs through the cascading
+verifier (text-match → embedding → LLM, with the LLM stage skipped in
+batch mode by default). The aggregated confidence + conflict signal +
+source-trust level then map to a `verification_status` annotation that
+drives the curation queue.
+
+### Default thresholds
+
+| `aggregated_confidence` | `conflict?` | `source_trust` | → `verification_status` |
+|---|---|---|---|
+| ≥ **0.90** | no | any | **`verified`** (auto-approved, skips queue) |
+| 0.60 – 0.90 | no | `reviewed` | **`verified`** (trusted-source bias) |
+| 0.60 – 0.90 | no | `extracted` | **`unverified`** (low priority in queue) |
+| < 0.60 | no | any | **`flagged`** (mid priority — needs human eye) |
+| any | **yes** | any | **`rejected`** (top of queue — conflicts with trusted data) |
+| verifier crashed / disabled | — | — | **`unverified`** (default) |
+
+Entities are not auto-verified yet — they default to `unverified` and
+require human review. (Adding an `EntityVerifier` is a future task.)
+
+### Tuning
+
+All thresholds are env-driven via `VerificationConfiguration`:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `VERIFY_ENABLED` | `true` | Run the verify stage at all |
+| `VERIFY_BATCH_SKIP_LLM` | `true` | Skip the (slow, expensive) LLM stage during batch verify |
+| `VERIFY_PARALLEL_WORKERS` | `4` | Bounded concurrency for in-pipeline verification |
+| `VERIFY_REL_AUTO` | `0.90` | Auto-approve threshold for relationships |
+| `VERIFY_REL_FLAG` | `0.60` | Below this, relationships go to `flagged` |
+| `VERIFY_TRUSTED_AUTO` | `0.60` | Trusted-source bias auto-approve threshold |
+| `VERIFY_CONFLICT_AS` | `rejected` | What to do when a conflict is detected |
+
+A typical Wikipedia extraction (50–100 relationships, mostly
+`extracted` source trust) produces roughly 60–70% auto-verified, 5–10%
+flagged, and 0–3% rejected — collapsing a 100-item review queue into
+~10 items that actually need a human.
 
 ---
 

@@ -245,6 +245,69 @@ class MonitoringConfiguration:
     performance_sample_rate: float = field(default_factory=lambda: float(os.getenv("MONITORING_SAMPLE_RATE", "0.1")))
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Embedding & verification — both relevant to the auto-flag pipeline
+# ──────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class EmbeddingConfiguration:
+    """Sentence-embedding model configuration.
+
+    The model is loaded lazily by ``services.embedding_factory`` on first
+    use; this struct just holds the choice. We default to **SapBERT**
+    (PubMedBERT fine-tuned for biomedical entity linking) because the
+    project's primary use case is matching biomedical entities — a
+    general-purpose model like all-MiniLM-L6-v2 leaves accuracy on the
+    table for `TNF-alpha` ↔ `Tumor Necrosis Factor Alpha` style links.
+    """
+
+    model_name: str = field(default_factory=lambda: os.getenv(
+        "EMBEDDING_MODEL", "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+    ))
+    fallback_model_name: str = field(default_factory=lambda: os.getenv(
+        "EMBEDDING_MODEL_FALLBACK", "all-MiniLM-L6-v2"
+    ))
+
+
+@dataclass
+class VerificationConfiguration:
+    """Auto-verification policy applied at the end of the pipeline.
+
+    After entity/relationship extraction the cascading verifier runs on
+    every newly-saved relationship. The (aggregated_confidence, conflict,
+    source_trust) triple maps to ``verification_status`` via the
+    thresholds below — see README "Verification policy" for the full
+    matrix and rationale.
+    """
+
+    # Run the auto-verification stage at all (turn off for cheap demos).
+    enabled: bool = field(default_factory=lambda: os.getenv("VERIFY_ENABLED", "true").lower() == "true")
+
+    # Skip the LLM stage during batch verification (it's slow and we run
+    # 10s-100s of items per pipeline). Users can still trigger the LLM
+    # stage manually from the /verification page.
+    batch_skip_llm: bool = field(default_factory=lambda: os.getenv("VERIFY_BATCH_SKIP_LLM", "true").lower() == "true")
+
+    # Bounded parallelism for verifying relationships in-pipeline.
+    parallel_workers: int = field(default_factory=lambda: int(os.getenv("VERIFY_PARALLEL_WORKERS", "4")))
+
+    # Auto-approve thresholds (above → verification_status="verified", skips queue)
+    entity_auto_approve: float = field(default_factory=lambda: float(os.getenv("VERIFY_ENTITY_AUTO", "0.85")))
+    relationship_auto_approve: float = field(default_factory=lambda: float(os.getenv("VERIFY_REL_AUTO", "0.90")))
+
+    # Flag thresholds (below → verification_status="flagged", needs human review)
+    entity_flag_below: float = field(default_factory=lambda: float(os.getenv("VERIFY_ENTITY_FLAG", "0.50")))
+    relationship_flag_below: float = field(default_factory=lambda: float(os.getenv("VERIFY_REL_FLAG", "0.60")))
+
+    # Trusted-source bias — items from `reviewed` sources auto-approve at
+    # a more permissive bar (Open Targets / PubMed are already curated).
+    trusted_auto_approve: float = field(default_factory=lambda: float(os.getenv("VERIFY_TRUSTED_AUTO", "0.60")))
+
+    # When a conflict with existing trusted data is detected, treat as:
+    treat_conflict_as: str = field(default_factory=lambda: os.getenv("VERIFY_CONFLICT_AS", "rejected"))
+
+
 class GraphBuilderConfig:
     """
     Enterprise-grade configuration management system.
@@ -276,6 +339,8 @@ class GraphBuilderConfig:
         self.logging = LoggingConfiguration()
         self.security = SecurityConfiguration()
         self.monitoring = MonitoringConfiguration()
+        self.embedding = EmbeddingConfiguration()
+        self.verification = VerificationConfiguration()
         
         # Validate configuration
         self._validate_configuration()

@@ -268,8 +268,12 @@ drives the curation queue.
 | any | **yes** | any | **`rejected`** (top of queue — conflicts with trusted data) |
 | verifier crashed / disabled | — | — | **`unverified`** (default) |
 
-Entities are not auto-verified yet — they default to `unverified` and
-require human review. (Adding an `EntityVerifier` is a future task.)
+Entities are auto-verified too via a lightweight two-stage check (no
+LLM ever): **text-match** against this run's chunk text + **embedding
+similarity** to existing graph entities. Confidence maps via the
+entity-specific knobs below. Entities that don't reach `auto_approve`
+but are above `flag_below` land in `unverified` (the middle bucket —
+not flagged as bad, but waiting for human approval).
 
 ### Tuning
 
@@ -280,10 +284,34 @@ All thresholds are env-driven via `VerificationConfiguration`:
 | `VERIFY_ENABLED` | `true` | Run the verify stage at all |
 | `VERIFY_BATCH_SKIP_LLM` | `true` | Skip the (slow, expensive) LLM stage during batch verify |
 | `VERIFY_PARALLEL_WORKERS` | `4` | Bounded concurrency for in-pipeline verification |
+| `VERIFY_ENTITY_AUTO` | `0.85` | Auto-approve threshold for entities |
+| `VERIFY_ENTITY_FLAG` | `0.50` | Below this, entities go to `flagged` |
 | `VERIFY_REL_AUTO` | `0.90` | Auto-approve threshold for relationships |
 | `VERIFY_REL_FLAG` | `0.60` | Below this, relationships go to `flagged` |
 | `VERIFY_TRUSTED_AUTO` | `0.60` | Trusted-source bias auto-approve threshold |
 | `VERIFY_CONFLICT_AS` | `rejected` | What to do when a conflict is detected |
+
+### Migrating to a different embedding model
+
+If you change `EMBEDDING_MODEL` (e.g. MiniLM → SapBERT), existing
+embeddings in Neo4j are stored at the old dim and won't compare
+against new ones. One call recreates everything:
+
+```bash
+curl -X POST http://localhost:8001/dev/reembed
+```
+
+Drops `entity_name_vector` + `rel_desc_vector` indexes, re-embeds
+every entity + relationship with the current model, recreates the
+indexes with the right dim. Idempotent; safe to re-run.
+
+### Startup warm-up
+
+The embedding model (~440 MB for SapBERT) preloads in a background
+task on FastAPI startup, so the first Process request after a fresh
+boot doesn't pay the download/load cost. The API is reachable
+immediately; if a request hits before warm-up finishes, the lazy
+load path still works (just slower for that one call).
 
 A typical Wikipedia extraction (50–100 relationships, mostly
 `extracted` source trust) produces roughly 60–70% auto-verified, 5–10%

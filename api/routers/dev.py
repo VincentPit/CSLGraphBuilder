@@ -281,6 +281,84 @@ async def seed_curation(graph_repo=Depends(get_graph_repo)):
     }
 
 
+@router.post("/reembed", summary="Recompute every embedding with the current model")
+async def reembed_graph(graph_repo=Depends(get_graph_repo)):
+    """Migrate the graph to the currently-configured embedding model.
+
+    What it does, in order:
+      1. Detects the current model + dim from ``embedding_factory``.
+      2. Drops the two vector indexes (``entity_name_vector`` and
+         ``rel_desc_vector``) — they may have been created with a
+         different dim, which would silently break new searches.
+      3. Re-embeds every entity (name + description) and every
+         relationship (description) with the current model and saves.
+      4. ``save_entity`` / ``save_relationship`` call the repo's index
+         setup on first write, so the indexes get recreated with the
+         new dim automatically.
+
+    Use this when you switch ``EMBEDDING_MODEL`` (e.g. MiniLM 384-d →
+    SapBERT 768-d). Safe to run multiple times — it's idempotent.
+    """
+    if os.getenv("ENVIRONMENT", "development").lower() == "production":
+        raise HTTPException(status_code=403, detail="Reembed endpoint is disabled in production.")
+
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from graphbuilder.infrastructure.services.embedding_factory import (
+        get_model_name, get_embedding_dim,
+    )
+    from graphbuilder.infrastructure.repositories.graph_repository import Neo4jGraphRepository
+
+    model_name = get_model_name() or "(unknown)"
+    new_dim = get_embedding_dim() or 0
+    if new_dim == 0:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedding model not loaded yet — try again in a few seconds.",
+        )
+
+    # Drop old vector indexes so they get recreated with the right dim
+    # on the first save below. Best-effort; a missing index is fine.
+    if isinstance(graph_repo, Neo4jGraphRepository):
+        for idx in ("entity_name_vector", "rel_desc_vector"):
+            try:
+                await graph_repo.execute_cypher_query(f"DROP INDEX `{idx}` IF EXISTS", {})
+            except Exception:
+                pass
+        # Reset the in-memory dim cache so the next save reads the new dim.
+        try:
+            graph_repo._embedding_dim = new_dim   # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    # Re-embed and save every entity + relationship.
+    all_entities = await graph_repo.get_all_entities()
+    all_rels = await graph_repo.get_all_relationships()
+
+    re_e, re_r, errors = 0, 0, 0
+    for ent in list(all_entities.values()):
+        try:
+            await graph_repo.save_entity(ent)   # save_entity recomputes the embedding
+            re_e += 1
+        except Exception:
+            errors += 1
+    for rel in list(all_rels.values()):
+        try:
+            await graph_repo.save_relationship(rel)
+            re_r += 1
+        except Exception:
+            errors += 1
+
+    return {
+        "model": model_name,
+        "dim": new_dim,
+        "reembedded_entities": re_e,
+        "reembedded_relationships": re_r,
+        "errors": errors,
+        "tip": "Run a Process job — vector pre-filter will now use the new model.",
+    }
+
+
 @router.delete("/reset", summary="Clear all data (dev only)")
 async def reset_graph(graph_repo=Depends(get_graph_repo)):
     if os.getenv("ENVIRONMENT", "development").lower() == "production":

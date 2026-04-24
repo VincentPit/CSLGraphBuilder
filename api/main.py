@@ -51,11 +51,44 @@ def _configure_logging() -> None:
 _configure_logging()
 
 
+async def _warm_embedding_model() -> None:
+    """Pre-load the sentence-embedding model in the background.
+
+    Without this, the *first* Process request after a fresh boot pays
+    the SapBERT download (~30s) before the pipeline can start. Doing it
+    at startup means the API is responsive immediately while the model
+    downloads/loads in parallel; if a request comes in before warm-up
+    finishes, the lazy-load path in ``embedding_factory`` still works,
+    just slower for that one call.
+    """
+    log = logging.getLogger("graphbuilder.api")
+    try:
+        # ``run_in_executor`` so the blocking sentence-transformers load
+        # doesn't block the asyncio loop or other startup work.
+        import asyncio, sys, os as _os
+        sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "src"))
+        from graphbuilder.infrastructure.services.embedding_factory import (
+            get_model, get_model_name, get_embedding_dim,
+        )
+        log.info("Warming embedding model in background…")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, get_model)
+        log.info("Embedding model ready: %s (dim=%d)", get_model_name(), get_embedding_dim())
+    except Exception as exc:
+        log.warning("Embedding model warm-up failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logging.getLogger("graphbuilder.api").info("API startup")
+    log = logging.getLogger("graphbuilder.api")
+    log.info("API startup")
+    # Fire-and-forget; the API is reachable immediately.
+    import asyncio
+    warm_task = asyncio.create_task(_warm_embedding_model())
     yield
-    logging.getLogger("graphbuilder.api").info("API shutdown")
+    log.info("API shutdown")
+    if not warm_task.done():
+        warm_task.cancel()
 
 
 def create_app() -> FastAPI:

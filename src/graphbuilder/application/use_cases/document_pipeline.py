@@ -98,6 +98,10 @@ class PipelineResult:
     relationships_flagged: int = 0    # needs human review (status="flagged")
     relationships_rejected: int = 0   # conflicts with trusted data ("rejected")
     relationships_unreviewed: int = 0 # cascade was inconclusive but not flag-worthy
+    entities_verified: int = 0
+    entities_flagged: int = 0
+    entities_rejected: int = 0
+    entities_unreviewed: int = 0
     cancelled: bool = False
     duration_seconds: float = 0.0
     error: Optional[str] = None
@@ -112,6 +116,10 @@ class PipelineResult:
             "entities_merged": self.entities_merged,
             "relationships_extracted": self.relationships_extracted,
             "relationships_merged": self.relationships_merged,
+            "entities_verified": self.entities_verified,
+            "entities_flagged": self.entities_flagged,
+            "entities_rejected": self.entities_rejected,
+            "entities_unreviewed": self.entities_unreviewed,
             "relationships_verified": self.relationships_verified,
             "relationships_flagged": self.relationships_flagged,
             "relationships_rejected": self.relationships_rejected,
@@ -217,24 +225,38 @@ class DocumentExtractionPipeline:
                 result.relationships_flagged    = verify_summary["flagged"]
                 result.relationships_rejected   = verify_summary["rejected"]
                 result.relationships_unreviewed = verify_summary["unreviewed"]
+                result.entities_verified   = verify_summary.get("entity_verified",   0)
+                result.entities_flagged    = verify_summary.get("entity_flagged",    0)
+                result.entities_rejected   = verify_summary.get("entity_rejected",   0)
+                result.entities_unreviewed = verify_summary.get("entity_unreviewed", 0)
 
             await _maybe_await(progress("finalize", "Persisting summary", 0.5, None))
             await self._stage_finalize(document, result)
             await _maybe_await(progress("finalize", "Done", 1.0, None))
 
             verify_summary = ""
-            verify_total = (
+            rel_total = (
                 result.relationships_verified
                 + result.relationships_flagged
                 + result.relationships_rejected
                 + result.relationships_unreviewed
             )
-            if verify_total > 0:
-                verify_summary = (
-                    f" · auto-verify: {result.relationships_verified} verified, "
-                    f"{result.relationships_flagged} flagged, "
-                    f"{result.relationships_rejected} rejected"
+            ent_total = (
+                result.entities_verified
+                + result.entities_flagged
+                + result.entities_rejected
+                + result.entities_unreviewed
+            )
+            if rel_total + ent_total > 0:
+                ent_part = (
+                    f"entities {result.entities_verified}✓ {result.entities_flagged}⚠ {result.entities_rejected}✗"
+                    if ent_total else "entities -"
                 )
+                rel_part = (
+                    f"rels {result.relationships_verified}✓ {result.relationships_flagged}⚠ {result.relationships_rejected}✗"
+                    if rel_total else "rels -"
+                )
+                verify_summary = f" · auto-verify: {ent_part} · {rel_part}"
             result.message = (
                 f"Extracted {result.entities_extracted} entities and "
                 f"{result.relationships_extracted} relationships from "
@@ -793,26 +815,38 @@ class DocumentExtractionPipeline:
         progress: ProgressCallback,
         cancel_check: CancelCheck,
     ) -> Dict[str, int]:
-        """Run the cascading verifier on every newly-saved relationship and
-        map the (confidence, conflict, source_trust) triple to a
-        ``verification_status`` annotation per the project's standard.
+        """Auto-verify newly-saved entities and relationships.
 
-        Why only relationships: the cascading verifier was designed for
-        ``GraphRelationship`` objects (text-match looks for the SUBJ-VERB-OBJ
-        in the source chunk; LLM stage is given source/target names). Entities
-        stay ``unverified`` for human review — adding an entity verifier is a
-        separate task.
+        Two passes:
+          1. Entities — fast (text-match in source + cosine similarity to
+             existing graph), no LLM ever. Run first so the relationship
+             pass sees up-to-date entity statuses.
+          2. Relationships — cascading verifier (text-match → embedding →
+             LLM, with the LLM stage skipped in batch mode by default).
 
-        Why we *fetch* unverified rels rather than threading IDs through the
-        relationship stage: simpler, and it picks up any leftover unverified
-        rels from a previous crashed pipeline as a bonus.
+        For both, the (confidence, conflict, source_trust) triple maps to
+        a ``verification_status`` per the README standard. We fetch
+        targets (rather than threading IDs through earlier stages) so a
+        previous crashed pipeline's unverified leftovers also get picked
+        up.
+
+        Returns counts under both ``entity_*`` and ``rel_*`` prefixes for
+        ergonomics; the caller only consumes the relationship counts in
+        the legacy keys (verified/flagged/rejected/unreviewed) plus the
+        new entity_* counterparts.
         """
         from ...core.verification import (
             CascadingVerifier,
             CascadingVerifierConfig,
+            EntityVerifier,
         )
 
         cfg = self.config.verification
+
+        # ── Pass 1 — entities ─────────────────────────────────────────
+        ent_counts = await self._verify_entities_pass(
+            document, EntityVerifier(graph_repo=self.graph_repo), cfg, progress, cancel_check,
+        )
 
         # Pull all relationships for this document that are still flagged as
         # unverified (the default tag set in _stage_relationships).
@@ -916,7 +950,113 @@ class DocumentExtractionPipeline:
                     ))
 
         await _gather_with_cancel([_verify_one(r) for r in targets], cancel_check=cancel_check)
+        # Merge entity counts in under the entity_* prefix so the caller can
+        # populate PipelineResult fields independently of relationship counts.
+        return {
+            **counts,
+            "entity_verified":   ent_counts["verified"],
+            "entity_flagged":    ent_counts["flagged"],
+            "entity_rejected":   ent_counts["rejected"],
+            "entity_unreviewed": ent_counts["unreviewed"],
+        }
+
+    async def _verify_entities_pass(
+        self,
+        document: SourceDocument,
+        verifier: Any,
+        cfg: Any,
+        progress: ProgressCallback,
+        cancel_check: CancelCheck,
+    ) -> Dict[str, int]:
+        """First half of the verify stage: classify newly-saved entities.
+
+        Cheap by design — text-match against this run's chunk text +
+        embedding similarity to the existing graph. No LLM stage. Same
+        threshold mapping as relationships, using the entity-specific
+        ``entity_auto_approve`` / ``entity_flag_below`` knobs.
+        """
+        all_entities = await self.graph_repo.get_all_entities()
+        targets = []
+        for ent in all_entities.values():
+            if document.id not in (ent.source_document_ids or []):
+                continue
+            ann = getattr(getattr(ent, "metadata", None), "annotations", {}) or {}
+            if ann.get("verification_status") in ("unverified", None, ""):
+                targets.append(ent)
+        if not targets:
+            return {"verified": 0, "flagged": 0, "rejected": 0, "unreviewed": 0}
+
+        # Pull every chunk this document spawned in one round-trip — same set
+        # the relationship pass needs, so this is shared work.
+        wanted_chunk_ids: set[str] = set()
+        for ent in targets:
+            wanted_chunk_ids.update(ent.source_chunk_ids or [])
+        chunk_text_by_id: Dict[str, str] = {}
+        if wanted_chunk_ids and hasattr(self.document_repo, "get_chunks_by_ids"):
+            try:
+                chunks = await self.document_repo.get_chunks_by_ids(list(wanted_chunk_ids))
+                for c in chunks:
+                    chunk_text_by_id[c.id] = c.content
+            except Exception as exc:
+                logger.debug("Entity verify: chunk lookup failed (%s)", exc)
+
+        sem = asyncio.Semaphore(max(1, int(cfg.parallel_workers)))
+        counts = {"verified": 0, "flagged": 0, "rejected": 0, "unreviewed": 0}
+        completed = 0
+        lock = asyncio.Lock()
+
+        async def _verify_one(ent: Any) -> None:
+            nonlocal completed
+            self._raise_if_cancelled(cancel_check)
+            async with sem:
+                self._raise_if_cancelled(cancel_check)
+                chunk_texts = [chunk_text_by_id[cid] for cid in (ent.source_chunk_ids or []) if cid in chunk_text_by_id]
+                try:
+                    vr = await verifier.verify(ent, chunk_texts=chunk_texts)
+                except Exception as exc:
+                    logger.debug("Entity verifier failed for %s: %s", ent.id, exc)
+                    vr = None
+                status, notes = self._classify_entity(vr, ent, cfg)
+                ent.metadata.add_annotation("verification_status", status)
+                if notes:
+                    ent.metadata.add_annotation("verification_notes", notes)
+                if vr is not None:
+                    ent.metadata.add_annotation(
+                        "verification_confidence", round(float(vr.confidence or 0.0), 3),
+                    )
+                try:
+                    await self.graph_repo.save_entity(ent)
+                except Exception as exc:
+                    logger.warning("Could not persist entity verification for %s: %s", ent.id, exc)
+                async with lock:
+                    counts[status if status in counts else "unreviewed"] += 1
+                    completed += 1
+                    fraction = completed / len(targets) * 0.5  # entity pass owns first half of the bar
+                    await _maybe_await(progress(
+                        "verify",
+                        f"Verified {completed}/{len(targets)} entities "
+                        f"({counts['verified']} verified · {counts['flagged']} flagged)",
+                        fraction,
+                        {"phase": "entities", "completed": completed, "total": len(targets), **counts},
+                    ))
+
+        await _gather_with_cancel([_verify_one(e) for e in targets], cancel_check=cancel_check)
         return counts
+
+    @staticmethod
+    def _classify_entity(verification_result: Any, entity: Any, cfg: Any) -> tuple[str, Optional[str]]:
+        """Same shape as ``_classify`` but using the entity thresholds."""
+        source_trust = getattr(getattr(entity, "metadata", None), "source_trust", None)
+        if verification_result is None:
+            return "unverified", "Entity verifier did not run"
+        confidence = float(verification_result.confidence or 0.0)
+        if confidence >= cfg.entity_auto_approve:
+            return "verified", f"Auto-approved at {confidence:.2f} confidence"
+        if source_trust == "reviewed" and confidence >= cfg.trusted_auto_approve:
+            return "verified", f"Trusted source + {confidence:.2f} confidence"
+        if confidence < cfg.entity_flag_below:
+            return "flagged", f"Low confidence ({confidence:.2f}) — needs review"
+        return "unverified", f"Inconclusive ({confidence:.2f})"
 
     @staticmethod
     def _classify(

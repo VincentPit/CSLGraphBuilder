@@ -24,6 +24,7 @@ allowed_patterns=(
   '^frontend/'
   '^README\.md$'
   '^\.githooks/'
+  '^\.github/'      # CI workflows — project plumbing, not backend code
   '^\.gitignore$'
 )
 

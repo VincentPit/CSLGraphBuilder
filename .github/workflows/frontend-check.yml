@@ -1,0 +1,97 @@
+name: frontend-check
+
+# Runs on every push to frontend-only and on every PR targeting main from
+# any branch. The pipeline proves the frontend:
+#   1. compiles cleanly under strict TypeScript,
+#   2. builds for production without warnings that block the build,
+#   3. handles every documented mock backend response (success + edge
+#      cases + FastAPI 422 validation arrays) without throwing.
+#
+# If this fails on a PR into main, the merge is blocked (assuming the
+# branch protection rule "Require status checks to pass" is enabled in
+# the repo settings).
+
+on:
+  push:
+    branches:
+      - frontend-only
+  pull_request:
+    branches:
+      - main
+
+# Cancel any in-progress run for the same ref when a new commit lands —
+# saves CI minutes during fast iteration.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build + typecheck + contract
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript strict check
+        run: npm run typecheck
+
+      - name: Production build
+        run: npm run build
+
+      - name: Contract check (mock backend payloads)
+        # Runs scripts/contract-check.mjs which:
+        #   - feeds every error shape (null, FastAPI 422 array, plain
+        #     string, nested object, etc.) through formatApiError and
+        #     asserts a non-empty string out, no throws.
+        #   - verifies mock fixture shapes match the exported TS types.
+        # If new fragile spots appear, add assertions to the script.
+        run: npm run contract-check
+
+  scope-guard:
+    # Mirror the local pre-commit hook on the server so a contributor
+    # who skipped `git config --local core.hooksPath .githooks` (or
+    # used `--no-verify`) can't sneak a backend change in via a PR
+    # from the frontend-only branch.
+    name: Branch scope guard
+    if: github.head_ref == 'frontend-only' || github.ref == 'refs/heads/frontend-only'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject non-frontend changes
+        run: |
+          # Compare against the merge-base with main so we look at the
+          # full set of changes the branch carries, not just the last commit.
+          git fetch origin main --depth=50
+          base=$(git merge-base origin/main HEAD)
+          changed=$(git diff --name-only "$base"..HEAD)
+          echo "Files changed since branching from main:"
+          echo "$changed" | sed 's/^/  /'
+          echo
+          offenders=$(echo "$changed" | grep -Ev '^(frontend/|README\.md$|\.githooks/|\.github/|\.gitignore$)' || true)
+          if [[ -n "$offenders" ]]; then
+            echo "::error::frontend-only branch contains non-frontend changes:"
+            echo "$offenders" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "✓ All changes are within the allowed paths."

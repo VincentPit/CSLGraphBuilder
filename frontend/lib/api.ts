@@ -205,11 +205,27 @@ export interface CurationEvent {
 export interface CurationQueueItem {
   type: 'entity' | 'relationship';
   id: string;
+  // Common
+  description?: string | null;
+  verification_status: 'unverified' | 'flagged' | 'rejected' | string;
+  notes?: string | null;
+  source_chunk_count: number;
+  source_document_count: number;
+  source_trust?: string | null;
+  created_at?: string | null;
+  // Entity-only
   name?: string;
   entity_type?: string;
+  tags?: string[];
+  // Relationship-only
+  source_entity_id?: string;
+  source_entity_name?: string | null;
+  source_entity_type?: string | null;
+  target_entity_id?: string;
+  target_entity_name?: string | null;
+  target_entity_type?: string | null;
   relationship_type?: string;
-  verification_status: string;
-  notes?: string;
+  strength?: number | null;
 }
 
 export const getCurationQueue = (params?: { status?: string; limit?: number; offset?: number }) =>

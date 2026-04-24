@@ -200,6 +200,21 @@ export interface CurationEvent {
   action: 'approve' | 'reject' | 'flag' | 'correct';
   curator_id?: string;
   notes?: string;
+  /** Required for action=correct. For entity: name/description/properties.
+   *  For relationship: relationship_type/description/strength. */
+  corrections?: Record<string, unknown>;
+}
+
+export interface CurationAuditEntry {
+  ts: string;
+  action: string;
+  target_id: string | null;
+  curator: string;
+  reason?: string;
+  corrections?: Record<string, unknown>;
+  success: boolean;
+  message?: string;
+  error?: string;
 }
 
 export interface CurationQueueItem {
@@ -232,7 +247,45 @@ export const getCurationQueue = (params?: { status?: string; limit?: number; off
   apiClient.get<{ total: number; items: CurationQueueItem[] }>('/curation/queue', { params }).then((r) => r.data);
 
 export const submitCurationEvents = (events: CurationEvent[]) =>
-  apiClient.post('/curation/events', { events }).then((r) => r.data);
+  apiClient
+    .post<{ processed: number; failed: number; errors: string[] }>(
+      '/curation/events',
+      { events },
+    )
+    .then((r) => r.data);
+
+export const getCurationAudit = (limit = 100) =>
+  apiClient
+    .get<{ total: number; items: CurationAuditEntry[] }>('/curation/audit', {
+      params: { limit },
+    })
+    .then((r) => r.data);
+
+// ── Chunks (source text behind extractions) ──────────────────────────────
+
+export interface ChunkRecord {
+  id: string;
+  document_id: string;
+  chunk_index: number;
+  content: string;
+  character_count: number;
+  token_count?: number | null;
+}
+
+export const getChunks = (ids: string[]) =>
+  apiClient
+    .get<{ items: ChunkRecord[]; missing: string[] }>('/graph/chunks', {
+      params: { ids: ids.join(',') },
+    })
+    .then((r) => r.data);
+
+// ── Type catalogs (drives the Correct-form dropdowns) ────────────────────
+
+export const getEntityTypes = () =>
+  apiClient.get<{ items: string[] }>('/graph/types/entities').then((r) => r.data.items);
+
+export const getRelationshipTypes = () =>
+  apiClient.get<{ items: string[] }>('/graph/types/relationships').then((r) => r.data.items);
 
 // ── Verification ─────────────────────────────────────────────────────────
 

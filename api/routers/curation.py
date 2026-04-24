@@ -1,9 +1,15 @@
 """Curation router — event ingestion and queue management."""
 
+import json
+import logging
+import os
+import tempfile
+import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth import require_api_key
 from ..dependencies import get_app_config, get_graph_repo
@@ -12,60 +18,187 @@ from ..schemas.curation import (
     CurationResultResponse,
 )
 
+
+# ── Audit log ────────────────────────────────────────────────────────────
+# Every curation event is appended to logs/curation_audit.jsonl so the
+# decision history survives backend restarts and can be replayed/queried
+# later. JSONL (one record per line) means we can append cheaply and
+# load only the tail without parsing the whole file.
+
+_logger = logging.getLogger("graphbuilder.curation_audit")
+_AUDIT_PATH = Path(__file__).resolve().parent.parent.parent / "logs" / "curation_audit.jsonl"
+_AUDIT_LOCK = threading.Lock()
+_AUDIT_MAX_LINES = 5000
+
+
+def _audit_append(records: List[Dict[str, Any]]) -> None:
+    """Append a batch of audit records to the JSONL file."""
+    if not records:
+        return
+    try:
+        _AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _AUDIT_LOCK:
+            with open(_AUDIT_PATH, "a", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, default=str) + "\n")
+            _audit_truncate_if_needed()
+    except Exception as exc:  # pragma: no cover — disk hiccup
+        _logger.warning("Failed to append audit records: %s", exc)
+
+
+def _audit_truncate_if_needed() -> None:
+    """Cap the file at the most-recent ``_AUDIT_MAX_LINES`` lines."""
+    try:
+        with open(_AUDIT_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= _AUDIT_MAX_LINES:
+            return
+        tail = lines[-_AUDIT_MAX_LINES:]
+        # Atomic rewrite via temp + rename so we can't lose data on crash.
+        fd, tmp = tempfile.mkstemp(prefix=".audit.", suffix=".tmp", dir=str(_AUDIT_PATH.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(tail)
+        os.replace(tmp, _AUDIT_PATH)
+    except Exception as exc:  # pragma: no cover
+        _logger.warning("Audit truncation failed: %s", exc)
+
+
+def _audit_tail(limit: int) -> List[Dict[str, Any]]:
+    """Return the most-recent ``limit`` audit records, newest first."""
+    if not _AUDIT_PATH.exists():
+        return []
+    try:
+        with open(_AUDIT_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as exc:
+        _logger.warning("Could not read audit log: %s", exc)
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
 router = APIRouter(prefix="/curation", tags=["curation"])
 
 
+def _build_curation_request(event: Any) -> Any:
+    """Translate a transport-level CurationEvent into a domain CurationRequest.
+
+    Centralises the action → builder-method mapping so the route handler
+    stays small and readable, and so adding a new action only touches one
+    place. Raises ``ValueError`` for unknown actions.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from graphbuilder.application.use_cases.curation import CurationAction, CurationRequest
+
+    action = CurationAction(event.resolved_action)
+    curator = event.curator_id or "anonymous"
+    target = event.target_id
+    reason = event.notes or ""
+    corrections = event.corrections or {}
+    req = CurationRequest(curator=curator)
+
+    builders = {
+        CurationAction.APPROVE_ENTITY:        lambda: req.approve_entity(target, reason),
+        CurationAction.REJECT_ENTITY:         lambda: req.reject_entity(target, reason),
+        CurationAction.CORRECT_ENTITY:        lambda: req.correct_entity(target, corrections, reason),
+        CurationAction.APPROVE_RELATIONSHIP:  lambda: req.approve_relationship(target, reason),
+        CurationAction.REJECT_RELATIONSHIP:   lambda: req.reject_relationship(target, reason),
+        CurationAction.CORRECT_RELATIONSHIP:  lambda: req.correct_relationship(target, corrections, reason),
+    }
+    builder = builders.get(action)
+    if builder is None:
+        raise ValueError(f"Unknown action: {event.resolved_action}")
+    builder()
+    return req
+
+
+def _audit_record(event: Any, *, success: bool, message: Optional[str] = None, error: Optional[str] = None) -> Dict[str, Any]:
+    """Build a single audit-log entry for one event."""
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "action": getattr(event, "resolved_action", "unknown"),
+        "target_id": getattr(event, "target_id", None),
+        "curator": getattr(event, "curator_id", None) or "anonymous",
+        "reason": getattr(event, "notes", None) or "",
+        "corrections": getattr(event, "corrections", None) or {},
+        "success": success,
+    }
+    if message is not None:
+        rec["message"] = message
+    if error is not None:
+        rec["error"] = error
+    return rec
+
+
 @router.post("/events", response_model=CurationResultResponse)
-def submit_curation_events(
+async def submit_curation_events(
     request: CurationBatchRequest,
     config=Depends(get_app_config),
     graph_repo=Depends(get_graph_repo),
     _=Depends(require_api_key),
 ):
+    """Apply a batch of curation events.
+
+    The use case is async; this endpoint must be ``async def`` and
+    ``await`` it (was previously ``def`` + non-awaited call — a silent
+    bug that discarded every event). After applying, every event is
+    appended to the persistent audit log so decisions survive backend
+    restarts.
+    """
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-    from graphbuilder.application.use_cases.curation import CurationUseCase, CurationRequest, CurationAction
+    from graphbuilder.application.use_cases.curation import CurationUseCase
 
-    results = []
-    errors = []
+    use_case = CurationUseCase(config, graph_repo)
+    results: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    audit_records: List[Dict[str, Any]] = []
+
     for event in request.events:
         try:
-            action = CurationAction(event.resolved_action)
-            curator = event.curator_id or "anonymous"
-            curation_req = CurationRequest(curator=curator)
-            target = event.target_id
-            reason = event.notes or ""
-
-            if action == CurationAction.APPROVE_ENTITY:
-                curation_req.approve_entity(target, reason)
-            elif action == CurationAction.REJECT_ENTITY:
-                curation_req.reject_entity(target, reason)
-            elif action == CurationAction.CORRECT_ENTITY:
-                curation_req.correct_entity(target, event.corrections or {}, reason)
-            elif action == CurationAction.APPROVE_RELATIONSHIP:
-                curation_req.approve_relationship(target, reason)
-            elif action == CurationAction.REJECT_RELATIONSHIP:
-                curation_req.reject_relationship(target, reason)
-            elif action == CurationAction.CORRECT_RELATIONSHIP:
-                curation_req.correct_relationship(target, event.corrections or {}, reason)
-            else:
-                errors.append(f"Unknown action: {event.resolved_action}")
-                continue
-
-            use_case = CurationUseCase(graph_repo, config)
-            result = use_case.execute(curation_req)
+            req = _build_curation_request(event)
+            result = await use_case.execute(req)
+            audit_records.append(_audit_record(event, success=bool(result.success), message=result.message))
             if result.success:
-                results.append({"target_id": target, "status": "ok"})
+                results.append({"target_id": event.target_id, "status": "ok"})
             else:
                 errors.append(result.message)
         except Exception as exc:
             errors.append(str(exc))
+            audit_records.append(_audit_record(event, success=False, error=str(exc)))
+
+    _audit_append(audit_records)
 
     return CurationResultResponse(
         processed=len(results),
         failed=len(errors),
         errors=errors,
     )
+
+
+@router.get("/audit", summary="Recent curation events (newest first)")
+async def get_audit_log(
+    limit: int = Query(100, ge=1, le=1000),
+    _=Depends(require_api_key),
+):
+    """Return the tail of ``logs/curation_audit.jsonl``.
+
+    Useful for UIs that want to surface "recently approved/rejected"
+    activity, and for compliance — every action a curator took is here
+    with a timestamp and curator identifier.
+    """
+    items = _audit_tail(limit)
+    return {"total": len(items), "items": items}
 
 
 _REVIEWABLE_STATUSES = ("rejected", "flagged", "unverified")

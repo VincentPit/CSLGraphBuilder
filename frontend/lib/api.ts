@@ -206,23 +206,92 @@ export interface CurationEvent {
   action: 'approve' | 'reject' | 'flag' | 'correct';
   curator_id?: string;
   notes?: string;
+  /** Required for action=correct. For entity: name/description/properties.
+   *  For relationship: relationship_type/description/strength. */
+  corrections?: Record<string, unknown>;
+}
+
+export interface CurationAuditEntry {
+  ts: string;
+  action: string;
+  target_id: string | null;
+  curator: string;
+  reason?: string;
+  corrections?: Record<string, unknown>;
+  success: boolean;
+  message?: string;
+  error?: string;
 }
 
 export interface CurationQueueItem {
   type: 'entity' | 'relationship';
   id: string;
+  // Common
+  description?: string | null;
+  verification_status: 'unverified' | 'flagged' | 'rejected' | string;
+  notes?: string | null;
+  source_chunk_count: number;
+  source_document_count: number;
+  source_trust?: string | null;
+  created_at?: string | null;
+  // Entity-only
   name?: string;
   entity_type?: string;
+  tags?: string[];
+  // Relationship-only
+  source_entity_id?: string;
+  source_entity_name?: string | null;
+  source_entity_type?: string | null;
+  target_entity_id?: string;
+  target_entity_name?: string | null;
+  target_entity_type?: string | null;
   relationship_type?: string;
-  verification_status: string;
-  notes?: string;
+  strength?: number | null;
 }
 
 export const getCurationQueue = (params?: { status?: string; limit?: number; offset?: number }) =>
   apiClient.get<{ total: number; items: CurationQueueItem[] }>('/curation/queue', { params }).then((r) => r.data);
 
 export const submitCurationEvents = (events: CurationEvent[]) =>
-  apiClient.post('/curation/events', { events }).then((r) => r.data);
+  apiClient
+    .post<{ processed: number; failed: number; errors: string[] }>(
+      '/curation/events',
+      { events },
+    )
+    .then((r) => r.data);
+
+export const getCurationAudit = (limit = 100) =>
+  apiClient
+    .get<{ total: number; items: CurationAuditEntry[] }>('/curation/audit', {
+      params: { limit },
+    })
+    .then((r) => r.data);
+
+// ── Chunks (source text behind extractions) ──────────────────────────────
+
+export interface ChunkRecord {
+  id: string;
+  document_id: string;
+  chunk_index: number;
+  content: string;
+  character_count: number;
+  token_count?: number | null;
+}
+
+export const getChunks = (ids: string[]) =>
+  apiClient
+    .get<{ items: ChunkRecord[]; missing: string[] }>('/graph/chunks', {
+      params: { ids: ids.join(',') },
+    })
+    .then((r) => r.data);
+
+// ── Type catalogs (drives the Correct-form dropdowns) ────────────────────
+
+export const getEntityTypes = () =>
+  apiClient.get<{ items: string[] }>('/graph/types/entities').then((r) => r.data.items);
+
+export const getRelationshipTypes = () =>
+  apiClient.get<{ items: string[] }>('/graph/types/relationships').then((r) => r.data.items);
 
 // ── Verification ─────────────────────────────────────────────────────────
 

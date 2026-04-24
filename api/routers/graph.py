@@ -3,10 +3,10 @@
 from typing import Annotated, List, Optional
 from datetime import timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth import require_api_key
-from ..dependencies import get_app_config, get_graph_repo
+from ..dependencies import get_app_config, get_document_repo, get_graph_repo
 from ..schemas.graph import (
     EntityListResponse,
     EntityResponse,
@@ -148,3 +148,64 @@ async def list_relationships(
         limit=limit,
         offset=offset,
     )
+
+
+# ── Chunks ───────────────────────────────────────────────────────────────
+# Lookup endpoint used by the curation page to surface the actual text
+# behind a flagged extraction. Reviewers can read the source paragraph
+# instead of guessing why the LLM produced a given entity / relationship.
+
+@router.get("/chunks", summary="Lookup chunks by ID")
+async def get_chunks(
+    ids: str = Query(..., description="Comma-separated chunk IDs"),
+    limit: int = Query(20, ge=1, le=200),
+    doc_repo=Depends(get_document_repo),
+    _=Depends(require_api_key),
+):
+    id_list = [x.strip() for x in (ids or "").split(",") if x.strip()][:limit]
+    if not id_list:
+        raise HTTPException(status_code=400, detail="At least one chunk id is required")
+
+    try:
+        chunks = await doc_repo.get_chunks_by_ids(id_list)
+    except Exception as exc:
+        # Don't 500 — the curation page is just trying to enrich a card.
+        chunks = []
+        return {"items": [], "missing": id_list, "error": str(exc)}
+
+    found_ids = {c.id for c in chunks}
+    missing = [i for i in id_list if i not in found_ids]
+    return {
+        "items": [
+            {
+                "id": c.id,
+                "document_id": c.document_id,
+                "chunk_index": getattr(c, "chunk_index", 0),
+                "content": c.content,
+                "character_count": getattr(c, "character_count", len(c.content or "")),
+                "token_count": getattr(c, "token_count", None),
+            }
+            for c in chunks
+        ],
+        "missing": missing,
+    }
+
+
+# ── Type catalogs ────────────────────────────────────────────────────────
+# Drives the Correct-form dropdowns on the curation page so reviewers
+# can only pick valid enum values.
+
+@router.get("/types/entities", summary="List valid entity-type values")
+async def list_entity_types(_=Depends(require_api_key)):
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from graphbuilder.domain.models.graph_models import EntityType
+    return {"items": [e.value for e in EntityType]}
+
+
+@router.get("/types/relationships", summary="List valid relationship-type values")
+async def list_relationship_types(_=Depends(require_api_key)):
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+    from graphbuilder.domain.models.graph_models import RelationshipType
+    return {"items": [r.value for r in RelationshipType]}

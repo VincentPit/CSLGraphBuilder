@@ -99,6 +99,11 @@ class DocumentRepositoryInterface(ABC):
         """Save a batch of chunks and create NEXT_CHUNK linked-list edges between them."""
         pass
 
+    @abstractmethod
+    async def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[DocumentChunk]:
+        """Lookup multiple chunks by ID. Missing IDs are silently dropped."""
+        pass
+
 
 class Neo4jDocumentRepository(DocumentRepositoryInterface):
     """
@@ -325,24 +330,44 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
     
     async def get_chunks_by_document_id(self, document_id: str) -> List[DocumentChunk]:
         """Get all chunks for a document ordered by chunk index."""
-        
+
         async with self.driver.session() as session:
             query = """
             MATCH (d:Document {id: $document_id})-[:HAS_CHUNK]->(c:DocumentChunk)
             RETURN c
             ORDER BY c.chunk_index ASC
             """
-            
+
             result = await session.run(query, {'document_id': document_id})
             chunks = []
-            
+
             async for record in result:
                 chunk_data = dict(record['c'])
                 chunk = self._create_chunk_from_data(chunk_data)
                 chunks.append(chunk)
-            
+
             return chunks
-    
+
+    async def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[DocumentChunk]:
+        """Lookup chunks by ID — used by the curation page to surface
+        the actual text behind a flagged extraction. Missing IDs are
+        silently dropped (a stale id from a deleted document shouldn't
+        500 the request)."""
+        if not chunk_ids:
+            return []
+        async with self.driver.session() as session:
+            result = await session.run(
+                "MATCH (c:DocumentChunk) WHERE c.id IN $ids RETURN c",
+                {"ids": list(chunk_ids)},
+            )
+            chunks: List[DocumentChunk] = []
+            async for record in result:
+                try:
+                    chunks.append(self._create_chunk_from_data(dict(record["c"])))
+                except Exception as exc:
+                    self.logger.debug("Skipping malformed chunk: %s", exc)
+            return chunks
+
     async def find_documents_by_url_pattern(self, url_pattern: str) -> List[SourceDocument]:
         """Find documents matching URL pattern."""
         
@@ -565,6 +590,15 @@ class InMemoryDocumentRepository(DocumentRepositoryInterface):
         for chunk in sorted(chunks, key=lambda c: c.chunk_index):
             await self.save_chunk(chunk)
         return chunks
+
+    async def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[DocumentChunk]:
+        wanted = set(chunk_ids or [])
+        if not wanted:
+            return []
+        out: List[DocumentChunk] = []
+        for chunks in self.chunks.values():
+            out.extend(c for c in chunks if c.id in wanted)
+        return out
 
 
 # Factory function for creating appropriate repository

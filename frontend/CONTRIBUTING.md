@@ -268,25 +268,40 @@ const { data, isLoading, error } = useQuery({
 
 ## Testing your changes
 
-The full pipeline:
+### Two test scripts, two contexts
 
 ```bash
-npm test                  # typecheck + build + contract-check
+npm test          # typecheck + contract-check     (safe to run while `npm run dev` is up)
+npm run test:full # typecheck + build + contract-check  (matches CI, but clobbers .next)
+```
+
+**Why there are two:** `next build` writes production-mode chunks to
+`.next/`. If `next dev` is also running against that same directory,
+the dev server's HTML keeps referencing dev chunks that the build just
+overwrote, and you get `Cannot find module './682.js'` 500s. Use
+`npm test` while iterating; let CI run `test:full`.
+
+If you do clobber `.next/` by accident:
+
+```bash
+pkill -f next-server   # or close the dev terminal
+rm -rf .next
+npm run dev
 ```
 
 Or each piece separately:
 
 ```bash
 npm run typecheck         # tsc --noEmit, strict mode
-npm run build             # next build, production
+npm run build             # next build, production  ⚠ don't run while dev is up
 npm run contract-check    # < 2s — feeds mock payloads to api helpers
 npm run lint              # next lint
 npm run dev               # interactive dev server
 ```
 
-The same `npm test` runs in CI on every push to `frontend-only` and on
-every PR into `main`. Run it locally before you push and you'll never
-have to wait for a red CI to tell you something's broken.
+CI on every push to `frontend-only` and every PR into `main` runs the
+**full** chain (`typecheck`, `build`, `contract-check`) as separate
+GitHub Action steps — the runner has no dev server to clobber.
 
 ### Adding a new contract assertion
 
@@ -365,9 +380,10 @@ guard will still catch it on the PR, so this is rarely useful.
 | `npm run dev` | Dev server on `:3000` against `:8001` backend |
 | `npm run dev:3002` | Dev server on `:3002` (handy when `:3000` is taken) |
 | `npm run clean-dev` | `rm -rf .next` + dev on `:3002` (post-build recovery) |
-| `npm run build` | Production build |
+| `npm run build` | Production build — **don't run while `npm run dev` is up** |
 | `npm run start` | Serve the production build |
 | `npm run lint` | `next lint` |
 | `npm run typecheck` | `tsc --noEmit` strict |
 | `npm run contract-check` | < 2s smoke test against mock backend payloads |
-| `npm test` | Full pipeline: typecheck + build + contract-check |
+| `npm test` | Safe loop: typecheck + contract-check (no build) |
+| `npm run test:full` | What CI runs: typecheck + build + contract-check |

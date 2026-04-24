@@ -12,7 +12,8 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "contract-check": "node scripts/contract-check.mjs",
-    "test": "npm run typecheck && npm run build && npm run contract-check"
+    "test": "npm run typecheck && npm run contract-check",
+    "test:full": "npm run typecheck && npm run build && npm run contract-check"
   },
   "keywords": [],
   "author": "",

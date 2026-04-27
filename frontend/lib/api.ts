@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8001';
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? '';
 
 export const apiClient = axios.create({
@@ -189,7 +189,16 @@ export const getMetrics = () =>
 
 export interface IngestResponse { job_id: string; source: string; status: string; }
 
-export const ingestOpenTargets = (body: { disease_id: string; max_associations?: number; min_association_score?: number; tag?: string }) =>
+export type OpenTargetsKind = 'disease' | 'target' | 'drug' | 'variant' | 'study';
+
+export const ingestOpenTargets = (body: {
+  entity_id: string;
+  entity_type?: OpenTargetsKind;
+  max_associations?: number;
+  max_known_drugs?: number;
+  min_association_score?: number;
+  tag?: string;
+}) =>
   apiClient.post<IngestResponse>('/ingest/open-targets', body).then((r) => r.data);
 
 export const ingestPubMed = (body: { query: string; max_articles?: number; email?: string; tag?: string }) =>
@@ -249,8 +258,25 @@ export interface CurationQueueItem {
   strength?: number | null;
 }
 
-export const getCurationQueue = (params?: { status?: string; limit?: number; offset?: number }) =>
-  apiClient.get<{ total: number; items: CurationQueueItem[] }>('/curation/queue', { params }).then((r) => r.data);
+export const getCurationQueue = (params?: { status?: string; type?: string; limit?: number; offset?: number }) =>
+  apiClient
+    .get<{ total: number; items: CurationQueueItem[]; limit: number; offset: number }>(
+      '/curation/queue',
+      { params },
+    )
+    .then((r) => r.data);
+
+export interface CurationQueueCounts {
+  total: number;
+  rejected: number;
+  flagged: number;
+  unverified: number;
+}
+
+export const getCurationQueueCounts = (params?: { type?: string }) =>
+  apiClient
+    .get<CurationQueueCounts>('/curation/queue/counts', { params })
+    .then((r) => r.data);
 
 export const submitCurationEvents = (events: CurationEvent[]) =>
   apiClient

@@ -58,16 +58,23 @@ async def _run_open_targets(
         IngestionConfig,
         OpenTargetsIngestionUseCase,
     )
+    from graphbuilder.infrastructure.external.open_targets_client import EntityKind
 
     try:
         graph_repo = _ensure_graph_repo(graph_repo, config)
         update_job(job_id, status=JobStatus.RUNNING, progress=0.0)
-        begin_stage(job_id, "fetch", message="Fetching from Open Targets")
+        begin_stage(
+            job_id,
+            "fetch",
+            message=f"Fetching from Open Targets ({request.entity_type or 'auto'} {request.entity_id})",
+        )
         cfg = IngestionConfig(
-            disease_id=request.disease_id,
+            entity_id=request.entity_id,
+            entity_kind=EntityKind(request.entity_type) if request.entity_type else None,
             max_associations=request.max_associations,
+            max_known_drugs=request.max_known_drugs,
             min_association_score=request.min_association_score,
-            tag=request.tag,
+            tag=request.tag or "open-targets",
         )
         use_case = OpenTargetsIngestionUseCase(config, graph_repo)
         result = await use_case.execute(cfg)

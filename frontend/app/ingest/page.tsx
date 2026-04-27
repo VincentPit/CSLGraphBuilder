@@ -41,7 +41,8 @@ export default function IngestPage() {
   const job = useJobStream(jobId);
 
   // Form state
-  const [diseaseId, setDiseaseId] = useState('');
+  const [entityId, setEntityId] = useState('');
+  const [entityType, setEntityType] = useState<'auto' | 'disease' | 'target' | 'drug' | 'variant' | 'study'>('auto');
   const [maxAssoc, setMaxAssoc] = useState('500');
   const [minScore, setMinScore] = useState('0.0');
   const [otTag, setOtTag] = useState('');
@@ -77,7 +78,8 @@ export default function IngestPage() {
     e.preventDefault();
     return startJob(() =>
       ingestOpenTargets({
-        disease_id: diseaseId,
+        entity_id: entityId,
+        entity_type: entityType === 'auto' ? undefined : entityType,
         max_associations: Number(maxAssoc),
         min_association_score: Number(minScore),
         tag: otTag || undefined,
@@ -123,19 +125,12 @@ export default function IngestPage() {
 
   return (
     <div className="space-y-8 max-w-3xl">
-      <header className="space-y-2">
-        <span
-          className="badge badge-brand inline-flex"
-          style={{ background: 'var(--accent-soft)', border: '1px solid rgba(99,102,241,0.25)' }}
-        >
-          <Database size={10} className="opacity-70" />
-          3 sources · same timeline UI
-        </span>
-        <h1 className="page-title">Ingest Sources</h1>
+      <header className="space-y-3">
+        <h1 className="page-title">Ingest sources</h1>
         <p className="page-desc">
-          Pull from <span className="text-gradient font-semibold">Open Targets</span>,
-          {' '}<span className="text-gradient font-semibold">PubMed</span>, or
-          {' '}<span className="text-gradient font-semibold">crawl the web</span>.
+          Pull from <strong style={{ color: 'var(--text-primary)' }}>Open Targets</strong>,
+          {' '}<strong style={{ color: 'var(--text-primary)' }}>PubMed</strong>, or
+          {' '}<strong style={{ color: 'var(--text-primary)' }}>crawl the web</strong>.
           Crawls feed pages through the same extraction pipeline as the Process page.
         </p>
       </header>
@@ -217,18 +212,42 @@ export default function IngestPage() {
         </form>
       ) : tab === 'open-targets' ? (
         <form onSubmit={submitOT} className="card p-6 space-y-5">
-          <Field label="Disease ID" hint="Use EFO or MONDO IDs">
+          <Field
+            label="Open Targets ID"
+            hint="Disease (EFO_/MONDO_), target (ENSG…), drug (CHEMBL…), variant (rs…), or study (GCST…)"
+          >
             <input
               required
               className="input"
-              value={diseaseId}
-              onChange={(e) => setDiseaseId(e.target.value)}
-              placeholder="EFO_0000275"
+              value={entityId}
+              onChange={(e) => setEntityId(e.target.value)}
+              placeholder="EFO_0000275, ENSG00000048462, CHEMBL941, rs7412…"
               disabled={isRunning}
             />
           </Field>
+          <Field
+            label="Entity Type"
+            hint="Auto-detect uses the ID prefix. Override only if detection misfires."
+          >
+            <select
+              className="input"
+              value={entityType}
+              onChange={(e) => setEntityType(e.target.value as typeof entityType)}
+              disabled={isRunning}
+            >
+              <option value="auto">Auto-detect from ID</option>
+              <option value="disease">Disease</option>
+              <option value="target">Target (gene)</option>
+              <option value="drug">Drug</option>
+              <option value="variant">Variant</option>
+              <option value="study">Study</option>
+            </select>
+          </Field>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Field label="Max Associations">
+            <Field
+              label="Max Associations"
+              hint="Caps disease↔target / drug↔target neighbor edges per fetch (lower = faster)"
+            >
               <input
                 className="input"
                 type="number"
@@ -237,7 +256,10 @@ export default function IngestPage() {
                 disabled={isRunning}
               />
             </Field>
-            <Field label="Min Score (0-1)">
+            <Field
+              label="Min Score (0-1)"
+              hint="Open Targets association-score floor — only associations ≥ this value are ingested (disease/target only)"
+            >
               <input
                 className="input"
                 type="number"
@@ -306,7 +328,7 @@ export default function IngestPage() {
 
       {submitError && (
         <div
-          className="card p-4 text-sm flex items-center gap-2"
+          className="card p-5 text-sm flex items-center gap-2"
           style={{ color: 'var(--danger)' }}
         >
           <XCircle size={15} />

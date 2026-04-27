@@ -45,8 +45,8 @@ Neo4j Knowledge Graph
   Document → [:FIRST_CHUNK] → Chunk → [:NEXT_CHUNK] → Chunk
   Chunk    → [:HAS_ENTITY]  → Entity
   Entity   → [:REL_TYPE]    → Entity
-  Entity.name_embedding      ← 384-d float[] vector index (cosine)
-  Relationship.desc_embedding← 384-d float[] vector index (cosine)
+  Entity.name_embedding      ← 768-d float[] vector index (cosine, SapBERT default)
+  Relationship.desc_embedding← 768-d float[] vector index (cosine)
         │
         ▼
 Relationship Verification Pipeline (cascading with escalation bands)
@@ -86,7 +86,10 @@ REST API (FastAPI, SSE)  ←→  Next.js 14 Frontend (stage timeline, metrics wi
 - **Pipeline metrics endpoint** — `GET /health/metrics` exposes LLM call volume by type, prompt/completion tokens, average latency, cache hit rate, embedding hit rate, and graph throughput.
 - **Structured SSE event stream** — `GET /documents/jobs/{id}/stream` emits typed `progress` and `done` events containing the full job snapshot (status, current stage, per-stage status map, recent event log).
 - **Unified job model** — Documents, web crawls, PubMed, and Open Targets all share one `Job` shape; the same UI timeline renders for any kind.
-- **Multi-source ingestion** — URLs, files, raw text, Open Targets API, PubMed, and web crawling with configurable depth and domain restrictions.
+- **Multi-source ingestion** — URLs, files, raw text, **Open Targets API (any entity kind: disease/target/drug/variant/study)**, PubMed, and web crawling with configurable depth and domain restrictions.
+- **Batched embeddings + cascading ingest dedup** — `save_entities_batch` encodes all entity-name embeddings in one `model.encode` call (10–50× faster than per-entity), and runs each new entity through a 3-tier dedup cascade against the existing graph (external-ID → case-insensitive name/alias → SapBERT vector ≥ 0.92), with an external-ID-contradiction gate that prevents merging entities with conflicting IDs. Re-ingesting the same source becomes a no-op.
+- **Async, non-blocking embedding** — `embed_async` / `embed_batch_async` run on a background thread executor under an `asyncio.Lock`, so a long encode no longer freezes `/health`, frontend polling, or other in-flight ingest jobs.
+- **GPU embedding pool** — When `torch.cuda.is_available()`, a `GPUEmbeddingPool` activates automatically: N model copies, each on its own dedicated `torch.cuda.Stream`, sized from free GPU memory. CPU stays single-worker (per-architecture decision: multi-worker on CPU is no-throughput-gain because torch's MKL already saturates cores).
 - **LLM entity & relationship extraction** — GPT-4 powered extraction with configurable schema constraints (`allowed_nodes`, `allowed_relationships`, `strict_mode`).
 - **Two-stage LLM deduplication** — Vector pre-filter (low threshold, cheap) followed by LLM confirmation for domain-aware synonym resolution across abbreviations, alternate names, and scientific notation.
 - **Neo4j vector search** — Native vector indexes on entity names and relationship descriptions for fast approximate nearest-neighbour queries.
@@ -206,9 +209,27 @@ All settings are read from environment variables (loaded from `.env` via `python
 | Variable | Default | Description |
 |---|---|---|
 | `IS_EMBEDDING` | `false` | Enable chunk embedding persistence |
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name, or `openai` / `vertexai` |
+| `EMBEDDING_MODEL` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | Model name; falls back to `all-MiniLM-L6-v2` if SapBERT can't load |
 
 When `IS_EMBEDDING=true`, each `Chunk` node gets an `embedding` float-array property and Neo4j creates a native `VECTOR INDEX` (cosine similarity) over it.
+
+**GPU embedding pool** (auto-activated when CUDA-enabled torch is installed):
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMBEDDING_GPU_WORKERS` | *(auto from free GPU mem)* | Exact worker count; bypasses sizing math |
+| `EMBEDDING_GPU_MIN_WORKERS` | `1` | Floor on worker count |
+| `EMBEDDING_GPU_MAX_WORKERS` | `8` | Hard ceiling for safety |
+| `EMBEDDING_GPU_MEMORY_FRACTION` | `0.7` | Usable share of free GPU memory |
+| `EMBEDDING_GPU_DEVICE` | `cuda:0` | Target CUDA device |
+
+The pool sizes itself by loading + warming up one model, measuring its
+GPU footprint, and dividing the available memory budget. Each worker
+holds its own model copy + dedicated `torch.cuda.Stream`, so encodes
+genuinely run in parallel on the GPU's SMs (sub-linear scaling — N=4
+≈ 2.5×, N=8 ≈ 3×; bottleneck is shared SMs and memory bandwidth, not
+queue depth). On CPU the pool stays disabled and the existing
+single-worker `asyncio.Lock` + executor path handles requests.
 
 ### Processing
 
@@ -298,12 +319,14 @@ embeddings in Neo4j are stored at the old dim and won't compare
 against new ones. One call recreates everything:
 
 ```bash
-curl -X POST http://localhost:8001/dev/reembed
+curl -X POST http://localhost:8000/dev/reembed
 ```
 
-Drops `entity_name_vector` + `rel_desc_vector` indexes, re-embeds
-every entity + relationship with the current model, recreates the
-indexes with the right dim. Idempotent; safe to re-run.
+Drops `entity_name_vector` + `rel_desc_vector` indexes, re-creates them
+at the new dimension via `_initialize_schema`, then re-embeds every
+entity + relationship with the current model **through the batched
+path** (one `model.encode` call per chunk of texts, not one per item —
+4-5k entities reembed in ~60 s on CPU). Idempotent; safe to re-run.
 
 ### Startup warm-up
 
@@ -350,8 +373,14 @@ graphbuilder process --text "raw text content" --title <title>
 ### `ingest`
 
 ```bash
-# Open Targets
-graphbuilder ingest --source open-targets --disease-id EFO_0000400
+# Open Targets — accepts any entity kind. Kind is auto-detected from the
+# ID prefix (EFO_/MONDO_/Orphanet_ → disease, ENSG → target, CHEMBL →
+# drug, rs… → variant, GCST → study). Pass --entity-type to override.
+graphbuilder ingest --source open-targets --entity-id EFO_0000400      # disease
+graphbuilder ingest --source open-targets --entity-id ENSG00000048462  # target / gene
+graphbuilder ingest --source open-targets --entity-id CHEMBL941        # drug
+
+# Legacy --disease-id is still accepted (assumes --entity-type=disease).
 
 # PubMed
 graphbuilder ingest --source pubmed --query "FVIII hemophilia" --max-results 50
@@ -450,9 +479,26 @@ The job envelope:
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/ingest/open-targets` | Open Targets disease/gene enrichment |
+| POST | `/ingest/open-targets` | Open Targets ingestion — any entity kind (disease/target/drug/variant/study), neighbors materialized as separate entities/relationships |
 | POST | `/ingest/pubmed` | PubMed article ingestion |
 | POST | `/ingest/crawl` | Web crawl — seed URLs with depth/domain control |
+
+**`POST /ingest/open-targets` body:**
+```json
+{
+  "entity_id": "ENSG00000048462",          // any OT ID — disease/target/drug/variant/study
+  "entity_type": "target",                  // optional; auto-detected from prefix when omitted
+  "max_associations": 100,                  // caps disease↔target / drug↔target neighbor edges
+  "min_association_score": 0.0,             // OT score floor (disease/target only)
+  "tag": "cancer-2026"
+}
+```
+Legacy `disease_id` field is still accepted as an alias for `entity_id`
+(implies `entity_type="disease"`). Materialized edges per root kind:
+disease→targets + known drugs; target→diseases + pathways + known drugs;
+drug→mechanisms-of-action + indications; variant→transcript consequences;
+study→trait diseases. Re-ingesting the same root is a no-op thanks to
+the cascading dedup in `save_entities_batch`.
 
 ### Curation
 
@@ -531,8 +577,10 @@ CSLGraphBuilder/
 │       └── services/
 │           ├── llm_service.py          # LLM extraction + dedup; records to PipelineMetrics
 │           ├── content_extractor.py
-│           ├── metrics.py              # NEW: process-wide PipelineMetrics singleton
-│           └── cache.py                # NEW: LLMDedupCache + EmbeddingCache (async LRU)
+│           ├── metrics.py              # process-wide PipelineMetrics singleton
+│           ├── cache.py                # LLMDedupCache + EmbeddingCache (async LRU)
+│           ├── embedding_factory.py    # Single source of truth for the embedder; sync + async + batched APIs
+│           └── gpu_embedding_pool.py   # NEW: multi-worker GPU pool (per-worker model + CUDA stream)
 ├── tests/
 │   ├── unit/                           # Unit tests
 │   ├── integration/                    # Includes test_document_pipeline.py covering the new orchestrator

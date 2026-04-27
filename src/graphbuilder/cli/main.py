@@ -693,8 +693,14 @@ def version(ctx):
 @click.option('--source', required=True,
               type=click.Choice(['open-targets', 'pubmed'], case_sensitive=False),
               help='External data source to ingest from.')
+@click.option('--entity-id', default=None,
+              help='Open Targets entity ID — disease (EFO_/MONDO_), target (ENSG…), '
+                   'drug (CHEMBL…), variant (rs…), or study (GCST…).')
+@click.option('--entity-type', default=None,
+              type=click.Choice(['disease', 'target', 'drug', 'variant', 'study']),
+              help='Open Targets entity kind. Auto-detected from prefix when omitted.')
 @click.option('--disease-id', default=None,
-              help='EFO disease identifier for Open Targets, e.g. EFO_0000275.')
+              help='Deprecated alias for --entity-id (assumes --entity-type=disease).')
 @click.option('--query', default=None,
               help='Search query for PubMed, e.g. "BRCA1 breast cancer".')
 @click.option('--max-results', default=500, show_default=True,
@@ -708,6 +714,8 @@ def version(ctx):
 def ingest(
     ctx,
     source: str,
+    entity_id: Optional[str],
+    entity_type: Optional[str],
     disease_id: Optional[str],
     query: Optional[str],
     max_results: int,
@@ -721,13 +729,15 @@ def ingest(
     Supported sources:
 
     \b
-      open-targets   Open Targets Platform (disease–target associations)
+      open-targets   Open Targets Platform (any entity: disease/target/drug/variant/study)
       pubmed         NCBI PubMed (article metadata + MeSH concepts)
 
     Examples:
 
     \b
-      graphbuilder ingest --source open-targets --disease-id EFO_0000275
+      graphbuilder ingest --source open-targets --entity-id EFO_0000275
+      graphbuilder ingest --source open-targets --entity-id ENSG00000048462
+      graphbuilder ingest --source open-targets --entity-id CHEMBL941
       graphbuilder ingest --source pubmed --query "BRCA1 breast cancer" \\
           --max-results 200 --email you@example.com --output results.json
     """
@@ -736,9 +746,18 @@ def ingest(
     app = ctx.obj['app']
     config = ctx.obj['config']
 
+    # Back-compat: old --disease-id flag implies disease kind.
+    if not entity_id and disease_id:
+        entity_id = disease_id
+        if not entity_type:
+            entity_type = 'disease'
+
     # Validate source-specific required options
-    if source == 'open-targets' and not disease_id:
-        raise click.UsageError("--disease-id is required for --source open-targets")
+    if source == 'open-targets' and not entity_id:
+        raise click.UsageError(
+            "--entity-id is required for --source open-targets "
+            "(legacy --disease-id is also accepted)"
+        )
     if source == 'pubmed' and not query:
         raise click.UsageError("--query is required for --source pubmed")
 
@@ -747,15 +766,17 @@ def ingest(
             graph_repo = create_graph_repository(config)
 
             if source == 'open-targets':
+                from ..infrastructure.external.open_targets_client import EntityKind
                 use_case = OpenTargetsIngestionUseCase(config, graph_repo)
                 ingestion_cfg = IngestionConfig(
-                    disease_id=disease_id,
+                    entity_id=entity_id,
+                    entity_kind=EntityKind(entity_type) if entity_type else None,
                     max_associations=max_results,
                     min_association_score=min_score,
                 )
                 app.print_status(
-                    f"Ingesting '{disease_id}' from Open Targets "
-                    f"(max {max_results} associations, min score {min_score})…"
+                    f"Ingesting '{entity_id}' ({entity_type or 'auto-detect'}) "
+                    f"from Open Targets (max {max_results} neighbors, min score {min_score})…"
                 )
             else:  # pubmed
                 use_case = PubMedIngestionUseCase(config, graph_repo)
@@ -787,7 +808,8 @@ def ingest(
                 if result.data:
                     if source == 'open-targets':
                         metrics = [
-                            {"Metric": "Disease", "Value": result.data.get("disease_name", disease_id)},
+                            {"Metric": "Entity Kind", "Value": result.data.get("entity_kind", entity_type or "?")},
+                            {"Metric": "Entity", "Value": result.data.get("entity_name", entity_id)},
                             {"Metric": "Entities Created", "Value": result.data.get("entities_created", 0)},
                             {"Metric": "Relationships Created", "Value": result.data.get("relationships_created", 0)},
                             {"Metric": "Associations Fetched", "Value": result.data.get("associations_fetched", 0)},

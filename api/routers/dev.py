@@ -317,35 +317,51 @@ async def reembed_graph(graph_repo=Depends(get_graph_repo)):
             detail="Embedding model not loaded yet — try again in a few seconds.",
         )
 
-    # Drop old vector indexes so they get recreated with the right dim
-    # on the first save below. Best-effort; a missing index is fine.
+    # Drop old vector indexes so they get recreated with the right dim.
+    # Best-effort; a missing index is fine.
     if isinstance(graph_repo, Neo4jGraphRepository):
         for idx in ("entity_name_vector", "rel_desc_vector"):
             try:
                 await graph_repo.execute_cypher_query(f"DROP INDEX `{idx}` IF EXISTS", {})
             except Exception:
                 pass
-        # Reset the in-memory dim cache so the next save reads the new dim.
+        # Reset the in-memory dim cache and re-run schema init so the new
+        # vector indexes are created with the correct dim. ``save_entity``
+        # does NOT recreate them on its own — only ``_initialize_schema`` does.
         try:
             graph_repo._embedding_dim = new_dim   # type: ignore[attr-defined]
-        except Exception:
-            pass
+            await graph_repo._initialize_schema()  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to recreate vector indexes at dim {new_dim}: {exc}",
+            )
 
-    # Re-embed and save every entity + relationship.
+    # Re-embed and save every entity + relationship. Use the batched path
+    # so the model encode is amortised across all rows in one forward pass
+    # — for 4-5k entities this is the difference between minutes and seconds.
     all_entities = await graph_repo.get_all_entities()
     all_rels = await graph_repo.get_all_relationships()
 
+    entity_list = list(all_entities.values())
+    rel_list = list(all_rels.values())
+
     re_e, re_r, errors = 0, 0, 0
-    for ent in list(all_entities.values()):
+    try:
+        saved = await graph_repo.save_entities_batch(entity_list)
+        re_e = len(saved)
+    except Exception:
+        errors += 1
+
+    if rel_list:
+        # Hand the rel batch a {id → name} map so it skips the per-rel
+        # endpoint MATCH. Use the post-save IDs in case dedup rewrote any.
+        id_to_name = {e.id: e.name for e in entity_list}
         try:
-            await graph_repo.save_entity(ent)   # save_entity recomputes the embedding
-            re_e += 1
-        except Exception:
-            errors += 1
-    for rel in list(all_rels.values()):
-        try:
-            await graph_repo.save_relationship(rel)
-            re_r += 1
+            saved_r = await graph_repo.save_relationships_batch(
+                rel_list, entity_names=id_to_name
+            )
+            re_r = len(saved_r)
         except Exception:
             errors += 1
 

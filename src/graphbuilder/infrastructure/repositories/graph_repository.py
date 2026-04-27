@@ -42,13 +42,47 @@ def _decode_props(value: Any) -> Dict[str, Any]:
     return {}
 
 
+_UNSET: Any = object()  # sentinel: distinguishes "use precomputed" from "compute fresh"
+
+
 class GraphRepositoryInterface(ABC):
     """Abstract interface for graph repository operations."""
-    
+
     @abstractmethod
     async def save_entity(self, entity: GraphEntity) -> GraphEntity:
         """Save an entity to the graph."""
         pass
+
+    async def save_entities_batch(
+        self, entities: List[GraphEntity]
+    ) -> List[GraphEntity]:
+        """Save a list of entities, batching expensive work where possible.
+
+        Default implementation falls back to per-entity ``save_entity`` calls;
+        the Neo4j implementation overrides this to encode all embeddings in
+        a single ``model.encode`` call before persisting.
+        """
+        out: List[GraphEntity] = []
+        for e in entities:
+            out.append(await self.save_entity(e))
+        return out
+
+    async def save_relationships_batch(
+        self,
+        relationships: List[GraphRelationship],
+        entity_names: Optional[Dict[str, str]] = None,
+    ) -> List[GraphRelationship]:
+        """Save a list of relationships, batching embedding work where possible.
+
+        ``entity_names`` is an optional ``{entity_id: name}`` map the caller
+        can supply to avoid a Neo4j round-trip per relationship — the
+        Neo4j implementation uses it to skip the source/target name lookup.
+        """
+        del entity_names  # unused in fallback
+        out: List[GraphRelationship] = []
+        for r in relationships:
+            out.append(await self.save_relationship(r))
+        return out
     
     @abstractmethod
     async def get_entity_by_id(self, entity_id: str) -> Optional[GraphEntity]:
@@ -195,13 +229,18 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 self._embedding_dim = get_embedding_dim() or self._embedding_dim
         return self._embedding_model
 
-    def _embed_text(self, text: str) -> Optional[List[float]]:
-        """Produce an embedding vector for *text*, or None if unavailable."""
+    async def _embed_text_async(self, text: str) -> Optional[List[float]]:
+        """Produce an embedding vector for *text*, or None if unavailable.
+
+        Async wrapper around the model's ``encode`` — runs in the default
+        thread executor under a module-level lock so callers don't freeze
+        the event loop and concurrent calls don't step on the model.
+        """
         model = self._get_embedding_model()
         if model is None or not text:
             return None
-        vec = model.encode(text, convert_to_numpy=True)
-        return vec.tolist()
+        from ..services.embedding_factory import embed_async
+        return await embed_async(text)
 
     def _entity_embedding_text(self, entity: GraphEntity) -> str:
         """Build the string to embed for an entity (name + description)."""
@@ -222,9 +261,20 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             parts.append(rel.description)
         return " ".join(parts)
     
-    async def save_entity(self, entity: GraphEntity) -> GraphEntity:
-        """Save entity to Neo4j graph database with provenance tracking."""
-        
+    async def save_entity(
+        self,
+        entity: GraphEntity,
+        *,
+        precomputed_embedding: Any = _UNSET,
+    ) -> GraphEntity:
+        """Save entity to Neo4j graph database with provenance tracking.
+
+        ``precomputed_embedding`` lets ``save_entities_batch`` skip the
+        per-entity ``model.encode`` call by passing in a vector that was
+        already computed as part of a batch. Pass ``None`` to explicitly
+        skip embedding without recomputation, or omit to compute fresh.
+        """
+
         async with self.driver.session() as session:
             # Check for existing entity with same name and type
             existing_query = """
@@ -268,7 +318,10 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
 
                 # Compute embedding for vector index (added after flattening
                 # because the embedding is already a list of primitives).
-                emb = self._embed_text(self._entity_embedding_text(entity))
+                if precomputed_embedding is _UNSET:
+                    emb = await self._embed_text_async(self._entity_embedding_text(entity))
+                else:
+                    emb = precomputed_embedding
                 if emb is not None:
                     properties['name_embedding'] = emb
 
@@ -314,7 +367,10 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties['content_hash'] = entity.get_hash()
 
                 # Compute embedding for vector index
-                emb = self._embed_text(self._entity_embedding_text(entity))
+                if precomputed_embedding is _UNSET:
+                    emb = await self._embed_text_async(self._entity_embedding_text(entity))
+                else:
+                    emb = precomputed_embedding
                 if emb is not None:
                     properties['name_embedding'] = emb
                 
@@ -355,33 +411,48 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             
             return None
     
-    async def save_relationship(self, relationship: GraphRelationship) -> GraphRelationship:
+    async def save_relationship(
+        self,
+        relationship: GraphRelationship,
+        *,
+        precomputed_embedding: Any = _UNSET,
+        precomputed_endpoint_names: Optional[Tuple[str, str]] = None,
+    ) -> GraphRelationship:
         """Save relationship to Neo4j graph database with provenance tracking.
-        
+
         If a relationship between the same source/target with the same type
         already exists, merges provenance (source chunks) instead of creating
         a duplicate.
-        """
-        
-        async with self.driver.session() as session:
-            # Check if entities exist
-            entities_query = """
-            MATCH (source:Entity {id: $source_id}), (target:Entity {id: $target_id})
-            RETURN source, target
-            """
-            
-            result = await session.run(entities_query, {
-                'source_id': relationship.source_entity_id,
-                'target_id': relationship.target_entity_id
-            })
-            
-            entities_record = await result.single()
-            if not entities_record:
-                raise ValueError(f"Source or target entity not found for relationship {relationship.id}")
 
-            # Extract entity names for embedding text
-            source_name = dict(entities_record['source']).get('name', '')
-            target_name = dict(entities_record['target']).get('name', '')
+        ``precomputed_embedding`` lets ``save_relationships_batch`` skip the
+        per-relationship embedding round-trip; ``precomputed_endpoint_names``
+        skips the source/target-name MATCH lookup when the caller already
+        knows them.
+        """
+
+        async with self.driver.session() as session:
+            # Resolve source/target names — needed both to validate the
+            # endpoints exist and to build the relationship's embedding text.
+            # The batch path passes them in to skip this round-trip.
+            if precomputed_endpoint_names is not None:
+                source_name, target_name = precomputed_endpoint_names
+            else:
+                entities_query = """
+                MATCH (source:Entity {id: $source_id}), (target:Entity {id: $target_id})
+                RETURN source, target
+                """
+
+                result = await session.run(entities_query, {
+                    'source_id': relationship.source_entity_id,
+                    'target_id': relationship.target_entity_id
+                })
+
+                entities_record = await result.single()
+                if not entities_record:
+                    raise ValueError(f"Source or target entity not found for relationship {relationship.id}")
+
+                source_name = dict(entities_record['source']).get('name', '')
+                target_name = dict(entities_record['target']).get('name', '')
 
             # Check for existing relationship between same entities with same type
             existing_query = """
@@ -406,9 +477,12 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 merged_docs = list(dict.fromkeys(existing_docs + relationship.source_document_ids))
 
                 # Compute embedding for vector index
-                emb = self._embed_text(self._relationship_embedding_text(
-                    relationship, source_name, target_name
-                ))
+                if precomputed_embedding is _UNSET:
+                    emb = await self._embed_text_async(self._relationship_embedding_text(
+                        relationship, source_name, target_name
+                    ))
+                else:
+                    emb = precomputed_embedding
 
                 # Carry forward any property/metadata updates the caller made
                 # (e.g. setting verification_status on an existing rel for the
@@ -473,12 +547,15 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 properties = _to_neo4j_props(properties)
 
                 # Compute embedding for vector index
-                emb = self._embed_text(self._relationship_embedding_text(
-                    relationship, source_name, target_name
-                ))
+                if precomputed_embedding is _UNSET:
+                    emb = await self._embed_text_async(self._relationship_embedding_text(
+                        relationship, source_name, target_name
+                    ))
+                else:
+                    emb = precomputed_embedding
                 if emb is not None:
                     properties['desc_embedding'] = emb
-                
+
                 await session.run(create_query, {
                     'source_id': relationship.source_entity_id,
                     'target_id': relationship.target_entity_id,
@@ -498,7 +575,375 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                 
                 self.logger.debug(f"Created relationship: {relationship.id}")
             return relationship
-    
+
+    # ------------------------------------------------------------------
+    # Batched persistence + cascading dedup
+    # ------------------------------------------------------------------
+
+    # Cosine threshold for tier-3 (vector) merges. 0.92 is conservative —
+    # enough to catch "TNFα" / "Tumor Necrosis Factor Alpha"-style variants
+    # but tight enough to avoid merging genuinely distinct concepts whose
+    # SapBERT embeddings happen to be neighbors.
+    _DEDUP_VECTOR_THRESHOLD: float = 0.92
+
+    async def save_entities_batch(
+        self, entities: List[GraphEntity]
+    ) -> List[GraphEntity]:
+        """Persist a batch with cascading dedup against the existing graph.
+
+        Cascade (cheapest → most expensive, short-circuit on first hit):
+          1. **External-ID match** — single Cypher lookup for all new
+             entities' external IDs at once. Strongest signal; most OT
+             ingests resolve here.
+          2. **Name / alias match (case-insensitive)** — single Cypher
+             lookup that scans for existing entities whose name or aliases
+             match any new entity's name/aliases (same entity_type only).
+          3. **SapBERT vector search** — only for the entities still
+             unmatched. Embeddings are computed in one batch ``encode``
+             call here (deferred from the start of the method so we don't
+             encode entities that tiers 1-2 already merged away).
+
+        Each tier applies an external-ID-contradiction gate before
+        accepting a match — two entities that share a name but have
+        conflicting Ensembl/ChEMBL IDs are *not* the same record.
+        """
+        if not entities:
+            return []
+
+        from ..services.embedding_factory import embed_batch_async
+
+        # ── Tiers 1 + 2: deterministic dedup, no embeddings needed ─────
+        matches: Dict[int, Tuple[str, str]] = {}  # idx → (existing_id, tier)
+        await self._dedup_tier_external_id(entities, matches)
+        await self._dedup_tier_name_alias(entities, matches)
+
+        # ── Tier 3: encode survivors, then per-survivor vector search ──
+        survivor_idxs = [i for i in range(len(entities)) if i not in matches]
+        survivor_entities = [entities[i] for i in survivor_idxs]
+
+        embeddings: List[Optional[List[float]]] = []
+        if survivor_entities:
+            texts = [self._entity_embedding_text(e) for e in survivor_entities]
+            if self._get_embedding_model() is not None:
+                embeddings = await embed_batch_async(texts)
+            else:
+                embeddings = [None] * len(survivor_entities)
+
+            for idx, entity, emb in zip(survivor_idxs, survivor_entities, embeddings):
+                if emb is None:
+                    continue
+                existing_id = await self._dedup_tier_vector(entity, emb)
+                if existing_id is not None:
+                    matches[idx] = (existing_id, "vector")
+
+        # ── Persist ─────────────────────────────────────────────────────
+        emb_by_idx = dict(zip(survivor_idxs, embeddings))
+        out: List[GraphEntity] = []
+        for i, entity in enumerate(entities):
+            if i in matches:
+                existing_id, tier = matches[i]
+                await self._merge_into_existing(entity, existing_id, tier)
+                out.append(entity)
+            else:
+                # Unmatched — has a precomputed embedding (or None if no model)
+                await self.save_entity(entity, precomputed_embedding=emb_by_idx.get(i))
+                out.append(entity)
+        return out
+
+    # ── Dedup: tier 1 — external-ID match ─────────────────────────────
+
+    async def _dedup_tier_external_id(
+        self,
+        entities: List[GraphEntity],
+        matches: Dict[int, Tuple[str, str]],
+    ) -> None:
+        """Look up every new entity's external IDs in one Cypher query.
+
+        ``external_ids`` is JSON-stringified at write time (see
+        ``_to_neo4j_props``), so we search via ``CONTAINS '"sys":"id"'``.
+        The entity_type filter narrows the scan considerably.
+        """
+        # Build needles: one per (system, id, type) tuple. Track which new
+        # entity each needle came from so we can record the match.
+        needles: List[Dict[str, Any]] = []
+        for idx, entity in enumerate(entities):
+            if idx in matches:
+                continue
+            for system, ext_id in (entity.external_ids or {}).items():
+                if not system or not ext_id:
+                    continue
+                # Mirror json.dumps' format exactly: "sys": "id" with a
+                # space after the colon (json.dumps default separator).
+                fragment = f'"{system}": "{ext_id}"'
+                needles.append({
+                    "idx": idx,
+                    "fragment": fragment,
+                    "type": entity.entity_type.value,
+                    "system": system,
+                    "ext_id": ext_id,
+                })
+
+        if not needles:
+            return
+
+        query = (
+            "UNWIND $needles AS n "
+            "MATCH (e:Entity) "
+            "WHERE e.entity_type = n.type "
+            "  AND e.external_ids CONTAINS n.fragment "
+            "RETURN n.idx AS idx, e.id AS entity_id "
+            "LIMIT 5000"
+        )
+        async with self.driver.session() as session:
+            result = await session.run(query, {"needles": needles})
+            async for record in result:
+                idx = record["idx"]
+                if idx in matches:
+                    continue  # First hit wins
+                matches[idx] = (record["entity_id"], "external_id")
+
+    # ── Dedup: tier 2 — name + alias match (case-insensitive) ─────────
+
+    async def _dedup_tier_name_alias(
+        self,
+        entities: List[GraphEntity],
+        matches: Dict[int, Tuple[str, str]],
+    ) -> None:
+        """Look up every new entity's name + aliases against existing names + aliases."""
+        # Collect (idx, type, lowercase name/alias) tuples for unmatched entities
+        needles: List[Dict[str, Any]] = []
+        for idx, entity in enumerate(entities):
+            if idx in matches:
+                continue
+            tokens: Set[str] = set()
+            if entity.name:
+                tokens.add(entity.name.strip().lower())
+            for alias in entity.aliases or []:
+                if alias:
+                    tokens.add(alias.strip().lower())
+            for tok in tokens:
+                needles.append({
+                    "idx": idx,
+                    "token": tok,
+                    "type": entity.entity_type.value,
+                })
+
+        if not needles:
+            return
+
+        query = (
+            "UNWIND $needles AS n "
+            "MATCH (e:Entity) "
+            "WHERE e.entity_type = n.type "
+            "  AND (toLower(e.name) = n.token "
+            "       OR ANY(a IN coalesce(e.aliases, []) WHERE toLower(a) = n.token)) "
+            "RETURN n.idx AS idx, e.id AS entity_id, e.external_ids AS existing_ext "
+            "LIMIT 5000"
+        )
+        async with self.driver.session() as session:
+            result = await session.run(query, {"needles": needles})
+            async for record in result:
+                idx = record["idx"]
+                if idx in matches:
+                    continue
+                # Apply the external-ID-contradiction gate before accepting.
+                if self._external_ids_contradict(
+                    entities[idx].external_ids, _decode_props(record["existing_ext"])
+                ):
+                    continue
+                matches[idx] = (record["entity_id"], "name_alias")
+
+    # ── Dedup: tier 3 — vector search ─────────────────────────────────
+
+    async def _dedup_tier_vector(
+        self, entity: GraphEntity, embedding: List[float]
+    ) -> Optional[str]:
+        """Vector-search for a candidate of the same type and accept if
+        the cosine score clears ``_DEDUP_VECTOR_THRESHOLD`` and the
+        candidate's external IDs don't contradict the new entity's."""
+        hits = await self.vector_search_entities(
+            embedding,
+            top_k=5,
+            min_score=self._DEDUP_VECTOR_THRESHOLD,
+        )
+        for candidate, _score in hits:
+            if candidate.entity_type != entity.entity_type:
+                continue
+            if self._external_ids_contradict(
+                entity.external_ids, candidate.external_ids
+            ):
+                continue
+            return candidate.id
+        return None
+
+    # ── Merge a new entity into an existing graph record ──────────────
+
+    async def _merge_into_existing(
+        self, entity: GraphEntity, existing_id: str, tier: str
+    ) -> None:
+        """Merge a new entity's provenance + aliases + external IDs into
+        an existing record, mutate ``entity.id`` to point at it, and
+        record an audit annotation so the merge can be reviewed/reversed.
+        """
+        async with self.driver.session() as session:
+            existing = await session.run(
+                "MATCH (e:Entity {id: $id}) "
+                "RETURN e.source_chunk_ids AS chunks, e.source_document_ids AS docs, "
+                "       e.aliases AS aliases, e.external_ids AS ext, "
+                "       e.metadata AS meta",
+                {"id": existing_id},
+            )
+            record = await existing.single()
+            if record is None:
+                # Existing entity vanished between dedup lookup and merge —
+                # fall back to creating new (no embedding precomputed here).
+                await self.save_entity(entity)
+                return
+
+            existing_chunks = record["chunks"] or []
+            existing_docs = record["docs"] or []
+            existing_aliases = record["aliases"] or []
+            existing_ext = _decode_props(record["ext"])
+
+            # Add the new entity's name + aliases as aliases on the existing
+            # record so future case-insensitive lookups find it under any name.
+            new_alias_pool = [entity.name] + list(entity.aliases or [])
+            merged_aliases = list(
+                dict.fromkeys(
+                    existing_aliases + [a for a in new_alias_pool if a]
+                )
+            )
+
+            # Merge external IDs (existing wins on conflict — those were
+            # presumably curated/saved earlier from a different source).
+            merged_ext = dict(existing_ext)
+            for sys_key, ext_id in (entity.external_ids or {}).items():
+                merged_ext.setdefault(sys_key, ext_id)
+
+            # Audit annotation: record what got merged in and via which tier.
+            existing_meta = _decode_props(record["meta"])
+            existing_anns = existing_meta.get("annotations") or {}
+            dedup_log = list(existing_anns.get("dedup_merged_from") or [])
+            dedup_log.append({
+                "merged_id": entity.id,
+                "tier": tier,
+                "merged_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+            merged_chunks = list(dict.fromkeys(existing_chunks + (entity.source_chunk_ids or [])))
+            merged_docs = list(dict.fromkeys(existing_docs + (entity.source_document_ids or [])))
+
+            # Round-trip the merged annotations through _to_neo4j_props so
+            # the ``annotations`` dict gets re-JSON-stringified consistently.
+            existing_meta.setdefault("annotations", {})
+            existing_meta["annotations"]["dedup_merged_from"] = dedup_log
+            meta_props = _to_neo4j_props({"metadata": existing_meta}).get("metadata")
+
+            await session.run(
+                "MATCH (e:Entity {id: $id}) "
+                "SET e.source_chunk_ids = $chunks, "
+                "    e.source_document_ids = $docs, "
+                "    e.aliases = $aliases, "
+                "    e.external_ids = $ext, "
+                "    e.metadata = $meta, "
+                "    e.updated_at = datetime(), "
+                "    e.version = coalesce(e.version, 1) + 1",
+                {
+                    "id": existing_id,
+                    "chunks": merged_chunks,
+                    "docs": merged_docs,
+                    "aliases": merged_aliases,
+                    "ext": json.dumps(merged_ext, default=str) if merged_ext else None,
+                    "meta": meta_props,
+                },
+            )
+
+            entity.id = existing_id
+            entity.source_chunk_ids = merged_chunks
+            entity.source_document_ids = merged_docs
+            self.logger.debug(
+                "Dedup merge (%s): incoming → %s", tier, existing_id
+            )
+
+    # ── Helper: detect contradicting external IDs across two entities ──
+
+    @staticmethod
+    def _external_ids_contradict(
+        a: Optional[Dict[str, str]],
+        b: Optional[Dict[str, str]],
+    ) -> bool:
+        """True iff ``a`` and ``b`` share an external-ID system but disagree
+        on the value. Two entities with the same Ensembl key but different
+        ENSG IDs are different genes — never merge them.
+        """
+        if not a or not b:
+            return False
+        for key, val in a.items():
+            other = b.get(key)
+            if other and val and other != val:
+                return True
+        return False
+
+    async def save_relationships_batch(
+        self,
+        relationships: List[GraphRelationship],
+        entity_names: Optional[Dict[str, str]] = None,
+    ) -> List[GraphRelationship]:
+        """Encode all relationship-description embeddings in one model call, then persist.
+
+        ``entity_names`` should map ``entity_id → entity.name`` for every
+        endpoint referenced by the batch. When provided, each
+        ``save_relationship`` call skips its source/target MATCH lookup.
+        """
+        if not relationships:
+            return []
+
+        # Resolve endpoint names — prefer the caller-supplied map; for any
+        # missing IDs, fall back to one MATCH query upfront so the inner
+        # save calls don't each do a lookup.
+        names: Dict[str, str] = dict(entity_names or {})
+        missing = {
+            eid
+            for r in relationships
+            for eid in (r.source_entity_id, r.target_entity_id)
+            if eid not in names
+        }
+        if missing:
+            async with self.driver.session() as session:
+                result = await session.run(
+                    "MATCH (e:Entity) WHERE e.id IN $ids RETURN e.id AS id, e.name AS name",
+                    {"ids": list(missing)},
+                )
+                async for record in result:
+                    names[record["id"]] = record["name"] or ""
+
+        from ..services.embedding_factory import embed_batch_async
+
+        texts = [
+            self._relationship_embedding_text(
+                r,
+                source_name=names.get(r.source_entity_id, ""),
+                target_name=names.get(r.target_entity_id, ""),
+            )
+            for r in relationships
+        ]
+        embeddings = await embed_batch_async(texts) if self._get_embedding_model() is not None else [None] * len(relationships)
+
+        out: List[GraphRelationship] = []
+        for rel, emb in zip(relationships, embeddings):
+            endpoints = (
+                names.get(rel.source_entity_id, ""),
+                names.get(rel.target_entity_id, ""),
+            )
+            out.append(
+                await self.save_relationship(
+                    rel,
+                    precomputed_embedding=emb,
+                    precomputed_endpoint_names=endpoints,
+                )
+            )
+        return out
+
     async def get_relationship_by_id(self, relationship_id: str) -> Optional[GraphRelationship]:
         """Get relationship by ID from Neo4j database."""
         

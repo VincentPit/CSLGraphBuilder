@@ -152,13 +152,18 @@ class DocumentExtractionPipeline:
         self.metrics = get_metrics()
         self.dedup_cache = get_dedup_cache()
         self.embedding_cache = get_embedding_cache()
-        # Concurrency bound for parallel per-chunk LLM calls.
-        # Capped to the configured parallel_workers (default 4).
+        # Concurrency bound for parallel per-chunk LLM calls. Set via
+        # PROCESSING_PARALLEL_WORKERS (default 4). The previous hard cap of
+        # 8 has been removed: with the LLM service's 429-aware retry, it's
+        # safe to push concurrency up to whatever the LLM provider's rate
+        # limits sustain. Typical Azure OpenAI gpt-4o standard tier handles
+        # 8-12 concurrent calls comfortably; high-tier deployments often
+        # do 30+. Tune up if your provider supports it.
         try:
             workers = int(getattr(config.processing, "parallel_workers", 4) or 4)
         except Exception:
             workers = 4
-        self._chunk_semaphore = asyncio.Semaphore(max(1, min(workers, 8)))
+        self._chunk_semaphore = asyncio.Semaphore(max(1, workers))
 
     # ------------------------------------------------------------------
     # Top-level entry point

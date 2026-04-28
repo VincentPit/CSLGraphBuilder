@@ -21,7 +21,7 @@ export default function ExportPage() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {FORMATS.map(({ key, label, icon: Icon, desc }) => (
-          <button key={key} onClick={() => download(key)} className="card p-5 text-left hover:border-[var(--accent)] transition-all group">
+          <button key={key} onClick={() => download(key)} className="card p-6 text-left hover:border-[var(--accent)] transition-all group">
             <div className="flex items-center gap-3 mb-3">
               <div className="h-9 w-9 rounded-lg flex items-center justify-center" style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>
                 <Icon size={16} />

@@ -1,9 +1,15 @@
 """Graph entities and relationships router."""
 
 from typing import Annotated, List, Optional
-from datetime import timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+
+
+# Sort sentinel: items with no created_at sort below all real timestamps,
+# so newest-first ordering doesn't crash on older records that pre-date
+# the metadata field.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 from ..auth import require_api_key
 from ..dependencies import get_app_config, get_document_repo, get_graph_repo
@@ -13,6 +19,7 @@ from ..schemas.graph import (
     GraphStatsResponse,
     RelationshipListResponse,
     RelationshipResponse,
+    SubgraphResponse,
 )
 
 router = APIRouter(prefix="/graph", tags=["graph"])
@@ -95,10 +102,21 @@ async def list_entities(
     repo=Depends(get_graph_repo),
     _=Depends(require_api_key),
 ):
+    """Return entities, **newest first** (by ``created_at``).
+
+    With ``limit=500`` (the default), this gives you the most-recently
+    ingested 500 entities. Items without ``created_at`` sort to the
+    bottom via the module-level ``_EPOCH`` sentinel so older records
+    without timestamps don't crash the comparison.
+    """
     all_entities = await repo.get_all_entities()
     entities = list(all_entities.values())
     if entity_type:
         entities = [e for e in entities if e.entity_type.value == entity_type]
+    entities.sort(
+        key=lambda e: (e.metadata.created_at if e.metadata and e.metadata.created_at else _EPOCH),
+        reverse=True,
+    )
     total = len(entities)
     page = entities[offset : offset + limit]
     return EntityListResponse(
@@ -140,6 +158,13 @@ async def list_relationships(
         rels = [r for r in rels if r.source_entity_id == source_entity_id]
     if target_entity_id:
         rels = [r for r in rels if r.target_entity_id == target_entity_id]
+    # Newest first — same ordering contract as /graph/entities so the
+    # frontend's default `limit=500` view shows the most-recently-added
+    # records, not whatever happens to come first in the dict.
+    rels.sort(
+        key=lambda r: (r.metadata.created_at if r.metadata and r.metadata.created_at else _EPOCH),
+        reverse=True,
+    )
     total = len(rels)
     page = rels[offset : offset + limit]
     return RelationshipListResponse(
@@ -147,6 +172,177 @@ async def list_relationships(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get("/subgraph", response_model=SubgraphResponse)
+async def get_subgraph(
+    per_type_limit: int = Query(50, ge=1, le=2000),
+    exclude_types: str = Query(
+        "Document",
+        description="Comma-separated entity types to exclude from seeds "
+        "(case-insensitive). Default skips Document — those are GWAS "
+        "studies and tend to clutter the visualisation.",
+    ),
+    max_neighbors: int = Query(2000, ge=0, le=10000),
+    max_fanout_per_seed: int = Query(
+        15, ge=1, le=500,
+        description="Cap on edges incident on any single seed entity. "
+        "Prevents one disease/drug hub from dragging hundreds of "
+        "leaf entities into the view and rendering as a solid disk.",
+    ),
+    drop_orphans: bool = Query(
+        True,
+        description="When true (default), entities with zero edges in "
+        "the final response are stripped — they're visual noise around "
+        "the perimeter of the graph.",
+    ),
+    repo=Depends(get_graph_repo),
+    _=Depends(require_api_key),
+):
+    """Return a self-consistent slice of the graph for visualisation.
+
+    Seeding is **per entity type**: take the newest ``per_type_limit``
+    entities of every type (excluding any in ``exclude_types``). Then:
+      1. Every relationship where at least one endpoint is in the seed,
+         capped per-seed by ``max_fanout_per_seed`` so dense hubs don't
+         dominate. Seed-seed edges win over seed-leaf when capping.
+      2. Whatever "other-end" entities the kept edges reach (capped at
+         ``max_neighbors`` to bound payload size).
+      3. ``drop_orphans=true`` strips any entity with no surviving edge
+         from the response so the frontend doesn't render it as a
+         disconnected dot in space.
+    Every relationship returned has both endpoints in the entity list.
+    """
+    exclude_set = {
+        t.strip().lower() for t in exclude_types.split(",") if t.strip()
+    }
+
+    all_entities = await repo.get_all_entities()
+    entities = list(all_entities.values())
+    total_entities = len(entities)
+
+    # Group by entity type, applying the exclusion filter.
+    by_type: dict[str, list] = {}
+    for e in entities:
+        type_str = e.entity_type.value
+        if type_str.lower() in exclude_set:
+            continue
+        by_type.setdefault(type_str, []).append(e)
+
+    # For each type, take the newest ``per_type_limit`` entities.
+    seed_entities = []
+    seed_per_type: dict[str, int] = {}
+    for type_str, ents in by_type.items():
+        ents.sort(
+            key=lambda e: (e.metadata.created_at if e.metadata and e.metadata.created_at else _EPOCH),
+            reverse=True,
+        )
+        picked = ents[:per_type_limit]
+        seed_entities.extend(picked)
+        seed_per_type[type_str] = len(picked)
+
+    seed_ids = {e.id for e in seed_entities}
+
+    # All edges with at least one endpoint in seed.
+    all_rels = await repo.get_all_relationships()
+    rels_full = list(all_rels.values())
+    total_relationships = len(rels_full)
+    edges = [
+        r for r in rels_full
+        if r.source_entity_id in seed_ids or r.target_entity_id in seed_ids
+    ]
+
+    # Per-seed fan-out cap. Sort so that:
+    #   - Tier 0 (both endpoints seeds): kept first — these are the
+    #     "structural" edges between sampled entities, the most
+    #     informative for showing how types interconnect.
+    #   - Tier 1 (one endpoint seed): kept after, oldest dropped first
+    #     when a hub blows past the cap.
+    # Within a tier, newer edges win the cap budget.
+    def _edge_sort_key(r):
+        src_in = r.source_entity_id in seed_ids
+        tgt_in = r.target_entity_id in seed_ids
+        tier = 0 if (src_in and tgt_in) else 1
+        created = r.metadata.created_at if r.metadata and r.metadata.created_at else _EPOCH
+        return (tier, -created.timestamp())
+    edges.sort(key=_edge_sort_key)
+
+    fan_out_count: dict = {}
+    capped_edges = []
+    for r in edges:
+        # Identify which endpoint(s) of this edge are seeds — those are
+        # the ones whose fan-out budget this edge consumes.
+        seed_endpoints = [
+            eid for eid in (r.source_entity_id, r.target_entity_id)
+            if eid in seed_ids
+        ]
+        # If keeping this edge would exceed the cap for any of those
+        # seeds, drop it. Tier-0 edges burn budget on both sides.
+        if any(fan_out_count.get(s, 0) >= max_fanout_per_seed for s in seed_endpoints):
+            continue
+        for s in seed_endpoints:
+            fan_out_count[s] = fan_out_count.get(s, 0) + 1
+        capped_edges.append(r)
+    edges = capped_edges
+
+    # Pull in "other end" entities that the *kept* edges reach. The
+    # exclude_types filter applies here too — if the other end is an
+    # excluded type, drop the edge rather than show a half-edge.
+    extra_ids: set = set()
+    for r in edges:
+        for endpoint in (r.source_entity_id, r.target_entity_id):
+            if endpoint in seed_ids or endpoint in extra_ids:
+                continue
+            other = all_entities.get(endpoint)
+            if other is None or other.entity_type.value.lower() in exclude_set:
+                continue
+            extra_ids.add(endpoint)
+            if len(extra_ids) >= max_neighbors:
+                break
+        if len(extra_ids) >= max_neighbors:
+            break
+
+    extra_entities = [all_entities[eid] for eid in extra_ids if eid in all_entities]
+
+    # Final coherence pass: drop any edge whose other end didn't survive
+    # (excluded type or max_neighbors clip). Keeps the invariant that
+    # every relationship in the response is renderable.
+    final_ids = seed_ids | {e.id for e in extra_entities}
+    edges = [
+        r for r in edges
+        if r.source_entity_id in final_ids and r.target_entity_id in final_ids
+    ]
+
+    final_entities = seed_entities + extra_entities
+
+    # Strip orphans: entities with no surviving edge are visual noise
+    # in the force-directed layout (they end up as disconnected dots
+    # around the perimeter).
+    if drop_orphans:
+        connected: set = set()
+        for r in edges:
+            connected.add(r.source_entity_id)
+            connected.add(r.target_entity_id)
+        final_entities = [e for e in final_entities if e.id in connected]
+        # Recount per-type seeds after the orphan cull so the response
+        # reflects what's actually rendered.
+        kept_seeds = sum(1 for e in final_entities if e.id in seed_ids)
+        seed_per_type = {
+            t: sum(1 for e in final_entities if e.id in seed_ids and e.entity_type.value == t)
+            for t in seed_per_type
+        }
+    else:
+        kept_seeds = len(seed_entities)
+
+    return SubgraphResponse(
+        entities=[_entity_to_response(e) for e in final_entities],
+        relationships=[_rel_to_response(r) for r in edges],
+        seed_count=kept_seeds,
+        expanded_count=len([e for e in final_entities if e.id not in seed_ids]),
+        seed_per_type=seed_per_type,
+        total_entities=total_entities,
+        total_relationships=total_relationships,
     )
 
 

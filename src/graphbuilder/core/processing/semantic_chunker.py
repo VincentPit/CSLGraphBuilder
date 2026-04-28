@@ -45,8 +45,7 @@ class SemanticChunkerConfig:
 
     max_chunk_tokens: int = 512
     min_chunk_tokens: int = 30
-    similarity_threshold: float = 0.5
-    embedding_model_name: str = "all-MiniLM-L6-v2"
+    similarity_threshold: float = 0.7
 
 
 class SemanticChunker:
@@ -61,7 +60,6 @@ class SemanticChunker:
 
     def __init__(self, config: Optional[SemanticChunkerConfig] = None) -> None:
         self.config = config or SemanticChunkerConfig()
-        self._model = None  # lazy-loaded
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -133,15 +131,15 @@ class SemanticChunker:
 
     def _embed(self, sentences: List[str]) -> np.ndarray:
         """Return (N, D) embedding matrix for *sentences*."""
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
+        from ...infrastructure.services.embedding_factory import get_model
 
-            self._model = SentenceTransformer(self.config.embedding_model_name)
-            logger.info(
-                "Loaded embedding model '%s' for semantic chunking",
-                self.config.embedding_model_name,
+        model = get_model()
+        if model is None:
+            raise RuntimeError(
+                "No embedding model available; semantic chunking requires "
+                "sentence-transformers (see infrastructure.services.embedding_factory)."
             )
-        return self._model.encode(sentences, show_progress_bar=False)
+        return model.encode(sentences, show_progress_bar=False)
 
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = (np.linalg.norm(a) * np.linalg.norm(b))

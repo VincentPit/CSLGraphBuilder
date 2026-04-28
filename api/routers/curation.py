@@ -218,11 +218,6 @@ def _trim(text: Optional[str], max_len: int = 220) -> Optional[str]:
     return text[: max_len - 1].rsplit(" ", 1)[0] + "…"
 
 
-def _annotation(obj: Any) -> Dict[str, Any]:
-    """Extract the annotations dict off an entity or relationship."""
-    return getattr(getattr(obj, "metadata", None), "annotations", {}) or {}
-
-
 def _parse_iso(value: Any) -> datetime:
     """Best-effort parse of an ISO timestamp; falls back to epoch."""
     if isinstance(value, datetime):
@@ -243,64 +238,139 @@ def _sort_key(item: Dict[str, Any]) -> tuple:
     return (rank, -created.timestamp())
 
 
-def _entity_to_queue_item(ent: Any, ann: Dict[str, Any], ent_status: str) -> Dict[str, Any]:
-    """Shape a GraphEntity into the rich queue payload."""
-    tags = list(getattr(ent.metadata, "tags", []) or []) if ent.metadata else []
-    return {
-        "type": "entity",
-        "id": ent.id,
-        "name": ent.name,
-        "entity_type": ent.entity_type.value,
-        "description": _trim(ent.description),
-        "verification_status": ent_status,
-        "notes": ann.get("verification_notes"),
-        "source_chunk_count": len(getattr(ent, "source_chunk_ids", []) or []),
-        "source_document_count": len(getattr(ent, "source_document_ids", []) or []),
-        "source_trust": getattr(ent.metadata, "source_trust", None) if ent.metadata else None,
-        "tags": tags,
-        "created_at": ent.metadata.created_at.isoformat() if ent.metadata else None,
-    }
+# ── Cypher-side filter helpers ──────────────────────────────────────────
+#
+# Both queue endpoints used to do `await graph_repo.get_all_entities()`
+# and `get_all_relationships()` followed by an in-Python filter loop. With
+# thousands of items in the graph, that round-tripped tens of MB of data
+# and rehydrated 7500+ Python objects on every call — even though only
+# a handful actually need curation.
+#
+# The new path pushes the status filter into Cypher via substring matches
+# on the JSON-stringified ``metadata`` property and returns ONLY rows
+# that need review. ``CONTAINS`` is a full scan, but it runs inside the
+# DB on a single C++ pass; the dominant cost in the old path was the
+# Python deserialization of every node into a ``GraphEntity``.
+#
+# Long term, the right fix is to lift ``verification_status`` and
+# ``curated`` to top-level indexed properties on the node — the payload
+# below is structured so that change becomes a one-line WHERE swap.
+
+_STATUS_FRAGMENTS = {
+    "rejected": '"verification_status": "rejected"',
+    "flagged": '"verification_status": "flagged"',
+    "unverified": '"verification_status": "unverified"',
+}
+_CURATED_FRAGMENT = '"curated": true'
 
 
-def _relationship_to_queue_item(
-    rel: Any,
-    ann: Dict[str, Any],
-    rel_status: str,
-    entities_by_id: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Shape a GraphRelationship + endpoint lookup into the queue payload.
+def _build_status_predicate(status_filter: Optional[str], var: str) -> str:
+    """Build the WHERE clause that selects items needing curation.
 
-    Resolves source/target entity *names + types* so reviewers see
-    "BRCA1 (GENE) → Breast Cancer (DISEASE)" instead of opaque UUIDs.
+    ``var`` is the Cypher variable bound to the node (e.g. ``e`` for
+    entities, ``r`` for relationships). ``status_filter`` narrows to a
+    single status when set; otherwise all three reviewable statuses are
+    accepted.
     """
-    src = entities_by_id.get(rel.source_entity_id)
-    tgt = entities_by_id.get(rel.target_entity_id)
-    return {
-        "type": "relationship",
-        "id": rel.id,
-        "source_entity_id": rel.source_entity_id,
-        "source_entity_name": src.name if src else None,
-        "source_entity_type": src.entity_type.value if src else None,
-        "target_entity_id": rel.target_entity_id,
-        "target_entity_name": tgt.name if tgt else None,
-        "target_entity_type": tgt.entity_type.value if tgt else None,
-        "relationship_type": rel.relationship_type.value,
-        "description": _trim(rel.description),
-        "strength": getattr(rel, "strength", None),
-        "verification_status": rel_status,
-        "notes": ann.get("verification_notes"),
-        "source_chunk_count": len(getattr(rel, "source_chunk_ids", []) or []),
-        "source_document_count": len(getattr(rel, "source_document_ids", []) or []),
-        "source_trust": getattr(rel.metadata, "source_trust", None) if rel.metadata else None,
-        "created_at": rel.metadata.created_at.isoformat() if rel.metadata else None,
-    }
+    if status_filter and status_filter in _STATUS_FRAGMENTS:
+        statuses = [status_filter]
+    else:
+        statuses = list(_STATUS_FRAGMENTS.keys())
+    status_or = " OR ".join(
+        f"{var}.metadata CONTAINS '{_STATUS_FRAGMENTS[s]}'" for s in statuses
+    )
+    return (
+        f"({status_or}) AND NOT {var}.metadata CONTAINS '{_CURATED_FRAGMENT}'"
+    )
 
 
-def _passes_status_filter(item_status: str, status_filter: Optional[str]) -> bool:
-    """Item must be reviewable AND match the optional status filter."""
-    if item_status not in _REVIEWABLE_STATUSES:
-        return False
-    return status_filter is None or item_status == status_filter
+def _row_status(metadata_str: Any) -> str:
+    """Pull verification_status from the raw JSON metadata string."""
+    if not metadata_str:
+        return ""
+    if isinstance(metadata_str, str):
+        try:
+            data = json.loads(metadata_str)
+        except (ValueError, json.JSONDecodeError):
+            return ""
+    elif isinstance(metadata_str, dict):
+        data = metadata_str
+    else:
+        return ""
+    return ((data.get("annotations") or {}).get("verification_status") or "")
+
+
+def _row_notes(metadata_str: Any) -> Optional[str]:
+    if not metadata_str:
+        return None
+    if isinstance(metadata_str, str):
+        try:
+            data = json.loads(metadata_str)
+        except (ValueError, json.JSONDecodeError):
+            return None
+    elif isinstance(metadata_str, dict):
+        data = metadata_str
+    else:
+        return None
+    return (data.get("annotations") or {}).get("verification_notes")
+
+
+def _row_to_iso(value: Any) -> Optional[str]:
+    """Coerce a Neo4j datetime / string / None to an ISO string."""
+    if value is None:
+        return None
+    if hasattr(value, "iso_format"):  # neo4j.time.DateTime
+        return value.iso_format()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+@router.get("/queue/counts")
+async def get_curation_queue_counts(
+    type_: Optional[str] = Query(None, alias="type", description="Filter by 'entity' or 'relationship'"),
+    graph_repo=Depends(get_graph_repo),
+    _=Depends(require_api_key),
+):
+    """Return per-status counts of items still pending human review.
+
+    Single Cypher round-trip with ``sum(CASE …)`` aggregations so we
+    never pull node payloads into Python just to count them.
+    """
+    counts: Dict[str, int] = {"total": 0, "rejected": 0, "flagged": 0, "unverified": 0}
+
+    async def _count(label_pattern: str, var: str) -> Dict[str, int]:
+        not_curated = f"NOT {var}.metadata CONTAINS '{_CURATED_FRAGMENT}'"
+        query = (
+            f"MATCH {label_pattern} "
+            f"WHERE {not_curated} "
+            f"RETURN "
+            f"  sum(CASE WHEN {var}.metadata CONTAINS '{_STATUS_FRAGMENTS['rejected']}' THEN 1 ELSE 0 END) AS rejected, "
+            f"  sum(CASE WHEN {var}.metadata CONTAINS '{_STATUS_FRAGMENTS['flagged']}' THEN 1 ELSE 0 END) AS flagged, "
+            f"  sum(CASE WHEN {var}.metadata CONTAINS '{_STATUS_FRAGMENTS['unverified']}' THEN 1 ELSE 0 END) AS unverified"
+        )
+        rows = await graph_repo.execute_cypher_query(query, {})
+        if not rows:
+            return {"rejected": 0, "flagged": 0, "unverified": 0}
+        row = rows[0]
+        return {
+            "rejected": int(row.get("rejected") or 0),
+            "flagged": int(row.get("flagged") or 0),
+            "unverified": int(row.get("unverified") or 0),
+        }
+
+    if type_ in (None, "entity"):
+        ent_counts = await _count("(e:Entity)", "e")
+        for k in ("rejected", "flagged", "unverified"):
+            counts[k] += ent_counts[k]
+
+    if type_ in (None, "relationship"):
+        rel_counts = await _count("()-[r:RELATES]->()", "r")
+        for k in ("rejected", "flagged", "unverified"):
+            counts[k] += rel_counts[k]
+
+    counts["total"] = counts["rejected"] + counts["flagged"] + counts["unverified"]
+    return counts
 
 
 @router.get("/queue")
@@ -318,24 +388,85 @@ async def get_curation_queue(
     without a follow-up request: description, source counts (chunks /
     documents), source trust level, tags, and — for relationships —
     the *names* and *types* of both endpoints (not just opaque IDs).
+
+    The status filter runs in Cypher (``CONTAINS`` substring match on
+    the JSON-stringified ``metadata`` property), so we only deserialize
+    rows that actually need review — not every entity in the graph.
     """
-    all_entities = await graph_repo.get_all_entities()
     items: List[Dict[str, Any]] = []
+    where = _build_status_predicate(status, "e")
 
     if type_ in (None, "entity"):
-        for ent in all_entities.values():
-            ann = _annotation(ent)
-            ent_status = ann.get("verification_status", "")
-            if _passes_status_filter(ent_status, status):
-                items.append(_entity_to_queue_item(ent, ann, ent_status))
+        ent_query = (
+            f"MATCH (e:Entity) "
+            f"WHERE {where} "
+            f"RETURN "
+            f"  e.id AS id, e.name AS name, e.entity_type AS entity_type, "
+            f"  e.description AS description, e.source_trust AS source_trust, "
+            f"  e.tags AS tags, "
+            f"  size(coalesce(e.source_chunk_ids, [])) AS source_chunk_count, "
+            f"  size(coalesce(e.source_document_ids, [])) AS source_document_count, "
+            f"  e.created_at AS created_at, e.metadata AS metadata"
+        )
+        rows = await graph_repo.execute_cypher_query(ent_query, {})
+        for row in rows:
+            row_status = _row_status(row.get("metadata"))
+            if row_status not in _REVIEWABLE_STATUSES:
+                continue
+            items.append({
+                "type": "entity",
+                "id": row.get("id"),
+                "name": row.get("name"),
+                "entity_type": row.get("entity_type"),
+                "description": _trim(row.get("description")),
+                "verification_status": row_status,
+                "notes": _row_notes(row.get("metadata")),
+                "source_chunk_count": int(row.get("source_chunk_count") or 0),
+                "source_document_count": int(row.get("source_document_count") or 0),
+                "source_trust": row.get("source_trust"),
+                "tags": list(row.get("tags") or []),
+                "created_at": _row_to_iso(row.get("created_at")),
+            })
 
     if type_ in (None, "relationship"):
-        all_relationships = await graph_repo.get_all_relationships()
-        for rel in all_relationships.values():
-            ann = _annotation(rel)
-            rel_status = ann.get("verification_status", "")
-            if _passes_status_filter(rel_status, status):
-                items.append(_relationship_to_queue_item(rel, ann, rel_status, all_entities))
+        rel_where = _build_status_predicate(status, "r")
+        rel_query = (
+            f"MATCH (s:Entity)-[r:RELATES]->(t:Entity) "
+            f"WHERE {rel_where} "
+            f"RETURN "
+            f"  r.id AS id, r.relationship_type AS relationship_type, "
+            f"  r.description AS description, r.strength AS strength, "
+            f"  r.source_trust AS source_trust, "
+            f"  size(coalesce(r.source_chunk_ids, [])) AS source_chunk_count, "
+            f"  size(coalesce(r.source_document_ids, [])) AS source_document_count, "
+            f"  r.created_at AS created_at, r.metadata AS metadata, "
+            f"  s.id AS source_entity_id, s.name AS source_entity_name, s.entity_type AS source_entity_type, "
+            f"  t.id AS target_entity_id, t.name AS target_entity_name, t.entity_type AS target_entity_type"
+        )
+        rows = await graph_repo.execute_cypher_query(rel_query, {})
+        for row in rows:
+            row_status = _row_status(row.get("metadata"))
+            if row_status not in _REVIEWABLE_STATUSES:
+                continue
+            items.append({
+                "type": "relationship",
+                "id": row.get("id"),
+                "source_entity_id": row.get("source_entity_id"),
+                "source_entity_name": row.get("source_entity_name"),
+                "source_entity_type": row.get("source_entity_type"),
+                "target_entity_id": row.get("target_entity_id"),
+                "target_entity_name": row.get("target_entity_name"),
+                "target_entity_type": row.get("target_entity_type"),
+                "relationship_type": row.get("relationship_type"),
+                "description": _trim(row.get("description")),
+                "strength": row.get("strength"),
+                "verification_status": row_status,
+                "notes": _row_notes(row.get("metadata")),
+                "source_chunk_count": int(row.get("source_chunk_count") or 0),
+                "source_document_count": int(row.get("source_document_count") or 0),
+                "source_trust": row.get("source_trust"),
+                "created_at": _row_to_iso(row.get("created_at")),
+            })
 
     items.sort(key=_sort_key)
     total = len(items)

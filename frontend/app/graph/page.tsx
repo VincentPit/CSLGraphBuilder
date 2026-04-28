@@ -12,7 +12,10 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { getEntities, getRelationships, type Entity, type Relationship } from '@/lib/api';
+import { getSubgraph, type Entity, type Relationship } from '@/lib/api';
+import { Button } from '@/components/ui/Button';
+import { Badge } from '@/components/ui/Badge';
+import { LoadingState } from '@/components/ui/LoadingState';
 
 // `next/dynamic` returns a plain LoadableComponent — refs passed to it are
 // dropped (and React warns). Sidestep the issue by accepting an `fgRef` prop
@@ -64,15 +67,110 @@ function entityColor(type: string): string {
   return TYPE_COLORS[type.toUpperCase()] ?? '#94a3b8';
 }
 
+// Shape-per-type for the graph nodes. Color carries the same signal but
+// shape adds a second redundant channel that survives at low zoom (when
+// dots are too small for the eye to compare colors reliably). Defaults
+// to circle for any type without an explicit mapping.
+type NodeShape = 'circle' | 'square' | 'triangle' | 'diamond';
+const TYPE_SHAPES: Record<string, NodeShape> = {
+  DISEASE: 'triangle',
+  DRUG: 'square',
+  COMPOUND: 'square',
+  PATHWAY: 'diamond',
+  GENE: 'circle',
+  PROTEIN: 'circle',
+};
+function shapeFor(type: string): NodeShape {
+  return TYPE_SHAPES[type.toUpperCase()] ?? 'circle';
+}
+
+/** Tiny inline SVG matching the canvas shape — used in the legend so
+ *  the swatch next to each type matches the dot drawn in the graph. */
+function LegendShape({ type, color }: { type: string; color: string }) {
+  const shape = shapeFor(type);
+  const stroke = 'rgba(15,23,42,0.45)';
+  const common = { fill: color, stroke, strokeWidth: 1 } as const;
+  return (
+    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+      {shape === 'square' && <rect x="1" y="1" width="10" height="10" {...common} />}
+      {shape === 'triangle' && <polygon points="6,1 11,10.5 1,10.5" {...common} />}
+      {shape === 'diamond' && <polygon points="6,1 11,6 6,11 1,6" {...common} />}
+      {shape === 'circle' && <circle cx="6" cy="6" r="5" {...common} />}
+    </svg>
+  );
+}
+
+/** Trace the outline of a typed node onto the canvas at (x,y) with
+ *  half-extent r. Caller handles fill + stroke after calling this. */
+function tracePath(
+  ctx: CanvasRenderingContext2D,
+  shape: NodeShape,
+  x: number,
+  y: number,
+  r: number,
+) {
+  ctx.beginPath();
+  switch (shape) {
+    case 'square':
+      ctx.rect(x - r, y - r, 2 * r, 2 * r);
+      break;
+    case 'triangle': {
+      // Equilateral-ish triangle, point up.
+      const h = r * 1.15;
+      ctx.moveTo(x, y - h);
+      ctx.lineTo(x - r, y + h * 0.55);
+      ctx.lineTo(x + r, y + h * 0.55);
+      ctx.closePath();
+      break;
+    }
+    case 'diamond':
+      ctx.moveTo(x, y - r);
+      ctx.lineTo(x + r, y);
+      ctx.lineTo(x, y + r);
+      ctx.lineTo(x - r, y);
+      ctx.closePath();
+      break;
+    case 'circle':
+    default:
+      ctx.arc(x, y, r, 0, 2 * Math.PI);
+  }
+}
+
 export default function GraphPage() {
-  const { data: entData, isLoading: entLoading } = useQuery({
-    queryKey: ['entities'],
-    queryFn: () => getEntities({ limit: 500 }),
+  // Single subgraph query: newest 50 entities of each type (excluding
+  // Document — those are GWAS studies and clutter the view) + every
+  // edge they touch + the "other-end" entities those edges reach.
+  // Backend guarantees every relationship returned has both endpoints
+  // in the entity list, so no bipartite filter on the client.
+  const { data: subgraph, isLoading: loadingSubgraph } = useQuery({
+    queryKey: ['subgraph'],
+    queryFn: () =>
+      getSubgraph({
+        per_type_limit: 50,
+        exclude_types: 'Document',
+        max_neighbors: 2000,
+      }),
   });
-  const { data: relData, isLoading: relLoading } = useQuery({
-    queryKey: ['relationships'],
-    queryFn: () => getRelationships({ limit: 1000 }),
-  });
+  // Adapter shape so the rest of this file (which was written against
+  // entData.items / relData.items) keeps working unchanged. Memoized so
+  // the rAF popover loop (which fires setState ~60×/sec) doesn't churn
+  // graphData refs and silently re-heat the d3 simulation every frame.
+  const entData = useMemo(
+    () =>
+      subgraph
+        ? { items: subgraph.entities, total: subgraph.total_entities }
+        : undefined,
+    [subgraph],
+  );
+  const relData = useMemo(
+    () =>
+      subgraph
+        ? { items: subgraph.relationships, total: subgraph.total_relationships }
+        : undefined,
+    [subgraph],
+  );
+  const entLoading = loadingSubgraph;
+  const relLoading = loadingSubgraph;
 
   const [search, setSearch] = useState('');
   const [activeTypes, setActiveTypes] = useState<Set<string>>(new Set());
@@ -112,13 +210,27 @@ export default function GraphPage() {
     }
     let raf = 0;
     let alive = true;
+    let lastX: number | null = null;
+    let lastY: number | null = null;
     const tick = () => {
       if (!alive) return;
       const fg = fgRef.current;
       const node = selectedNodeRef.current;
       if (fg?.graph2ScreenCoords && typeof node?.x === 'number') {
         const p = fg.graph2ScreenCoords(node.x, node.y);
-        setPopoverPos({ x: p.x, y: p.y });
+        // Only propagate when the screen position changed by ≥0.5px;
+        // a per-frame setState with a fresh object would otherwise
+        // re-render the page 60×/sec for nothing. First tick (lastX
+        // null) always publishes so the inspector mounts.
+        if (
+          lastX === null ||
+          Math.abs(p.x - lastX) > 0.5 ||
+          Math.abs(p.y - (lastY as number)) > 0.5
+        ) {
+          lastX = p.x;
+          lastY = p.y;
+          setPopoverPos({ x: p.x, y: p.y });
+        }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -188,6 +300,62 @@ export default function GraphPage() {
 
   const loading = entLoading || relLoading;
 
+  // Force-directed layout tuning. Two competing goals:
+  //   - Pull disconnected clusters close enough that the canvas isn't
+  //     mostly empty space.
+  //   - Keep nodes inside a cluster from overlapping.
+  // Charge needs to be strong enough to counteract the link force on a
+  // ~300-node, densely-connected graph; -50 was too weak and let every
+  // hub collapse into a tight ball.
+  //
+  // Re-key on node/link counts (not the graphData object reference),
+  // so the rAF popover loop can churn React state without dragging the
+  // simulation back to alpha=1 every frame.
+  const nodeCount = graphData.nodes.length;
+  const linkCount = graphData.links.length;
+  useEffect(() => {
+    if (!nodeCount) return;
+    const fg = fgRef.current;
+    if (!fg?.d3Force) return;
+    const charge = fg.d3Force('charge');
+    const link = fg.d3Force('link');
+    if (charge?.strength) charge.strength(-180);   // default ~-30; needed to spread dense hubs
+    if (link?.distance) link.distance(60);          // default ~30; room for labels
+    // Collision: enforce a minimum gap so the bigger shapes from the
+    // canvas redesign don't visually pile up. d3 isn't imported here,
+    // so we register a small custom per-tick force that pushes any
+    // pair closer than ``minDist`` apart proportional to alpha. The
+    // force reads nodes off the live d3 simulation (passed in via
+    // initialize) rather than a captured React array, so it stays
+    // correct after filter changes without re-registering.
+    const minDist = 28;
+    let simNodes: any[] = [];
+    const collide = (alpha: number) => {
+      for (let i = 0; i < simNodes.length; i++) {
+        const ni = simNodes[i];
+        for (let j = i + 1; j < simNodes.length; j++) {
+          const nj = simNodes[j];
+          const dx = (nj.x ?? 0) - (ni.x ?? 0);
+          const dy = (nj.y ?? 0) - (ni.y ?? 0);
+          const d2 = dx * dx + dy * dy;
+          if (d2 < minDist * minDist && d2 > 0.0001) {
+            const d = Math.sqrt(d2);
+            const push = ((minDist - d) / d) * 0.5 * alpha;
+            ni.x -= dx * push;
+            ni.y -= dy * push;
+            nj.x += dx * push;
+            nj.y += dy * push;
+          }
+        }
+      }
+    };
+    (collide as any).initialize = (nodes: any[]) => {
+      simNodes = nodes;
+    };
+    fg.d3Force('collide', collide);
+    fg.d3ReheatSimulation?.();
+  }, [nodeCount, linkCount]);
+
   function toggleType(t: string) {
     setActiveTypes((prev) => {
       const next = new Set(prev);
@@ -202,27 +370,23 @@ export default function GraphPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <header className="flex items-end justify-between flex-wrap gap-3">
-        <div>
-          <div className="flex items-center gap-2 mb-2">
-            <span
-              className="badge badge-brand"
-              style={{ background: 'var(--accent-soft)', border: '1px solid rgba(213,33,44,0.25)' }}
-            >
-              <Sparkles size={10} className="opacity-70" />
-              Live · Interactive
-            </span>
-          </div>
+    <div className="space-y-8 lg:space-y-10">
+      <header className="flex items-end justify-between flex-wrap gap-4">
+        <div className="space-y-3">
+          <Badge tone="brand">
+            <Sparkles size={10} className="opacity-70" aria-hidden="true" />
+            Live · Interactive
+          </Badge>
           <h1 className="page-title">Knowledge Graph</h1>
           <p className="page-desc">
             Drag nodes to rearrange, scroll to zoom, click to inspect.
-            Each colour represents an entity type — see the legend on the right.
+            Each colour represents an entity type — use the filter panel
+            on the left to narrow the view.
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <div className="card px-3 py-1.5 flex items-center gap-1.5" title="Visible nodes">
-            <Network size={12} style={{ color: 'var(--accent)' }} />
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="card px-3 py-1.5 flex items-center gap-1.5" aria-label={`${filteredEntities.length} visible nodes`}>
+            <Network size={12} style={{ color: 'var(--accent)' }} aria-hidden="true" />
             <span className="text-xs font-semibold tabular-nums">
               {filteredEntities.length}
             </span>
@@ -230,8 +394,8 @@ export default function GraphPage() {
               nodes
             </span>
           </div>
-          <div className="card px-3 py-1.5 flex items-center gap-1.5" title="Visible edges">
-            <GitBranch size={12} style={{ color: 'var(--accent)' }} />
+          <div className="card px-3 py-1.5 flex items-center gap-1.5" aria-label={`${filteredRels.length} visible edges`}>
+            <GitBranch size={12} style={{ color: 'var(--accent)' }} aria-hidden="true" />
             <span className="text-xs font-semibold tabular-nums">
               {filteredRels.length}
             </span>
@@ -239,55 +403,79 @@ export default function GraphPage() {
               edges
             </span>
           </div>
-          <button
+          <Button
             onClick={recenter}
-            className="btn-ghost"
             title="Fit the entire graph into the viewport"
+            aria-label="Recenter graph to fit viewport"
           >
-            <Maximize2 size={13} />
+            <Maximize2 size={13} aria-hidden="true" />
             Recenter
-          </button>
+          </Button>
         </div>
       </header>
 
-      {/* Search bar (filter chips moved into the Legend panel) */}
-      <div className="card flex items-center gap-2 px-3 py-2 max-w-2xl">
-        <Search size={14} style={{ color: 'var(--text-muted)' }} />
+      {/* Prominent search bar — full width, large hit area. */}
+      <div
+        className="flex items-center gap-3 px-5 py-4"
+        style={{
+          background: 'var(--bg-card)',
+          border: '1.5px solid var(--border-input)',
+          borderRadius: 'var(--radius-md)',
+          boxShadow: 'var(--shadow-card)',
+        }}
+      >
+        <Search size={22} style={{ color: 'var(--text-muted)' }} aria-hidden="true" />
+        <label htmlFor="graph-search" className="sr-only">Search entities</label>
         <input
+          id="graph-search"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search entities by name (e.g. BRCA1, hemophilia)…"
-          className="bg-transparent outline-none text-sm flex-1"
+          className="bg-transparent outline-none text-[16px] font-semibold flex-1 py-1"
+          style={{ color: 'var(--text-primary)' }}
         />
         {search && (
           <button
             onClick={() => setSearch('')}
-            className="text-xs text-slate-400 hover:text-slate-700"
-            title="Clear search"
+            className="btn-icon"
+            style={{ width: 34, height: 34 }}
+            aria-label="Clear search"
           >
-            <X size={13} />
+            <X size={15} aria-hidden="true" />
           </button>
         )}
         {activeTypes.size > 0 && (
           <button
             onClick={() => setActiveTypes(new Set())}
-            className="text-[11px] font-semibold px-2 py-1 rounded-md"
+            className="text-[12px] font-semibold px-3 py-1.5 rounded-md whitespace-nowrap"
             style={{ color: 'var(--accent)', background: 'var(--accent-muted)' }}
-            title="Show all entity types"
+            aria-label={`Reset entity-type filter (${activeTypes.size} active)`}
           >
             Reset filter ({activeTypes.size})
           </button>
         )}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
-        <div className="lg:col-span-3 card overflow-hidden relative" ref={containerRef}>
+      {/* Filter on the LEFT always, graph on the RIGHT. Always
+          side-by-side regardless of viewport width. */}
+      <div className="flex gap-5">
+        <aside
+          className="w-[240px] shrink-0 sticky top-4 h-fit"
+        >
+          <FilterPanel
+            allTypes={allTypes}
+            typeCounts={typeCounts}
+            activeTypes={activeTypes}
+            toggleType={toggleType}
+            clearFilter={() => setActiveTypes(new Set())}
+          />
+        </aside>
+
+        {/* Right column: the graph itself */}
+        <div className="flex-1 min-w-0 card overflow-hidden relative" ref={containerRef}>
           {loading ? (
-            <div
-              className="h-[640px] flex items-center justify-center text-sm gap-2"
-              style={{ color: 'var(--text-muted)' }}
-            >
-              <Activity size={16} className="animate-pulse" /> Loading graph
+            <div className="h-[640px] flex items-center justify-center">
+              <LoadingState>Loading graph</LoadingState>
             </div>
           ) : (
             <ForceGraph2D
@@ -295,40 +483,54 @@ export default function GraphPage() {
               graphData={graphData}
               nodeLabel={(n: any) => `${n.name} (${n.type})`}
               nodeColor={(n: any) => n.color}
-              nodeRelSize={5}
-              linkColor={() => 'rgba(148,163,184,0.45)'}
+              nodeRelSize={9}
+              linkColor={() => 'rgba(148,163,184,0.55)'}
               linkLabel={(l: any) => l.label}
               linkDirectionalArrowLength={3}
               linkDirectionalArrowRelPos={1}
               linkWidth={(l: any) => {
-                if (!selected) return 1;
+                if (!selected) return 1.2;
                 return l.source.id === selected.id || l.target.id === selected.id ? 2.5 : 0.5;
               }}
               nodeCanvasObject={(node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
                 const isSelected = selected?.id === node.id;
-                const r = isSelected ? 7 : 5;
-                ctx.beginPath();
-                ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+                const r = isSelected ? 11 : 9;
+                const shape = shapeFor(node.type);
+                // Subtle dark outline so colored shapes stay legible
+                // against the off-white background.
                 ctx.fillStyle = node.color;
+                ctx.strokeStyle = 'rgba(15,23,42,0.45)';
+                ctx.lineWidth = 1.25;
+                tracePath(ctx, shape, node.x, node.y, r);
                 ctx.fill();
+                ctx.stroke();
                 if (isSelected) {
+                  // CSL-red ring + glow.
                   ctx.lineWidth = 2;
                   ctx.strokeStyle = 'rgba(213,33,44,0.90)';
+                  tracePath(ctx, shape, node.x, node.y, r);
                   ctx.stroke();
-                  // Subtle CSL-red glow
-                  ctx.beginPath();
-                  ctx.arc(node.x, node.y, r + 4, 0, 2 * Math.PI);
+                  tracePath(ctx, shape, node.x, node.y, r + 5);
                   ctx.strokeStyle = 'rgba(213,33,44,0.25)';
                   ctx.lineWidth = 4;
                   ctx.stroke();
                 }
-                if (globalScale > 1.3 || isSelected) {
-                  ctx.font = `${isSelected ? 11 : 9}px Inter, sans-serif`;
-                  ctx.fillStyle = isSelected ? '#0f172a' : 'rgba(15,23,42,0.65)';
+                // Labels only appear when zoomed in moderately, or for
+                // the selected node. Showing every label at default zoom
+                // produced an unreadable wall of overlapping text.
+                if (globalScale > 1.4 || isSelected) {
+                  ctx.font = `${isSelected ? 12 : 10}px Inter, sans-serif`;
+                  ctx.fillStyle = isSelected ? '#0f172a' : 'rgba(15,23,42,0.7)';
                   ctx.textAlign = 'center';
                   ctx.textBaseline = 'top';
-                  ctx.fillText(node.name, node.x, node.y + r + 2);
+                  ctx.fillText(node.name, node.x, node.y + r + 3);
                 }
+              }}
+              nodePointerAreaPaint={(node: any, color: string, ctx: CanvasRenderingContext2D) => {
+                // Match the visible shape so click hit-testing aligns.
+                ctx.fillStyle = color;
+                tracePath(ctx, shapeFor(node.type), node.x, node.y, 11);
+                ctx.fill();
               }}
               onNodeClick={(n: any) => {
                 selectedNodeRef.current = n;
@@ -363,108 +565,119 @@ export default function GraphPage() {
           )}
         </div>
 
-        {/* Right column: Legend (always visible) + Inspector */}
-        <div className="space-y-4 lg:sticky lg:top-4 h-fit">
-          {/* ── Legend ───────────────────────────────────────────────── */}
-          <div className="card p-4">
-            <div className="flex items-center justify-between mb-3">
-              <p
-                className="text-[10px] uppercase tracking-wider font-semibold"
-                style={{ color: 'var(--text-muted)' }}
-              >
-                Legend
-              </p>
-              <span
-                className="help-icon"
-                title="Click a row to filter the graph to that type. Click again to remove the filter."
-              >
-                ?
-              </span>
-            </div>
-            <ul className="space-y-1">
-              {allTypes.map((t) => {
-                const filterActive = activeTypes.size > 0;
-                const isOn = !filterActive || activeTypes.has(t);
-                const color = entityColor(t);
-                const count = typeCounts[t] ?? 0;
-                return (
-                  <li key={t}>
-                    <button
-                      onClick={() => toggleType(t)}
-                      className="w-full text-left px-2 py-1.5 rounded-md flex items-center gap-2 transition-all"
-                      style={{
-                        background: filterActive && isOn ? `${color}10` : 'transparent',
-                        border: `1px solid ${filterActive && isOn ? `${color}33` : 'transparent'}`,
-                        opacity: isOn ? 1 : 0.4,
-                      }}
-                      title={
-                        !filterActive
-                          ? `Click to show only ${t} (${TYPE_DESCRIPTIONS[t] ?? ''})`
-                          : isOn
-                            ? `${t} is shown — click to hide`
-                            : `${t} is hidden — click to show`
-                      }
-                    >
-                      <span
-                        className="h-2.5 w-2.5 rounded-full shrink-0"
-                        style={{
-                          background: color,
-                          boxShadow: isOn ? `0 0 0 3px ${color}22` : 'none',
-                        }}
-                      />
-                      <span
-                        className="text-[12.5px] font-semibold flex-1"
-                        style={{ color: isOn ? 'var(--text-primary)' : 'var(--text-muted)' }}
-                      >
-                        {t}
-                      </span>
-                      <span
-                        className="text-[11px] tabular-nums font-semibold"
-                        style={{ color: 'var(--text-muted)' }}
-                      >
-                        {count}
-                      </span>
-                    </button>
-                    {TYPE_DESCRIPTIONS[t] && (
-                      <p
-                        className="text-[10.5px] pl-7 -mt-0.5 mb-1"
-                        style={{ color: 'var(--text-muted)' }}
-                      >
-                        {TYPE_DESCRIPTIONS[t]}
-                      </p>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-            {allTypes.length === 0 && (
-              <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                Graph is empty.
-              </p>
-            )}
-          </div>
-
-          {/* Inspector lives inline only when nothing is selected — it
-              becomes a hint card. Once a node is clicked, the popover
-              floats over the canvas instead. */}
-          {!selected && (
-            <div className="card p-4">
-              <div className="empty-state">
-                <span className="empty-icon">
-                  <Network size={20} />
-                </span>
-                <p className="text-[12.5px] font-medium" style={{ color: 'var(--text-secondary)' }}>
-                  Click a node to inspect
-                </p>
-                <p className="text-[10.5px]">
-                  A details card will pop up next to the node showing its
-                  type, description, sources, and neighbours.
-                </p>
-              </div>
-            </div>
-          )}
-        </div>
       </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   FilterPanel — checkbox-style entity-type filter panel that lives
+   in the left column of the graph page.
+
+   Behaviour mirrors the legacy legend: when no boxes are checked,
+   ALL entity types are visible (no filter). Checking one or more
+   boxes restricts the graph to those types.
+
+   The colour swatch is the same one rendered in the graph for that
+   entity type, so users can mentally connect rows in the panel to
+   nodes in the canvas.
+   ───────────────────────────────────────────────────────────────── */
+function FilterPanel({
+  allTypes,
+  typeCounts,
+  activeTypes,
+  toggleType,
+  clearFilter,
+}: {
+  allTypes: string[];
+  typeCounts: Record<string, number>;
+  activeTypes: Set<string>;
+  toggleType: (t: string) => void;
+  clearFilter: () => void;
+}) {
+  const filterActive = activeTypes.size > 0;
+  return (
+    <div className="card p-5">
+      <div className="flex items-center justify-between mb-3">
+        <p
+          className="text-[11px] uppercase tracking-wider font-extrabold"
+          style={{ color: 'var(--text-secondary)' }}
+        >
+          Entity-type filter
+        </p>
+        {filterActive && (
+          <button
+            type="button"
+            onClick={clearFilter}
+            className="text-[11px] font-semibold"
+            style={{ color: 'var(--accent)' }}
+          >
+            Clear ({activeTypes.size})
+          </button>
+        )}
+      </div>
+      <p
+        className="text-[11px] mb-3"
+        style={{ color: 'var(--text-muted)' }}
+      >
+        Tick a row to limit the graph to that type. Untick all to show every
+        entity type.
+      </p>
+      {allTypes.length === 0 ? (
+        <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+          Graph is empty.
+        </p>
+      ) : (
+        <ul className="space-y-1">
+          {allTypes.map((t) => {
+            const checked = filterActive ? activeTypes.has(t) : false;
+            const isOn = !filterActive || checked;
+            const color = entityColor(t);
+            const count = typeCounts[t] ?? 0;
+            const inputId = `filter-${t}`;
+            return (
+              <li key={t}>
+                <label
+                  htmlFor={inputId}
+                  className="flex items-center gap-2.5 px-2 py-2 cursor-pointer transition-colors"
+                  style={{
+                    background: checked ? `${color}10` : 'transparent',
+                    border: `1px solid ${checked ? `${color}33` : 'transparent'}`,
+                    borderRadius: 'var(--radius-md)',
+                    opacity: isOn ? 1 : 0.55,
+                  }}
+                  title={TYPE_DESCRIPTIONS[t] ?? t}
+                >
+                  <input
+                    id={inputId}
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleType(t)}
+                    className="shrink-0 cursor-pointer"
+                    style={{ accentColor: color, width: 14, height: 14 }}
+                    aria-label={`Filter to ${t} entities`}
+                  />
+                  <span className="shrink-0 inline-flex" aria-hidden="true">
+                    <LegendShape type={t} color={color} />
+                  </span>
+                  <span
+                    className="text-[12.5px] font-bold flex-1 truncate"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    {t}
+                  </span>
+                  <span
+                    className="text-[11px] tabular-nums font-semibold"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    {count.toLocaleString()}
+                  </span>
+                </label>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }
@@ -531,6 +744,27 @@ function FloatingInspector({
     setPlacement({ left, top, side });
   }, [anchor.x, anchor.y, container, entity.id]);
 
+  // Escape closes the inspector. Background click also closes (handled by
+  // the parent page's onBackgroundClick), but keyboard users need a path.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  // Move focus into the popover on open so Tab order is sensible and
+  // Escape works without first clicking inside.
+  useEffect(() => {
+    popRef.current?.focus();
+  }, [entity.id]);
+
+  const titleId = `graph-inspector-title-${entity.id}`;
+
   const color = entityColorLocal(entity.entity_type);
   const neighbours = relationships
     .filter((r) => r.source_entity_id === entity.id || r.target_entity_id === entity.id)
@@ -557,7 +791,11 @@ function FloatingInspector({
 
       <div
         ref={popRef}
-        className="absolute card p-3.5 fade-up"
+        role="dialog"
+        aria-modal="false"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className="absolute card p-3.5 fade-up focus:outline-none"
         style={{
           left: `${placement.left}px`,
           top: `${placement.top}px`,
@@ -577,6 +815,7 @@ function FloatingInspector({
               Selected
             </p>
             <p
+              id={titleId}
               className="text-[15px] font-semibold leading-tight truncate"
               style={{ color: 'var(--text-primary)' }}
               title={entity.name}
@@ -587,9 +826,9 @@ function FloatingInspector({
           <button
             onClick={onClose}
             className="text-slate-400 hover:text-slate-700 -m-1 p-1 rounded"
-            title="Close (or click background)"
+            aria-label="Close inspector (Esc)"
           >
-            <X size={14} />
+            <X size={14} aria-hidden="true" />
           </button>
         </div>
 

@@ -21,10 +21,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body className="min-h-screen antialiased">
         <Providers>
-          <div className="flex min-h-screen">
+          <div className="flex flex-col lg:flex-row min-h-screen">
             <Nav />
             <main className="flex-1 overflow-auto">
-              <div className="px-8 py-8 lg:px-12 lg:py-12 max-w-[1280px] fade-up">
+              <div className="px-10 py-10 sm:px-16 sm:py-14 lg:px-24 lg:py-16 max-w-[1320px] mx-auto fade-up">
                 {children}
               </div>
             </main>

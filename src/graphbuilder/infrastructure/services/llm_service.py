@@ -8,6 +8,8 @@ prompt engineering, response validation, and multi-provider support.
 import asyncio
 import logging
 import json
+import os
+import random
 from typing import Dict, List, Optional, Any, Union
 from datetime import datetime, timezone
 from abc import ABC, abstractmethod
@@ -18,6 +20,93 @@ from ...domain.models.processing_models import ProcessingResult
 from ...domain.models.graph_models import EntityType, RelationshipType
 from ..config.settings import GraphBuilderConfig, LLMProvider
 from .metrics import get_metrics
+
+
+# ── 429 / transient-error retry config ──────────────────────────────────
+#
+# When the chunk pipeline runs many concurrent LLM calls (controlled by
+# PROCESSING_PARALLEL_WORKERS), bursting past the provider's rate-limit
+# would otherwise drop chunks on the floor. The retry helper below catches
+# the right exception types — RateLimitError (429), APITimeoutError,
+# APIConnectionError, InternalServerError — and backs off with full jitter.
+# 4xx errors other than 429 (auth, bad-request, etc.) are NOT retried;
+# those are application bugs, not transient.
+#
+# Defaults: 5 attempts × exponential 1s/2s/4s/8s/16s with jitter, capped
+# at 30s per sleep. Honors the Retry-After header on RateLimitError when
+# the provider sends one.
+
+_RETRY_MAX_ATTEMPTS = int(os.getenv("LLM_RETRY_MAX_ATTEMPTS", "5"))
+_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))
+_RETRY_MAX_DELAY = float(os.getenv("LLM_RETRY_MAX_DELAY", "30.0"))
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with full jitter, capped at ``_RETRY_MAX_DELAY``."""
+    base = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
+    return random.uniform(0, base)
+
+
+def _retry_after_seconds(exc: Any) -> Optional[float]:
+    """Extract the Retry-After header from an OpenAI error, if present."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    val = headers.get("Retry-After") or headers.get("retry-after")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _retryable_llm_call(call_fn, logger: logging.Logger):
+    """Run an async LLM API call with backoff retry on rate-limit / transient errors.
+
+    ``call_fn`` is a no-arg async callable that performs the actual provider
+    call (e.g. ``client.chat.completions.create(...)``). All other work
+    (response parsing, metrics, etc.) should happen *outside* this helper —
+    we only want the network call retried, never application-side bugs.
+    """
+    try:
+        import openai  # local import so the module loads even when openai is mocked in tests
+    except ImportError:
+        return await call_fn()  # provider stubbed; nothing to catch
+
+    retryable = (
+        openai.RateLimitError,
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+    )
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        try:
+            return await call_fn()
+        except retryable as exc:
+            last_exc = exc
+            if attempt == _RETRY_MAX_ATTEMPTS - 1:
+                # Last attempt — don't sleep, just re-raise below.
+                break
+            # On 429 prefer the server-suggested delay; otherwise jittered backoff.
+            retry_after = (
+                _retry_after_seconds(exc)
+                if isinstance(exc, openai.RateLimitError)
+                else None
+            )
+            delay = retry_after if retry_after is not None else _backoff_delay(attempt)
+            logger.warning(
+                "LLM %s (attempt %d/%d) — sleeping %.2fs",
+                type(exc).__name__, attempt + 1, _RETRY_MAX_ATTEMPTS, delay,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 class PromptType(Enum):
@@ -752,14 +841,19 @@ RESPOND WITH VALID JSON:
                 {"role": "user", "content": request.prompt}
             ]
             
-            # Execute API call
-            response = await self.client.chat.completions.create(
-                model=self.config.llm.model_name,
-                messages=messages,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                response_format={"type": "json_object"} if self.config.llm.provider in [LLMProvider.OPENAI, LLMProvider.AZURE_OPENAI] else None
-            )
+            # Execute API call. The retry wrapper handles 429s and transient
+            # network errors with exponential-backoff + jitter; application
+            # bugs (4xx other than 429) bubble up unchanged so we don't mask
+            # configuration mistakes behind retries.
+            async def _do_call():
+                return await self.client.chat.completions.create(
+                    model=self.config.llm.model_name,
+                    messages=messages,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                    response_format={"type": "json_object"} if self.config.llm.provider in [LLMProvider.OPENAI, LLMProvider.AZURE_OPENAI] else None
+                )
+            response = await _retryable_llm_call(_do_call, self.logger)
             
             # Calculate processing time
             processing_time = (datetime.now(timezone.utc) - start_time).total_seconds()

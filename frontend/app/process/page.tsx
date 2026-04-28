@@ -44,8 +44,10 @@ export default function ProcessPage() {
   const [url, setUrl] = useState('');
   const [text, setText] = useState('');
   const [label, setLabel] = useState('');
-  const [chunkSize, setChunkSize] = useState<number | ''>('');
-  const [chunkOverlap, setChunkOverlap] = useState<number | ''>('');
+  // Sensible defaults for biomedical text (≈ 1 paragraph / 200 tokens with
+  // a 25% overlap so cross-sentence relationships still get caught).
+  const [chunkSize, setChunkSize] = useState<number | ''>(200);
+  const [chunkOverlap, setChunkOverlap] = useState<number | ''>(50);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -96,21 +98,19 @@ export default function ProcessPage() {
       <header className="space-y-3">
         <div className="flex items-center gap-2 flex-wrap">
           <span
-            className="badge badge-brand inline-flex"
-            style={{ background: 'var(--accent-soft)', border: '2px solid rgba(213,33,44,0.30)' }}
+            className="badge badge-neutral inline-flex"
+            title="The pipeline runs five stages — fetch the source, chunk it into passages, extract entities, extract relationships, then finalise (dedup + persist). You can cancel between stages from the timeline."
           >
-            <Loader2 size={10} className="opacity-80" />
+            <Loader2 size={10} className="opacity-80" aria-hidden="true" />
             5 stages · cancel any time
+            <span className="help-icon ml-0.5">?</span>
           </span>
-          <span className="badge badge-xp"><Sliders size={11} /> Earns XP per chunk</span>
         </div>
-        <h1 className="page-title">Start a Quest</h1>
+        <h1 className="page-title">Process a document</h1>
         <p className="page-desc">
-          Paste a URL or some text and watch the LLM pipeline run live. Five
-          stages —
-          <span className="text-gradient font-bold"> fetch · chunk · entities · relationships · finalize</span>
-          {' '}— stream progress in real time. Cancel any time, no penalty.
-          Every entity you extract levels up your knowledge graph!
+          Paste a URL or raw text and watch the LLM pipeline run live: fetch ·
+          chunk · entities · relationships · finalize. Progress streams in real
+          time and you can cancel between stages.
         </p>
       </header>
 
@@ -171,11 +171,11 @@ export default function ProcessPage() {
               className="text-xs font-medium flex items-center gap-1.5"
               style={{ color: 'var(--text-secondary)' }}
             >
-              <Sliders size={12} />
+              <Sliders size={12} aria-hidden="true" />
               {showAdvanced ? 'Hide' : 'Show'} chunking options
             </button>
             {showAdvanced && (
-              <div className="grid grid-cols-2 gap-3 mt-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
                 <div>
                   <FieldLabel icon={Sliders} label="Chunk size (tokens)" optional />
                   <input
@@ -185,9 +185,15 @@ export default function ProcessPage() {
                     onChange={(e) =>
                       setChunkSize(e.target.value === '' ? '' : Number(e.target.value))
                     }
-                    placeholder="512"
+                    placeholder="200"
                     disabled={isRunning}
                   />
+                  <p
+                    className="text-[11px] mt-1.5 font-medium"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Default 200. Suggested range 128–512.
+                  </p>
                 </div>
                 <div>
                   <FieldLabel icon={Sliders} label="Chunk overlap" optional />
@@ -201,6 +207,12 @@ export default function ProcessPage() {
                     placeholder="50"
                     disabled={isRunning}
                   />
+                  <p
+                    className="text-[11px] mt-1.5 font-medium"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    Default 50 (≈ 25% of chunk size). Suggested ≈ 15–25%.
+                  </p>
                 </div>
               </div>
             )}
@@ -214,22 +226,22 @@ export default function ProcessPage() {
             >
               {isRunning ? (
                 <>
-                  <Loader2 size={16} className="animate-spin" /> Processing…
+                  <Loader2 size={16} className="animate-spin" aria-hidden="true" /> Processing…
                 </>
               ) : (
-                <>Begin Quest →</>
+                <>Start extraction</>
               )}
             </button>
             {job && !isRunning && (
               <button type="button" onClick={reset} className="btn-ghost">
-                New quest
+                New job
               </button>
             )}
           </div>
 
           {submitError && (
             <p className="text-sm flex items-center gap-2" style={{ color: 'var(--danger)' }}>
-              <XCircle size={14} /> {submitError}
+              <XCircle size={14} aria-hidden="true" /> {submitError}
             </p>
           )}
         </form>
@@ -257,7 +269,7 @@ function ResultSummary({ result }: { result: Record<string, unknown> }) {
     { label: 'Duration (s)', value: Number(result.duration_seconds ?? 0) },
   ];
   return (
-    <div className="card p-5">
+    <div className="card p-6">
       <p className="field-label flex items-center gap-2">
         <CheckCircle2 size={13} style={{ color: 'var(--success)' }} />
         Extraction summary

@@ -828,36 +828,18 @@ class ProcessDocumentUseCase(UseCase):
     # Embedding / dedup helpers
     # ------------------------------------------------------------------
 
-    _embedding_model = None  # class-level lazy cache
-
-    def _get_embedding_model(self):
-        """Lazy-load sentence-transformers model (shared across calls)."""
-        if ProcessDocumentUseCase._embedding_model is None:
-            try:
-                from sentence_transformers import SentenceTransformer  # type: ignore
-                ProcessDocumentUseCase._embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-            except ImportError:
-                self.logger.warning("sentence-transformers not installed; vector dedup disabled.")
-                return None
-        return ProcessDocumentUseCase._embedding_model
-
     def _embed_entity_text(self, entity: GraphEntity) -> Optional[list]:
         """Produce an embedding for an entity name + description."""
-        model = self._get_embedding_model()
-        if model is None:
-            return None
+        from ...infrastructure.services.embedding_factory import embed
         parts = [entity.name]
         if entity.description:
             parts.append(entity.description)
-        text = " — ".join(parts)
-        return model.encode(text, convert_to_numpy=True).tolist()
+        return embed(" — ".join(parts))
 
     def _embed_text(self, text: str) -> Optional[list]:
         """Produce an embedding for arbitrary text."""
-        model = self._get_embedding_model()
-        if model is None or not text:
-            return None
-        return model.encode(text, convert_to_numpy=True).tolist()
+        from ...infrastructure.services.embedding_factory import embed
+        return embed(text)
 
     async def _execute_graph_construction(self, task: ProcessingTask) -> ProcessingResult:
         """Execute graph construction task."""

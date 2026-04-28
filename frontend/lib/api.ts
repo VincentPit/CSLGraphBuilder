@@ -87,6 +87,28 @@ export const getEntities = (params?: { entity_type?: string; limit?: number; off
 export const getRelationships = (params?: { limit?: number; offset?: number }) =>
   apiClient.get<{ items: Relationship[]; total: number; limit: number; offset: number }>('/graph/relationships', { params }).then((r) => r.data);
 
+export interface Subgraph {
+  entities: Entity[];
+  relationships: Relationship[];
+  seed_count: number;
+  expanded_count: number;
+  seed_per_type: Record<string, number>;
+  total_entities: number;
+  total_relationships: number;
+}
+
+/** Fetch a self-consistent slice of the graph for visualization.
+ *  Seeds are picked **per entity type** (newest `per_type_limit` of each),
+ *  excluding any types listed in `exclude_types` (default `"Document"`).
+ *  Every relationship in the response has both endpoints in the entity
+ *  list, so the caller doesn't need a bipartite filter. */
+export const getSubgraph = (params?: {
+  per_type_limit?: number;
+  exclude_types?: string;
+  max_neighbors?: number;
+}) =>
+  apiClient.get<Subgraph>('/graph/subgraph', { params }).then((r) => r.data);
+
 // ── Documents ────────────────────────────────────────────────────────────
 
 export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';

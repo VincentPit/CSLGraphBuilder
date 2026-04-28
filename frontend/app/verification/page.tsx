@@ -6,7 +6,7 @@ import { ShieldCheck, ChevronDown, ChevronUp, Loader2, CheckSquare, Square, Aler
 
 function Toggle({ label, desc, checked, onChange }: { label: string; desc: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
-    <label className="card p-4 cursor-pointer transition" style={checked ? { borderColor: 'var(--accent)', background: 'var(--accent-muted)' } : {}}>
+    <label className="card p-5 cursor-pointer transition" style={checked ? { borderColor: 'var(--accent)', background: 'var(--accent-muted)' } : {}}>
       <div className="flex justify-between items-center mb-1">
         <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{label}</span>
         <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="accent-[var(--accent)]" />
@@ -214,7 +214,7 @@ export default function VerificationPage() {
             </button>
           </form>
 
-          {textError && <div className="card p-4 text-sm" style={{ color: 'var(--danger)' }}>{textError}</div>}
+          {textError && <div className="card p-5 text-sm" style={{ color: 'var(--danger)' }}>{textError}</div>}
 
           {textReport && (
             <div className="space-y-4">
@@ -226,7 +226,7 @@ export default function VerificationPage() {
                   ['Skipped', textReport.skipped],
                   ['Best Confidence', `${(textReport.best_confidence * 100).toFixed(0)}%`],
                 ].map(([label, value]) => (
-                  <div key={String(label)} className="card p-4 text-center">
+                  <div key={String(label)} className="card p-5 text-center">
                     <p className="field-label !mb-1 text-center">{label}</p>
                     <p className="text-2xl font-semibold" style={{ color: 'var(--text-primary)' }}>{value}</p>
                   </div>
@@ -374,7 +374,7 @@ export default function VerificationPage() {
         </button>
       </form>
 
-      {error && <div className="card p-4 text-sm" style={{ color: 'var(--danger)' }}>{error}</div>}
+      {error && <div className="card p-5 text-sm" style={{ color: 'var(--danger)' }}>{error}</div>}
 
       {report && (
         <div className="space-y-4">
@@ -385,7 +385,7 @@ export default function VerificationPage() {
               ['Failed', report.failed],
               ['Skipped', report.skipped],
             ].map(([label, value]) => (
-              <div key={String(label)} className="card p-4 text-center">
+              <div key={String(label)} className="card p-5 text-center">
                 <p className="field-label !mb-1 text-center">{label}</p>
                 <p className="text-2xl font-semibold" style={{ color: 'var(--text-primary)' }}>{value}</p>
               </div>
@@ -465,16 +465,16 @@ export default function VerificationPage() {
             </button>
           </form>
 
-          {conflictError && <div className="card p-4 text-sm" style={{ color: 'var(--danger)' }}>{conflictError}</div>}
+          {conflictError && <div className="card p-5 text-sm" style={{ color: 'var(--danger)' }}>{conflictError}</div>}
 
           {conflictReport && (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-3">
-                <div className="card p-4 text-center">
+                <div className="card p-5 text-center">
                   <p className="field-label !mb-1 text-center">Pairs Checked</p>
                   <p className="text-2xl font-semibold" style={{ color: 'var(--text-primary)' }}>{conflictReport.total_checked}</p>
                 </div>
-                <div className="card p-4 text-center">
+                <div className="card p-5 text-center">
                   <p className="field-label !mb-1 text-center">Conflicts Found</p>
                   <p className="text-2xl font-semibold" style={{ color: conflictReport.conflicts_found > 0 ? 'var(--danger)' : 'var(--text-primary)' }}>
                     {conflictReport.conflicts_found}
@@ -490,7 +490,7 @@ export default function VerificationPage() {
               ) : (
                 <div className="space-y-3">
                   {conflictReport.conflicts.map((c, i) => (
-                    <div key={i} className="card p-4 space-y-2" style={c.severity === 'high' ? { borderColor: 'var(--danger)' } : c.severity === 'medium' ? { borderColor: '#d97706' } : {}}>
+                    <div key={i} className="card p-5 space-y-2" style={c.severity === 'high' ? { borderColor: 'var(--danger)' } : c.severity === 'medium' ? { borderColor: '#d97706' } : {}}>
                       <div className="flex items-center gap-2">
                         <span className={`badge ${c.severity === 'high' ? 'badge-danger' : c.severity === 'medium' ? 'badge-warning' : 'badge-neutral'}`}>
                           {c.severity}
@@ -563,7 +563,7 @@ export default function VerificationPage() {
               {reviewData.items.map((item) => {
                 const c = item.conflict;
                 return (
-                  <div key={item.review_id} className="card p-4 space-y-3" style={{ borderColor: 'var(--danger)' }}>
+                  <div key={item.review_id} className="card p-5 space-y-3" style={{ borderColor: 'var(--danger)' }}>
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className={`badge ${c.severity === 'high' ? 'badge-danger' : c.severity === 'medium' ? 'badge-warning' : 'badge-neutral'}`}>
                         {c.severity}

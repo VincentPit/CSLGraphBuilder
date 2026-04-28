@@ -1,5 +1,24 @@
 # ── GraphBuilder API ─────────────────────────────────────────────────────────
-# Multi-stage build: builder → runtime
+# Multi-stage build: builder → runtime.
+#
+# This image is CPU-only — sentence-transformers pulls a CPU build of torch
+# from PyPI on `python:3.11-slim`, so the embedding stack runs through the
+# single-worker asyncio.Lock + executor path. The GPU embedding pool
+# (gpu_embedding_pool.py) detects CUDA at first use and stays disabled
+# here, falling through to the CPU path.
+#
+# To run with the GPU pool active:
+#   1. Switch the base image to nvidia/cuda:12.1-cudnn-runtime-ubuntu22.04
+#      (or matching CUDA version for your host driver) and install Python
+#      3.11 + the same requirements.
+#   2. Replace `pip install` of torch (transitive) with the CUDA-enabled
+#      build: `pip install torch --index-url https://download.pytorch.org/whl/cu121`
+#   3. Add `runtime: nvidia` (or the modern `deploy.resources.reservations.devices`
+#      block) to the api service in docker-compose.yml so the container
+#      can see the GPU.
+# The EMBEDDING_GPU_* env vars in docker-compose.yml are already wired
+# through and will become live once those changes land.
+
 FROM python:3.11-slim AS builder
 
 WORKDIR /build

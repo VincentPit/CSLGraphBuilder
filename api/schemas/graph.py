@@ -60,6 +60,28 @@ class RelationshipListResponse(BaseModel):
     offset: int
 
 
+class SubgraphResponse(BaseModel):
+    """A coherent slice of the graph for visualization.
+
+    ``entities`` always contains every endpoint referenced by any
+    relationship in ``relationships``, so the frontend never needs to
+    drop edges due to missing endpoints.
+
+    Seeding is **per type**: the newest ``per_type_limit`` entities of
+    each ``entity_type`` are selected, optionally excluding configured
+    types (e.g. ``Document``).  Expansion entities pulled in to satisfy
+    edges are not subject to the per-type cap.
+    """
+
+    entities: List[EntityResponse]
+    relationships: List[RelationshipResponse]
+    seed_count: int                       # total seed entities across all types
+    expanded_count: int                   # extra entities pulled in to satisfy edges
+    seed_per_type: dict[str, int]         # how many seeds picked from each type
+    total_entities: int                   # total in the graph (pre-filter)
+    total_relationships: int
+
+
 # ── Conflict Detection ───────────────────────────────────────────────────
 
 class ConflictCheckRequest(BaseModel):

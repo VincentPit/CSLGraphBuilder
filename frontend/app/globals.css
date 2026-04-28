@@ -3,36 +3,33 @@
 @tailwind utilities;
 
 /* ─────────────────────────────────────────────────────────────────
-   Duolingo-style design system, CSL Behring brand-coded.
+   Design system — clean, rectangular, restrained palette.
 
-   Big ideas from Duolingo we adopt:
-   - Chunky, friendly typography (Nunito, heavier weights, slightly
-     wider tracking on headings)
-   - "3D" buttons — a darker shadow underneath that gets crushed on
-     :active so the button feels like a physical key
-   - Generous border-radius — pills and rounded squircles
-   - Saturated, encouraging palette: brand red as primary, Duolingo-ish
-     green for success, warm gold for warnings/XP
-   - Bouncy state transitions; tiny celebration cues (sparkle, pop)
-   - Gamification chrome: progress bars, achievement chips, streak
-     pulse, XP-style number tickers
+   Principles:
+   - Rectangular (2–4px corner radius); no pills, no squircles.
+   - One brand colour: CSL red. Status colours retained for semantic
+     signalling (success / danger / warning / info) but used sparingly.
+   - Decoration is minimal — no mesh-gradient backdrops, no
+     gamification chrome, no celebration palettes.
+   - Type: still Nunito for headings (warm but readable) + Inter for
+     body / numbers. Weights remain firm.
    ───────────────────────────────────────────────────────────────── */
 
 :root {
-  /* Surfaces — warmer, friendlier than the previous neutral grey */
-  --bg-app:        #fff8f6;          /* warm off-white */
+  /* Surfaces — warm off-white throughout. */
+  --bg-app:        #fff8f6;
   --bg-app-tint-1: #fff0ea;
   --bg-app-tint-2: #fff8e8;
   --bg-card:       #ffffff;
-  --bg-card-soft:  rgba(255, 255, 255, 0.85);
+  --bg-card-soft:  rgba(255, 255, 255, 0.92);
   --bg-muted:      #f4eee9;
   --bg-input:      #ffffff;
 
-  /* Sidebar — keep dark for contrast, but warmer */
+  /* Sidebar — dark for visual contrast and brand presence. */
   --bg-sidebar:        #1a1218;
   --bg-sidebar-grad:   linear-gradient(180deg, #20161d 0%, #14101a 100%);
   --bg-sidebar-hover:  rgba(255, 255, 255, 0.06);
-  --bg-sidebar-active: rgba(213, 33, 44, 0.25);
+  --bg-sidebar-active: rgba(213, 33, 44, 0.22);
 
   /* Borders */
   --border-default: #ead5cc;
@@ -47,51 +44,51 @@
   --text-sidebar:         #c8a89c;
   --text-sidebar-active:  #ffffff;
 
-  /* CSL brand — primary CTA colour, with a darker "shadow" tone for
-     the 3D button effect */
+  /* CSL brand — primary CTA, with a darker shadow tone for the
+     chunky-button bottom edge. */
   --accent:        #d5212c;
-  --accent-hover:  #e8323d;          /* lighter on hover (counter-intuitive but feels Duolingo) */
-  --accent-shadow: #9a131c;          /* darker — used for the 3D bottom edge */
+  --accent-hover:  #e8323d;
+  --accent-shadow: #9a131c;
   --accent-soft:   rgba(213, 33, 44, 0.08);
   --accent-muted:  rgba(213, 33, 44, 0.13);
   --accent-2:      #ef4444;
-  --accent-3:      #f59e0b;
+  --accent-3:      #d5212c;
 
-  /* Status */
-  --success:        #58cc02;          /* Duolingo green */
-  --success-hover:  #6dd91c;
-  --success-shadow: #429b00;
-  --success-soft:   rgba(88, 204, 2, 0.10);
-  --success-muted:  #effae0;
-  --danger:         #ea2b2b;
-  --danger-shadow:  #a91313;
-  --danger-soft:    rgba(234, 43, 43, 0.10);
-  --danger-muted:   #fee9e9;
-  --warning:        #ffc800;          /* gold — XP / achievement vibe */
-  --warning-shadow: #c79900;
-  --warning-muted:  #fff5d2;
-  --info:           #1cb0f6;          /* Duolingo blue */
-  --info-shadow:    #0080c2;
-  --info-muted:     #dff4ff;
+  /* Status — bright enough to register at a glance. */
+  --success:        #2f9e3f;
+  --success-hover:  #36b048;
+  --success-shadow: #1f6b2c;
+  --success-soft:   rgba(47, 158, 63, 0.10);
+  --success-muted:  #e6f5e9;
+  --danger:         #d92929;
+  --danger-shadow:  #9c1414;
+  --danger-soft:    rgba(217, 41, 41, 0.10);
+  --danger-muted:   #fde9e9;
+  --warning:        #d97706;
+  --warning-shadow: #9c4f04;
+  --warning-muted:  #fdf0d4;
+  --info:           #1d8ec7;
+  --info-shadow:    #11628c;
+  --info-muted:     #e0f0fa;
 
-  /* Shape — much rounder than before */
-  --radius-sm: 10px;
-  --radius-md: 14px;
-  --radius-lg: 20px;
-  --radius-xl: 28px;
-  --radius-pill: 999px;
+  /* Shape — rectangular but not razor-sharp. Pills are out (per feedback). */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+  --radius-pill: 4px;
 
-  /* Shadows */
+  /* Shadows — restored depth. */
   --shadow-sm:    0 1px 2px rgba(0, 0, 0, 0.04);
-  --shadow-card:  0 2px 4px rgba(45, 27, 20, 0.05), 0 1px 2px rgba(45, 27, 20, 0.04);
-  --shadow-lift:  0 12px 28px -10px rgba(213, 33, 44, 0.20), 0 4px 10px -4px rgba(45, 27, 20, 0.08);
-  --shadow-glow:  0 0 0 4px rgba(213, 33, 44, 0.18);
+  --shadow-card:  0 1px 3px rgba(34, 21, 17, 0.06), 0 1px 2px rgba(34, 21, 17, 0.04);
+  --shadow-lift:  0 12px 24px -8px rgba(213, 33, 44, 0.18), 0 4px 8px -4px rgba(34, 21, 17, 0.08);
+  --shadow-glow:  0 0 0 3px rgba(213, 33, 44, 0.18);
 
-  /* Gradients */
-  --grad-brand:        linear-gradient(135deg, #d5212c 0%, #ef4444 45%, #f59e0b 100%);
-  --grad-brand-soft:   linear-gradient(135deg, rgba(213,33,44,.10) 0%, rgba(239,68,68,.08) 50%, rgba(245,158,11,.10) 100%);
-  --grad-success:      linear-gradient(135deg, #58cc02 0%, #1cb0f6 100%);
-  --grad-celebration:  linear-gradient(135deg, #58cc02 0%, #ffc800 50%, #d5212c 100%);
+  /* Brand title gradient (anchor element on every page). */
+  --grad-brand:        linear-gradient(135deg, #2d1b14 0%, #d5212c 100%);
+  --grad-brand-soft:   linear-gradient(135deg, rgba(213,33,44,.10) 0%, rgba(213,33,44,.04) 100%);
+  --grad-success:      var(--success);
+  --grad-celebration:  var(--accent);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -112,79 +109,68 @@ body {
   font-weight: 500;       /* slightly heavier baseline — Duolingo feel */
 }
 
-/* Mesh-gradient backdrop — warm CSL+Duolingo blooms */
+/* Single-bloom warm backdrop — one red radial, very subtle. */
 body::before {
   content: '';
   position: fixed;
   inset: 0;
   z-index: -2;
   background:
-    radial-gradient(circle at 12% 8%, rgba(213,33,44,.10), transparent 45%),
-    radial-gradient(circle at 92% 14%, rgba(255,200,0,.10), transparent 42%),
-    radial-gradient(circle at 78% 92%, rgba(88,204,2,.08), transparent 50%),
-    radial-gradient(circle at 6% 88%, rgba(28,176,246,.06), transparent 45%);
+    radial-gradient(circle at 12% 8%, rgba(213,33,44,0.06), transparent 50%);
   pointer-events: none;
 }
 
 /* ─────────────────────────────────────────────────────────────────
-   Cards — rounder, slightly chunkier shadow
+   Cards — rectangular but with real depth. Hover gets the lift +
+   accent border so cards feel responsive without rounding the corners.
    ───────────────────────────────────────────────────────────────── */
 .card {
   background: var(--bg-card);
-  border: 2px solid var(--border-default);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
   transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
 }
 
 .card-hover:hover {
-  transform: translateY(-3px);
-  box-shadow: var(--shadow-lift);
+  transform: translateY(-2px);
   border-color: var(--accent);
+  box-shadow: var(--shadow-lift);
 }
 
-/* Lesson-node style — used for hero / quick-action tiles */
+/* Lesson-node style — adds the chunky bottom shadow for action tiles
+   and stat cards. Rectangular corners; the depth comes from the
+   shadow, not the radius. */
 .card-chunky {
   background: var(--bg-card);
-  border: 2px solid var(--border-default);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
-  box-shadow: 0 4px 0 var(--border-default);
+  box-shadow: 0 3px 0 var(--border-default), var(--shadow-card);
   transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.18s ease;
 }
 .card-chunky:hover {
   border-color: var(--accent);
-  box-shadow: 0 4px 0 var(--accent-shadow);
+  box-shadow: 0 3px 0 var(--accent-shadow), var(--shadow-card);
 }
 .card-chunky:active {
   transform: translateY(2px);
-  box-shadow: 0 2px 0 var(--accent-shadow);
+  box-shadow: 0 1px 0 var(--accent-shadow), var(--shadow-card);
 }
 
 .card-glass {
   background: var(--bg-card-soft);
-  backdrop-filter: blur(14px) saturate(140%);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
-  border: 2px solid rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
 }
 
 .card-bordered-grad {
-  position: relative;
   background: var(--bg-card);
+  border: 1px solid var(--accent);
   border-radius: var(--radius-lg);
-}
-.card-bordered-grad::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  padding: 2px;
-  border-radius: inherit;
-  background: var(--grad-brand);
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-          mask-composite: exclude;
-  pointer-events: none;
+  box-shadow: var(--shadow-card);
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -192,18 +178,22 @@ body::before {
    ───────────────────────────────────────────────────────────────── */
 .input {
   width: 100%;
-  padding: 12px 16px;
-  font-size: 0.9375rem;
-  font-weight: 600;
+  /* 16px on mobile prevents iOS auto-zoom on focus; shrinks at sm: and up. */
+  padding: 12px 14px;
+  font-size: 1rem;
+  font-weight: 500;
   line-height: 1.5;
   color: var(--text-primary);
   background: var(--bg-input);
-  border: 2px solid var(--border-input);
+  border: 1px solid var(--border-input);
   border-radius: var(--radius-md);
   outline: none;
-  transition: border-color 0.18s, box-shadow 0.18s, background 0.18s;
+  transition: border-color 0.18s, box-shadow 0.18s;
 }
-.input::placeholder { color: var(--text-muted); font-weight: 500; }
+@media (min-width: 640px) {
+  .input { padding: 10px 14px; font-size: 0.9375rem; }
+}
+.input::placeholder { color: var(--text-muted); font-weight: 400; }
 .input:hover { border-color: var(--text-muted); }
 .input:focus {
   border-color: var(--accent);
@@ -216,105 +206,12 @@ textarea.input { resize: vertical; }
    Buttons — Duolingo-style 3D press
    ───────────────────────────────────────────────────────────────── */
 
-/* Generic chunky button mixin */
-.btn-chunky {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 12px 24px;
-  font-size: 0.9375rem;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  line-height: 1;
-  border: none;
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: transform 0.08s ease, box-shadow 0.08s ease, filter 0.18s ease;
-  user-select: none;
-}
-.btn-chunky:active {
-  transform: translateY(2px);
-  filter: brightness(1.04);
-}
-.btn-chunky:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-  filter: saturate(0.5);
-}
-
-/* Primary — CSL red CTA (the "Continue" button) */
-.btn-primary {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 12px 22px;
-  font-size: 0.9375rem;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  line-height: 1;
-  color: #fff;
-  background: var(--accent);
-  border: none;
-  border-radius: var(--radius-md);
-  box-shadow: 0 4px 0 var(--accent-shadow);
-  cursor: pointer;
-  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.18s ease;
-  user-select: none;
-}
-.btn-primary:hover { background: var(--accent-hover); }
-.btn-primary:active {
-  transform: translateY(4px);
-  box-shadow: 0 0 0 var(--accent-shadow);
-}
-.btn-primary:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-  background: var(--text-muted);
-  box-shadow: 0 4px 0 var(--border-default);
-}
-
-/* Success / "Nice!" — Duolingo green */
-.btn-success {
-  composes: btn-chunky;
-  color: #fff;
-  background: var(--success);
-  box-shadow: 0 4px 0 var(--success-shadow);
-}
-/* Tailwind composes don't work here without a postcss plugin; redefine */
-.btn-success {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 12px 22px;
-  font-size: 0.9375rem;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  line-height: 1;
-  color: #fff;
-  background: var(--success);
-  border: none;
-  border-radius: var(--radius-md);
-  box-shadow: 0 4px 0 var(--success-shadow);
-  cursor: pointer;
-  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.18s ease;
-}
-.btn-success:hover { background: var(--success-hover); }
-.btn-success:active {
-  transform: translateY(4px);
-  box-shadow: 0 0 0 var(--success-shadow);
-}
-.btn-success:disabled { opacity: 0.55; cursor: not-allowed; }
-
-/* Danger / Reject */
+/* Buttons — chunky 3D press effect with rectangular corners. Variants
+   share a single base for padding/typography; only colour + bottom-edge
+   shadow vary. */
+.btn-chunky,
+.btn-primary,
+.btn-success,
 .btn-danger {
   position: relative;
   display: inline-flex;
@@ -324,25 +221,75 @@ textarea.input { resize: vertical; }
   padding: 12px 22px;
   font-size: 0.9375rem;
   font-weight: 800;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  letter-spacing: 0.03em;
   line-height: 1;
   color: #fff;
-  background: var(--danger);
   border: none;
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 0 var(--danger-shadow);
   cursor: pointer;
   transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.18s ease;
+  user-select: none;
+  text-transform: none;
 }
-.btn-danger:hover { filter: brightness(1.05); }
+
+.btn-chunky:active,
+.btn-primary:active,
+.btn-success:active,
 .btn-danger:active {
   transform: translateY(4px);
-  box-shadow: 0 0 0 var(--danger-shadow);
 }
-.btn-danger:disabled { opacity: 0.55; cursor: not-allowed; }
 
-/* Ghost — secondary, also chunky but less heavy */
+.btn-chunky:disabled,
+.btn-primary:disabled,
+.btn-success:disabled,
+.btn-danger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Focus ring composes with the 3D shadow. */
+.btn-primary:focus-visible {
+  outline: none;
+  box-shadow: 0 4px 0 var(--accent-shadow), 0 0 0 4px var(--accent-soft);
+}
+.btn-success:focus-visible {
+  outline: none;
+  box-shadow: 0 4px 0 var(--success-shadow), 0 0 0 4px var(--success-soft);
+}
+.btn-danger:focus-visible {
+  outline: none;
+  box-shadow: 0 4px 0 var(--danger-shadow), 0 0 0 4px var(--danger-soft);
+}
+
+/* Primary — CSL red CTA */
+.btn-primary {
+  background: var(--accent);
+  box-shadow: 0 4px 0 var(--accent-shadow);
+}
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:active { box-shadow: 0 0 0 var(--accent-shadow); }
+.btn-primary:disabled {
+  background: var(--text-muted);
+  box-shadow: 0 4px 0 var(--border-default);
+}
+
+/* Success — approve actions */
+.btn-success {
+  background: var(--success);
+  box-shadow: 0 4px 0 var(--success-shadow);
+}
+.btn-success:hover { background: var(--success-hover); }
+.btn-success:active { box-shadow: 0 0 0 var(--success-shadow); }
+
+/* Danger — destructive actions */
+.btn-danger {
+  background: var(--danger);
+  box-shadow: 0 4px 0 var(--danger-shadow);
+}
+.btn-danger:hover { filter: brightness(1.05); }
+.btn-danger:active { box-shadow: 0 0 0 var(--danger-shadow); }
+
+/* Ghost — secondary action; lighter chunky shadow */
 .btn-ghost {
   display: inline-flex;
   align-items: center;
@@ -351,25 +298,29 @@ textarea.input { resize: vertical; }
   padding: 10px 18px;
   font-size: 0.875rem;
   font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
   color: var(--text-secondary);
   background: var(--bg-card);
-  border: 2px solid var(--border-default);
+  border: 1.5px solid var(--border-default);
   border-radius: var(--radius-md);
   box-shadow: 0 2px 0 var(--border-default);
   cursor: pointer;
   transition: all 0.12s ease;
+  text-transform: none;
 }
 .btn-ghost:hover {
-  background: var(--bg-card);
-  color: var(--text-primary);
+  color: var(--accent);
   border-color: var(--accent);
   box-shadow: 0 2px 0 var(--accent);
 }
 .btn-ghost:active {
   transform: translateY(2px);
   box-shadow: 0 0 0 var(--accent);
+}
+.btn-ghost:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 2px 0 var(--accent), 0 0 0 4px var(--accent-soft);
 }
 .btn-ghost.active {
   background: var(--accent-muted);
@@ -378,42 +329,65 @@ textarea.input { resize: vertical; }
 }
 .btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* Icon-only button. Always include an aria-label when using this. */
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  border: 1.5px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: 0 2px 0 var(--border-default);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.btn-icon:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 2px 0 var(--accent);
+}
+.btn-icon:active {
+  transform: translateY(2px);
+  box-shadow: 0 0 0 var(--accent);
+}
+.btn-icon:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 2px 0 var(--accent), 0 0 0 4px var(--accent-soft);
+}
+.btn-icon:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ─────────────────────────────────────────────────────────────────
-   Badges / pills
+   Badges — rectangular pills (4px radius), readable contrast.
    ───────────────────────────────────────────────────────────────── */
 .badge {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  padding: 5px 12px;
+  padding: 4px 10px;
   font-size: 0.6875rem;
   font-weight: 800;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
-  border-radius: var(--radius-pill);
-  line-height: 1.4;
+  border-radius: var(--radius-sm);
+  line-height: 1.5;
 }
-.badge-success { background: var(--success-soft); color: #2f7a00; border: 1.5px solid rgba(88,204,2,0.30); }
-.badge-danger  { background: var(--danger-soft);  color: #b91c1c; border: 1.5px solid rgba(234,43,43,0.30); }
-.badge-warning { background: var(--warning-muted); color: #92400e; border: 1.5px solid rgba(255,200,0,0.45); }
-.badge-neutral { background: var(--bg-muted);      color: var(--text-secondary); border: 1.5px solid var(--border-default); }
-.badge-brand   { background: var(--accent-muted);  color: var(--accent-hover); border: 1.5px solid rgba(213,33,44,0.30); }
-.badge-info    { background: var(--info-muted);    color: #075e8f; border: 1.5px solid rgba(28,176,246,0.30); }
+.badge-success { background: var(--success-muted); color: var(--success-shadow); border: 1px solid rgba(47,158,63,0.32); }
+.badge-danger  { background: var(--danger-muted);  color: var(--danger-shadow);  border: 1px solid rgba(217,41,41,0.32); }
+.badge-warning { background: var(--warning-muted); color: var(--warning-shadow); border: 1px solid rgba(217,119,6,0.32); }
+.badge-neutral { background: var(--bg-muted);      color: var(--text-primary);   border: 1px solid var(--border-default); }
+.badge-brand   { background: var(--accent-muted);  color: var(--accent-shadow);  border: 1px solid rgba(213,33,44,0.30); }
+.badge-info    { background: var(--info-muted);    color: var(--info-shadow);    border: 1px solid rgba(29,142,199,0.32); }
 
-/* XP-style chip — gold gradient with a little sparkle */
-.badge-xp {
-  background: linear-gradient(135deg, #ffe162 0%, #ffc800 100%);
-  color: #5a4400;
-  border: 1.5px solid rgba(255,200,0,0.55);
-  box-shadow: 0 2px 0 var(--warning-shadow);
-}
-
-/* Streak chip — fire colour */
+/* Aliases retained for legacy refs — rendered as neutral badges. */
+.badge-xp,
 .badge-streak {
-  background: linear-gradient(135deg, #ff7a59 0%, #ff3d00 100%);
-  color: #fff;
-  border: 1.5px solid rgba(255, 61, 0, 0.40);
-  box-shadow: 0 2px 0 #b91c00;
+  background: var(--bg-muted);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -445,7 +419,7 @@ textarea.input { resize: vertical; }
   color: var(--text-secondary);
   margin-top: 8px;
   line-height: 1.55;
-  max-width: 60ch;
+  max-width: 65ch;
 }
 
 .text-gradient {
@@ -456,37 +430,33 @@ textarea.input { resize: vertical; }
 }
 
 .text-celebrate {
-  background: var(--grad-celebration);
-  -webkit-background-clip: text;
-          background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: var(--accent);
   font-weight: 900;
 }
 
 /* ─────────────────────────────────────────────────────────────────
-   Progress bar — chunky, lesson-bar style
+   Progress bar — flat rectangle
    ───────────────────────────────────────────────────────────────── */
 .progress-bar {
   width: 100%;
-  height: 14px;
+  height: 12px;
   background: var(--bg-muted);
-  border: 2px solid var(--border-default);
-  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
   overflow: hidden;
   position: relative;
 }
 .progress-bar > .progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, var(--success) 0%, #6dd91c 100%);
-  border-radius: var(--radius-pill);
+  background: linear-gradient(180deg, var(--info) 0%, var(--info-shadow) 100%);
   transition: width 0.4s cubic-bezier(.2,.7,.2,1);
-  box-shadow: inset 0 -3px 0 rgba(0,0,0,0.10), inset 0 3px 0 rgba(255,255,255,0.25);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.18);
 }
 .progress-bar.brand > .progress-fill {
-  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-3) 100%);
+  background: linear-gradient(180deg, var(--accent) 0%, var(--accent-shadow) 100%);
 }
 
-/* Ring progress — for streaks / completion */
+/* Ring progress — kept circular by necessity (it IS a ring). */
 .ring-stat {
   display: inline-flex;
   align-items: center;
@@ -612,11 +582,25 @@ textarea.input { resize: vertical; }
 }
 ::-webkit-scrollbar-thumb:hover { background: rgba(45, 27, 20, 0.30); }
 
-/* Focus ring (keyboard) */
+/* Focus ring (keyboard) — chunky button variants override this with their
+   own composed shadow rings (see .btn-primary:focus-visible etc.). */
 :focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 3px;
   border-radius: 4px;
+}
+
+/* Visually hidden, but available to assistive tech. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -629,17 +613,17 @@ textarea.input { resize: vertical; }
 .tip[data-tip]::after {
   content: attr(data-tip);
   position: absolute;
-  bottom: calc(100% + 10px);
+  bottom: calc(100% + 8px);
   left: 50%;
   transform: translateX(-50%) translateY(4px);
   padding: 6px 10px;
-  background: #2d1b14;
-  color: #fff8f6;
+  background: var(--text-primary);
+  color: #ffffff;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 600;
   white-space: nowrap;
-  border-radius: 8px;
-  box-shadow: 0 4px 0 #1a0e09;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-card);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s ease, transform 0.15s ease;
@@ -648,11 +632,11 @@ textarea.input { resize: vertical; }
 .tip[data-tip]::before {
   content: '';
   position: absolute;
-  bottom: calc(100% + 5px);
+  bottom: calc(100% + 3px);
   left: 50%;
   transform: translateX(-50%);
-  border: 5px solid transparent;
-  border-top-color: #2d1b14;
+  border: 4px solid transparent;
+  border-top-color: var(--text-primary);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s ease;
@@ -669,14 +653,14 @@ textarea.input { resize: vertical; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px; height: 18px;
-  border-radius: 999px;
+  width: 16px; height: 16px;
+  border-radius: var(--radius-sm);
   background: var(--bg-muted);
   color: var(--text-secondary);
-  font-size: 11px;
-  font-weight: 800;
+  font-size: 10px;
+  font-weight: 700;
   cursor: help;
-  border: 1.5px solid var(--border-default);
+  border: 1px solid var(--border-default);
   transition: all 0.15s;
 }
 .help-icon:hover {
@@ -685,42 +669,41 @@ textarea.input { resize: vertical; }
   border-color: rgba(213,33,44,0.30);
 }
 
-/* Empty state — friendly mascot vibe */
+/* Empty state */
 .empty-state {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 14px;
-  padding: 36px 20px;
+  gap: 10px;
+  padding: 28px 20px;
   text-align: center;
   color: var(--text-muted);
 }
 .empty-state .empty-icon {
-  width: 64px; height: 64px;
-  border-radius: 999px;
+  width: 56px; height: 56px;
+  border-radius: var(--radius-lg);
   background: linear-gradient(135deg, var(--accent-soft), var(--bg-muted));
   color: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 3px solid var(--bg-card);
-  box-shadow: 0 4px 0 var(--border-default);
+  border: 1px solid var(--border-default);
+  box-shadow: 0 2px 0 var(--border-default);
 }
-.empty-state .empty-icon.bouncy { animation: wobble 1.4s ease-in-out infinite; }
+.empty-state .empty-icon.bouncy { animation: none; }
 
-/* Achievement chip — used for completed stages, milestones */
+/* Achievement chip — flattened to a neutral badge. */
 .chip-achievement {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 14px;
-  font-size: 0.75rem;
-  font-weight: 800;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 0.6875rem;
+  font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: #5a4400;
-  background: linear-gradient(135deg, #fff5d2 0%, #ffe162 100%);
-  border: 2px solid rgba(255, 200, 0, 0.50);
-  border-radius: var(--radius-pill);
-  box-shadow: 0 3px 0 var(--warning-shadow);
+  color: var(--text-primary);
+  background: var(--bg-muted);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
 }

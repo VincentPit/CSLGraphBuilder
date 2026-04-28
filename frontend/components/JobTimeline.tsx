@@ -63,7 +63,7 @@ export default function JobTimeline({
   const isRunning = job.status === 'running' || job.status === 'pending';
 
   return (
-    <div className="card p-5 space-y-5 relative overflow-hidden fade-up">
+    <div className="card p-6 space-y-5 relative overflow-hidden fade-up">
       {/* Top accent bar — animated when running */}
       <div
         className={`absolute top-0 inset-x-0 h-[3px] ${isRunning ? 'bg-animated' : ''}`}

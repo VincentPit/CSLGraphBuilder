@@ -101,10 +101,18 @@ export interface Subgraph {
  *  Seeds are picked **per entity type** (newest `per_type_limit` of each),
  *  excluding any types listed in `exclude_types` (default `"Document"`).
  *  Every relationship in the response has both endpoints in the entity
- *  list, so the caller doesn't need a bipartite filter. */
+ *  list, so the caller doesn't need a bipartite filter.
+ *
+ *  When `include_types` is set (comma-separated), only those types seed
+ *  the slice — used by the graph page's progressive loader to fan out
+ *  one request per type so the canvas paints in batches instead of
+ *  staying blank until the full payload arrives. Cross-type neighbours
+ *  are still returned for each per-type slice, so dedup-and-merge on
+ *  the client keeps the graph coherent. */
 export const getSubgraph = (params?: {
   per_type_limit?: number;
   exclude_types?: string;
+  include_types?: string;
   max_neighbors?: number;
 }) =>
   apiClient.get<Subgraph>('/graph/subgraph', { params }).then((r) => r.data);

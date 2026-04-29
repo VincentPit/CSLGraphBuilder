@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
-import { useQuery } from '@tanstack/react-query';
+import { useQueries, useQuery } from '@tanstack/react-query';
 import {
   Activity,
   GitBranch,
@@ -12,7 +12,12 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { getSubgraph, type Entity, type Relationship } from '@/lib/api';
+import {
+  getEntityTypes,
+  getSubgraph,
+  type Entity,
+  type Relationship,
+} from '@/lib/api';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
 import { LoadingState } from '@/components/ui/LoadingState';
@@ -136,41 +141,141 @@ function tracePath(
   }
 }
 
+// Order in which entity types are fetched. The first few are the most
+// useful to land on screen quickly for biomedical browsing, so they
+// run first in the per-type fan-out. Anything not in this list is
+// appended at the end so unknown / future EntityType values still get
+// loaded.
+const TYPE_FETCH_PRIORITY = [
+  'DISEASE',
+  'GENE',
+  'DRUG',
+  'PROTEIN',
+  'PATHWAY',
+  'COMPOUND',
+  'CONCEPT',
+  'ORGANISM',
+];
+
+// Types we never seed from. Mirrors the historical default of the
+// /graph/subgraph endpoint — Document entities are GWAS studies and
+// clutter the visualisation. Kept here too so the per-type fan-out
+// doesn't fire a wasted request for them.
+const EXCLUDED_SEED_TYPES = new Set(['DOCUMENT']);
+
 export default function GraphPage() {
-  // Single subgraph query: newest 50 entities of each type (excluding
-  // Document — those are GWAS studies and clutter the view) + every
-  // edge they touch + the "other-end" entities those edges reach.
-  // Backend guarantees every relationship returned has both endpoints
-  // in the entity list, so no bipartite filter on the client.
-  const { data: subgraph, isLoading: loadingSubgraph } = useQuery({
-    queryKey: ['subgraph'],
-    queryFn: () =>
-      getSubgraph({
-        per_type_limit: 50,
-        exclude_types: 'Document',
-        max_neighbors: 2000,
-      }),
+  // ── Progressive loading ────────────────────────────────────────────
+  // Instead of one big subgraph fetch (which would leave the canvas
+  // blank until the full ~hundreds-of-nodes payload finished), we fan
+  // out one request **per entity type**. Each request returns a self-
+  // consistent slice (seeds of that type + their edges + cross-type
+  // neighbours) so the graph stays coherent as batches arrive.
+  //
+  // Step 1 — pull the enum of valid entity types from the backend.
+  // This is an instant lookup (just enum values, no DB scan) and
+  // avoids hard-coding the list in two places.
+  const { data: typeList } = useQuery({
+    queryKey: ['entity-types'],
+    queryFn: getEntityTypes,
+    staleTime: 5 * 60 * 1000, // enum doesn't change between deploys
   });
+
+  // Order types so the high-signal ones render first. We restrict to
+  // the biomedical priority list rather than fetching every value in
+  // the EntityType enum — most non-biomedical legacy types (Person,
+  // Organization, …) are empty in practice, and an extra request per
+  // empty type still triggers a full backend scan. Future biomedical
+  // additions should be added to TYPE_FETCH_PRIORITY explicitly.
+  const orderedTypes = useMemo(() => {
+    if (!typeList) return [] as string[];
+    const upper = new Set(typeList.map((t) => t.toUpperCase()));
+    return TYPE_FETCH_PRIORITY.filter(
+      (t) => upper.has(t) && !EXCLUDED_SEED_TYPES.has(t),
+    );
+  }, [typeList]);
+
+  // Step 2 — fan out one /graph/subgraph request per type. React Query
+  // will dispatch them in parallel; whichever returns first paints
+  // first. We pass the original enum-cased value (not uppercased) so
+  // the backend's case-insensitive match works regardless of which
+  // EntityType uses TitleCase vs UPPERCASE in the enum.
+  const typeQueries = useQueries({
+    queries: orderedTypes.map((upperType) => {
+      // Recover the original-cased name from typeList for the request
+      // string. Backend is case-insensitive but this keeps cache keys
+      // consistent with the enum the user sees in /types/entities.
+      const original =
+        typeList?.find((t) => t.toUpperCase() === upperType) ?? upperType;
+      return {
+        queryKey: ['subgraph', 'by-type', original],
+        queryFn: () =>
+          getSubgraph({
+            per_type_limit: 50,
+            exclude_types: 'Document',
+            include_types: original,
+            max_neighbors: 2000,
+          }),
+        staleTime: 30 * 1000,
+      };
+    }),
+  });
+
+  // Step 3 — accumulate completed batches into deduped Maps. A node or
+  // edge that appears in multiple per-type slices (e.g. a PROTEIN that
+  // links to both a GENE and a DISEASE) gets kept once. Memoized on
+  // the *successful query identities* rather than the queries array
+  // itself so the rAF popover loop in this component (which causes
+  // re-renders ~60×/sec) doesn't rebuild these every frame.
+  const completedSignature = typeQueries
+    .map((q) => (q.data ? `${q.data.entities.length}:${q.data.relationships.length}` : '-'))
+    .join('|');
+
+  const { entityList, relationshipList, totalEntities, totalRelationships } = useMemo(() => {
+    const entMap = new Map<string, Entity>();
+    const relMap = new Map<string, Relationship>();
+    let totalEnt = 0;
+    let totalRel = 0;
+    for (const q of typeQueries) {
+      const slice = q.data;
+      if (!slice) continue;
+      for (const e of slice.entities) entMap.set(e.id, e);
+      for (const r of slice.relationships) relMap.set(r.id, r);
+      // total_* is the same for every slice (it's the global count,
+      // not per-type), so the last non-zero wins. Take the max so
+      // mid-load mismatches don't flicker the badge downward.
+      totalEnt = Math.max(totalEnt, slice.total_entities);
+      totalRel = Math.max(totalRel, slice.total_relationships);
+    }
+    return {
+      entityList: Array.from(entMap.values()),
+      relationshipList: Array.from(relMap.values()),
+      totalEntities: totalEnt,
+      totalRelationships: totalRel,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [completedSignature]);
+
   // Adapter shape so the rest of this file (which was written against
-  // entData.items / relData.items) keeps working unchanged. Memoized so
-  // the rAF popover loop (which fires setState ~60×/sec) doesn't churn
-  // graphData refs and silently re-heat the d3 simulation every frame.
+  // entData.items / relData.items) keeps working unchanged.
   const entData = useMemo(
-    () =>
-      subgraph
-        ? { items: subgraph.entities, total: subgraph.total_entities }
-        : undefined,
-    [subgraph],
+    () => ({ items: entityList, total: totalEntities }),
+    [entityList, totalEntities],
   );
   const relData = useMemo(
-    () =>
-      subgraph
-        ? { items: subgraph.relationships, total: subgraph.total_relationships }
-        : undefined,
-    [subgraph],
+    () => ({ items: relationshipList, total: totalRelationships }),
+    [relationshipList, totalRelationships],
   );
-  const entLoading = loadingSubgraph;
-  const relLoading = loadingSubgraph;
+
+  // Progressive loading state. We only block the canvas with the full-
+  // page LoadingState until the *first* batch lands; after that, the
+  // graph is rendered and remaining types stream in alongside a small
+  // inline progress chip so users can interact with what's there.
+  const completedTypes = typeQueries.filter((q) => q.isSuccess).length;
+  const totalTypes = typeQueries.length;
+  const initialLoad = totalTypes === 0 || (completedTypes === 0 && entityList.length === 0);
+  const stillStreaming = totalTypes > 0 && completedTypes < totalTypes;
+  const entLoading = initialLoad;
+  const relLoading = initialLoad;
 
   const [search, setSearch] = useState('');
   const [activeTypes, setActiveTypes] = useState<Set<string>>(new Set());
@@ -403,6 +508,33 @@ export default function GraphPage() {
               edges
             </span>
           </div>
+          {/* Progressive-loader status: visible only while per-type
+              batches are still arriving. The graph itself is already
+              interactive at this point, so this is non-blocking. */}
+          {stillStreaming && (
+            <div
+              className="card px-3 py-1.5 flex items-center gap-2"
+              role="status"
+              aria-live="polite"
+              aria-label={`Loading ${totalTypes - completedTypes} more entity type${totalTypes - completedTypes === 1 ? '' : 's'}`}
+            >
+              <span
+                className="inline-block w-2.5 h-2.5 rounded-full"
+                style={{
+                  background: 'var(--accent)',
+                  animation: 'pulse 1.4s ease-in-out infinite',
+                }}
+                aria-hidden="true"
+              />
+              <span className="text-[11px] tabular-nums" style={{ color: 'var(--text-muted)' }}>
+                Loading{' '}
+                <span className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  {completedTypes}/{totalTypes}
+                </span>{' '}
+                types
+              </span>
+            </div>
+          )}
           <Button
             onClick={recenter}
             title="Fit the entire graph into the viewport"

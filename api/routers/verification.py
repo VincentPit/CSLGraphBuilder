@@ -63,7 +63,7 @@ async def run_verification(
             kg.entities[ent.id] = ent
 
     use_case = RelationshipVerificationUseCase(kg, graph_repo=graph_repo)
-    result = use_case.execute(ver_cfg)
+    result = await use_case.execute(ver_cfg)
 
     entries: list[VerificationEntryResponse] = []
     if result.success and result.data:
@@ -161,7 +161,7 @@ async def verify_text(
     )
 
     use_case = TextVerificationUseCase(kg, graph_repo=graph_repo)
-    report = use_case.execute(request.text, ver_cfg)
+    report = await use_case.execute(request.text, ver_cfg)
 
     entries = [
         TextVerificationEntryResponse(

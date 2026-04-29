@@ -361,7 +361,7 @@ class DocumentExtractionPipeline:
                     similarity_threshold=0.5,
                 )
             )
-            chunks = chunker.chunk(content, document.id)
+            chunks = await chunker.chunk(content, document.id)
         except Exception as exc:  # fall back to fixed-size split
             logger.warning("Semantic chunker failed (%s); falling back to fixed-size", exc)
             chunks = _fixed_size_chunks(
@@ -913,17 +913,12 @@ class DocumentExtractionPipeline:
                 src_name = id_to_name.get(rel.source_entity_id)
                 tgt_name = id_to_name.get(rel.target_entity_id)
 
-                # The verifier is sync; run in a thread so the LLM call (if
-                # enabled) doesn't block the event loop.
                 try:
-                    vr = await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        lambda: verifier.verify(
-                            relationship=rel,
-                            context=context,
-                            source_name=src_name,
-                            target_name=tgt_name,
-                        ),
+                    vr = await verifier.verify(
+                        relationship=rel,
+                        context=context,
+                        source_name=src_name,
+                        target_name=tgt_name,
                     )
                 except Exception as exc:
                     logger.debug("Verify failed for rel %s: %s", rel.id, exc)

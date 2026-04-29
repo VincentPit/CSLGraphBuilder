@@ -131,6 +131,39 @@ class GraphRepositoryInterface(ABC):
         """Search entities whose name or description contains any of the given terms."""
         raise NotImplementedError
 
+    async def get_subgraph_slice(
+        self,
+        seed_types: Sequence[str],
+        per_type_limit: int,
+        exclude_types: Sequence[str],
+        max_neighbors: int,
+    ) -> Tuple[Dict[str, 'GraphEntity'], Dict[str, 'GraphRelationship'], Set[str], Dict[str, int], int, int]:
+        """Fetch a coherent subgraph slice for the given seed types.
+
+        Returns ``(entities, relationships, seed_ids, seed_per_type,
+        total_entities, total_relationships)``:
+
+        * ``entities`` includes every seed plus the other-end entities
+          of any returned edge.
+        * ``relationships`` are edges where at least one endpoint is a
+          seed and neither endpoint's type is in ``exclude_types``.
+        * ``seed_ids`` is the subset of ``entities.keys()`` that were
+          picked as seeds — the rest are pulled-in neighbours. The
+          router needs this to apply per-seed fan-out caps without
+          re-deriving seed membership.
+        * ``seed_per_type`` is the count of seeds actually picked from
+          each requested type (typically equal to ``per_type_limit``,
+          less if the type has fewer entities in the graph).
+        * ``total_entities`` / ``total_relationships`` are global counts,
+          used by the visualisation to show "showing N of M".
+
+        Implementations should use indexed lookups so this stays cheap
+        even on large graphs — the goal is to avoid the full-graph
+        scan that ``get_all_entities`` / ``get_all_relationships``
+        require.
+        """
+        raise NotImplementedError
+
     async def vector_search_entities(
         self, query_embedding: List[float], top_k: int = 10, min_score: float = 0.5
     ) -> List[Tuple['GraphEntity', float]]:
@@ -1107,6 +1140,152 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
                     self.logger.debug("Skipping relationship: %s", exc)
             return rels
 
+    async def get_subgraph_slice(
+        self,
+        seed_types: Sequence[str],
+        per_type_limit: int,
+        exclude_types: Sequence[str],
+        max_neighbors: int,
+    ) -> Tuple[Dict[str, GraphEntity], Dict[str, GraphRelationship], Set[str], Dict[str, int], int, int]:
+        """Indexed Cypher implementation of the subgraph-slice fetch.
+
+        Three small queries replace the full-graph scan:
+          1. **Per type**: pick the newest ``per_type_limit`` entities
+             whose ``entity_type`` matches — uses ``entity_type_idx``,
+             so cost scales with ``per_type_limit``, not graph size.
+          2. **Edges**: ``UNWIND`` the seed ids and traverse out via
+             the ``entity_id_unique`` constraint. Each edge is returned
+             with both endpoints; the other-end entity comes back in
+             the same record so we don't need a follow-up id→entity
+             round trip.
+          3. **Counts**: two cheap label/relationship-type counts (O(1)
+             via Neo4j's count store) for the response totals.
+
+        The router still applies the per-seed fan-out cap, the
+        max-neighbour cap and the orphan drop in Python — those are
+        cheap on the smaller in-memory result set and keep the Cypher
+        focused on data retrieval.
+        """
+        seed_types_list = [t for t in (seed_types or []) if t]
+        exclude_lower = [t.lower() for t in (exclude_types or []) if t]
+
+        entities: Dict[str, GraphEntity] = {}
+        seed_per_type: Dict[str, int] = {}
+        seed_ids_list: List[str] = []
+
+        async with self.driver.session() as session:
+            # ── Step 1: seeds, one query per type ────────────────
+            for seed_type in seed_types_list:
+                if seed_type.lower() in exclude_lower:
+                    continue
+                seed_query = (
+                    "MATCH (e:Entity) "
+                    "WHERE toLower(e.entity_type) = toLower($type) "
+                    "RETURN e "
+                    "ORDER BY e.created_at DESC "
+                    "LIMIT $limit"
+                )
+                result = await session.run(
+                    seed_query, {"type": seed_type, "limit": per_type_limit}
+                )
+                picked = 0
+                async for record in result:
+                    data = dict(record['e'])
+                    try:
+                        entity = self._create_entity_from_data(data)
+                    except Exception as exc:
+                        self.logger.debug("Skipping seed entity: %s", exc)
+                        continue
+                    if entity.id in entities:
+                        continue
+                    entities[entity.id] = entity
+                    seed_ids_list.append(entity.id)
+                    picked += 1
+                if picked:
+                    seed_per_type[seed_type] = picked
+
+            relationships: Dict[str, GraphRelationship] = {}
+            seed_ids = set(seed_ids_list)
+
+            # ── Step 2: edges + other-end entities for the seeds ──
+            # The undirected ``-[r]-`` traversal returns each edge
+            # once per seed endpoint it touches; the dict keyed by
+            # rel.id dedupes the seed-seed double-counting that
+            # produces. ``startNode(r)`` / ``endNode(r)`` preserve
+            # the stored direction so the response keeps the
+            # source/target semantics the rest of the pipeline
+            # expects.
+            if seed_ids_list:
+                edges_query = (
+                    "UNWIND $ids AS sid "
+                    "MATCH (s:Entity {id: sid})-[r:RELATES]-(t:Entity) "
+                    "WHERE NOT toLower(t.entity_type) IN $excl "
+                    "RETURN r, "
+                    "       startNode(r).id AS src_id, "
+                    "       endNode(r).id   AS tgt_id, "
+                    "       t "
+                    "LIMIT $cap"
+                )
+                # Loose row cap: enough headroom for fan-out caps
+                # without flooding the response if a hub has tens
+                # of thousands of edges. Tighter caps are applied
+                # by the router after dedup.
+                row_cap = max(len(seed_ids_list) * 200, max_neighbors * 4, 2000)
+                result = await session.run(
+                    edges_query,
+                    {"ids": seed_ids_list, "excl": exclude_lower, "cap": row_cap},
+                )
+                neighbor_count = 0
+                async for record in result:
+                    other_data = dict(record['t'])
+                    other_id = other_data.get('id')
+                    if not other_id:
+                        continue
+
+                    # If the other end isn't already known, try to
+                    # add it — bounded by ``max_neighbors`` so a
+                    # single hub can't blow up the payload. When the
+                    # cap is hit we drop the edge too, since
+                    # rendering a half-edge is worse than dropping it.
+                    if other_id not in entities:
+                        if other_id not in seed_ids and neighbor_count >= max_neighbors:
+                            continue
+                        try:
+                            other = self._create_entity_from_data(other_data)
+                        except Exception as exc:
+                            self.logger.debug("Skipping neighbour: %s", exc)
+                            continue
+                        entities[other.id] = other
+                        if other.id not in seed_ids:
+                            neighbor_count += 1
+
+                    edge_data = dict(record['r'])
+                    edge_data['source_entity_id'] = record['src_id']
+                    edge_data['target_entity_id'] = record['tgt_id']
+                    try:
+                        rel = self._create_relationship_from_data(edge_data)
+                    except Exception as exc:
+                        self.logger.debug("Skipping edge: %s", exc)
+                        continue
+                    relationships[rel.id] = rel
+
+            # ── Step 3: cheap global counts for the response ─────
+            total_entities = 0
+            total_relationships = 0
+            try:
+                r1 = await session.run("MATCH (e:Entity) RETURN count(e) AS c")
+                rec = await r1.single()
+                if rec is not None:
+                    total_entities = int(rec['c'])
+                r2 = await session.run("MATCH ()-[r:RELATES]->() RETURN count(r) AS c")
+                rec = await r2.single()
+                if rec is not None:
+                    total_relationships = int(rec['c'])
+            except Exception as exc:
+                self.logger.debug("Total count query failed: %s", exc)
+
+        return entities, relationships, seed_ids, seed_per_type, total_entities, total_relationships
+
     async def search_entities_by_text(self, terms: List[str], limit: int = 50) -> Dict[str, GraphEntity]:
         """Search entities using the full-text index on name/description."""
         if not terms:
@@ -1492,6 +1671,86 @@ class InMemoryGraphRepository(GraphRepositoryInterface):
                 if len(matches) >= limit:
                     break
         return matches
+
+    async def get_subgraph_slice(
+        self,
+        seed_types: Sequence[str],
+        per_type_limit: int,
+        exclude_types: Sequence[str],
+        max_neighbors: int,
+    ) -> Tuple[Dict[str, GraphEntity], Dict[str, GraphRelationship], Set[str], Dict[str, int], int, int]:
+        """In-memory equivalent of the Neo4j fast path.
+
+        The cost is similar to the previous full-scan implementation
+        because everything lives in dicts already, but mirroring the
+        shape of the Neo4j path keeps the router code uniform.
+        """
+        seed_types_list = [t for t in (seed_types or []) if t]
+        exclude_lower = {t.lower() for t in (exclude_types or []) if t}
+        wanted_lower = {t.lower() for t in seed_types_list if t.lower() not in exclude_lower}
+
+        # Group by lowercased type, sort each bucket newest first.
+        buckets: Dict[str, List[GraphEntity]] = {}
+        for ent in self.entities.values():
+            type_lower = ent.entity_type.value.lower()
+            if type_lower in exclude_lower or type_lower not in wanted_lower:
+                continue
+            buckets.setdefault(type_lower, []).append(ent)
+
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        entities: Dict[str, GraphEntity] = {}
+        seed_per_type: Dict[str, int] = {}
+        seed_ids: Set[str] = set()
+
+        for seed_type in seed_types_list:
+            bucket = buckets.get(seed_type.lower(), [])
+            bucket.sort(
+                key=lambda e: (e.metadata.created_at if e.metadata and e.metadata.created_at else epoch),
+                reverse=True,
+            )
+            picked = 0
+            for ent in bucket[:per_type_limit]:
+                if ent.id in entities:
+                    continue
+                entities[ent.id] = ent
+                seed_ids.add(ent.id)
+                picked += 1
+            if picked:
+                seed_per_type[seed_type] = picked
+
+        relationships: Dict[str, GraphRelationship] = {}
+        neighbor_count = 0
+        for rel in self.relationships.values():
+            src = self.entities.get(rel.source_entity_id)
+            tgt = self.entities.get(rel.target_entity_id)
+            if src is None or tgt is None:
+                continue
+            if src.entity_type.value.lower() in exclude_lower:
+                continue
+            if tgt.entity_type.value.lower() in exclude_lower:
+                continue
+            if rel.source_entity_id not in seed_ids and rel.target_entity_id not in seed_ids:
+                continue
+            for endpoint in (src, tgt):
+                if endpoint.id in entities:
+                    continue
+                if endpoint.id not in seed_ids and neighbor_count >= max_neighbors:
+                    # Cap reached — break out and skip this edge below.
+                    break
+                entities[endpoint.id] = endpoint
+                if endpoint.id not in seed_ids:
+                    neighbor_count += 1
+            else:
+                relationships[rel.id] = rel
+
+        return (
+            entities,
+            relationships,
+            seed_ids,
+            seed_per_type,
+            len(self.entities),
+            len(self.relationships),
+        )
     
     def _calculate_name_similarity(self, name1: str, name2: str) -> float:
         """Calculate simple name similarity score."""

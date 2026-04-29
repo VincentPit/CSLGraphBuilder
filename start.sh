@@ -7,9 +7,11 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
-# Kill any existing processes on our ports
+# Kill any existing processes LISTENING on our ports (not clients connected to them).
+# Without -sTCP:LISTEN this would also kill browsers that have an open
+# connection to the dev server (e.g. Safari's WebKit Networking XPC).
 echo "Cleaning up existing processes..."
-lsof -ti:3000,8000 | xargs kill -9 2>/dev/null || true
+lsof -ti:3000,8000 -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || true
 
 # Activate Python virtualenv
 source "$PROJECT_DIR/.venv/bin/activate"

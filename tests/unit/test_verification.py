@@ -13,7 +13,7 @@ Covers:
 import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -254,69 +254,70 @@ class TestLLMVerifier:
 
     def _llm(self, response: str) -> MagicMock:
         svc = MagicMock()
-        svc.generate_text.return_value = response
+        svc.generate_text = AsyncMock(return_value=response)
         return svc
 
-    def test_valid_verdict_passes(self):
+    async def test_valid_verdict_passes(self):
         llm = self._llm(json.dumps({"verdict": "valid", "confidence": 0.9, "reasoning": "clear evidence"}))
         v = LLMVerifier(llm)
-        result = v.verify(_make_rel(), "some context")
+        result = await v.verify(_make_rel(), "some context")
         assert result.passed
         assert result.confidence == 0.9
         assert "clear evidence" in result.reasoning
 
-    def test_invalid_verdict_fails(self):
+    async def test_invalid_verdict_fails(self):
         llm = self._llm(json.dumps({"verdict": "invalid", "confidence": 0.15, "reasoning": "no support"}))
         v = LLMVerifier(llm)
-        result = v.verify(_make_rel(), "some context")
+        result = await v.verify(_make_rel(), "some context")
         assert result.failed
 
-    def test_uncertain_defaults_to_failed(self):
+    async def test_uncertain_defaults_to_failed(self):
         llm = self._llm(json.dumps({"verdict": "uncertain", "confidence": 0.5, "reasoning": "unclear"}))
         v = LLMVerifier(llm, LLMVerifierConfig(uncertain_as_pass=False))
-        result = v.verify(_make_rel(), "context")
+        result = await v.verify(_make_rel(), "context")
         assert result.failed
 
-    def test_uncertain_as_pass_when_configured(self):
+    async def test_uncertain_as_pass_when_configured(self):
         llm = self._llm(json.dumps({"verdict": "uncertain", "confidence": 0.5, "reasoning": "unclear"}))
         v = LLMVerifier(llm, LLMVerifierConfig(uncertain_as_pass=True))
-        result = v.verify(_make_rel(), "context")
+        result = await v.verify(_make_rel(), "context")
         assert result.passed
 
-    def test_malformed_json_returns_failed(self):
+    async def test_malformed_json_returns_failed(self):
         llm = self._llm("not json at all")
         v = LLMVerifier(llm)
-        result = v.verify(_make_rel(), "context")
+        result = await v.verify(_make_rel(), "context")
         assert result.failed
         assert "non-JSON" in result.reasoning
         assert result.metadata.get("raw_response") == "not json at all"
 
-    def test_strips_code_fences(self):
+    async def test_strips_code_fences(self):
         payload = json.dumps({"verdict": "valid", "confidence": 0.7, "reasoning": "fine"})
         llm = self._llm(f"```json\n{payload}\n```")
         v = LLMVerifier(llm)
-        result = v.verify(_make_rel(), "ctx")
+        result = await v.verify(_make_rel(), "ctx")
         assert result.passed
 
-    def test_empty_context_short_circuits(self):
+    async def test_empty_context_short_circuits(self):
         llm = MagicMock()
+        llm.generate_text = AsyncMock()
         v = LLMVerifier(llm)
-        result = v.verify(_make_rel(), "")
+        result = await v.verify(_make_rel(), "")
         assert result.failed
         llm.generate_text.assert_not_called()
 
-    def test_llm_exception_returns_failed(self):
+    async def test_llm_exception_returns_failed(self):
         llm = MagicMock()
-        llm.generate_text.side_effect = RuntimeError("timeout")
+        llm.generate_text = AsyncMock(side_effect=RuntimeError("timeout"))
         v = LLMVerifier(llm)
-        result = v.verify(_make_rel(), "context")
+        result = await v.verify(_make_rel(), "context")
         assert result.failed
         assert "timeout" in result.reasoning
 
-    def test_confidence_clamped_to_valid_range(self):
+    async def test_confidence_clamped_to_valid_range(self):
         llm = self._llm(json.dumps({"verdict": "valid", "confidence": 9.99, "reasoning": "wild"}))
         v = LLMVerifier(llm)
-        result = v.verify(_make_rel(), "ctx")
+        result = await v.verify(_make_rel(), "ctx")
         assert result.confidence <= 1.0
 
 
@@ -332,16 +333,16 @@ class TestCascadingVerifier:
     def _fail_result(self, stage: VerificationStage, conf: float = 0.2) -> VerificationResult:
         return VerificationResult(status=VerificationStatus.FAILED, stage=stage, confidence=conf, reasoning="fail")
 
-    def test_all_stages_pass_returns_passed(self):
+    async def test_all_stages_pass_returns_passed(self):
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=False)
         v = CascadingVerifier(config=cfg)
         rel = _make_rel()
         context = "alpha related to beta"
-        result = v.verify(rel, context, source_name="alpha", target_name="beta")
+        result = await v.verify(rel, context, source_name="alpha", target_name="beta")
         assert result.stage == VerificationStage.CASCADING
         assert result.passed
 
-    def test_decisive_pass_skips_later_stages(self):
+    async def test_decisive_pass_skips_later_stages(self):
         """A decisive PASS from TextMatch (confidence ≥ escalation_upper) should skip Embedding."""
         cfg = CascadingVerifierConfig(
             enable_embedding=True,
@@ -362,13 +363,13 @@ class TestCascadingVerifier:
         v._emb_verifier.verify = spy
 
         rel = _make_rel()
-        result = v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
+        result = await v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
         # embedding stage should NOT have been called because text match was decisive
         assert len(called) == 0
         assert result.stage == VerificationStage.CASCADING
         assert result.passed
 
-    def test_inconclusive_result_escalates_to_next_stage(self):
+    async def test_inconclusive_result_escalates_to_next_stage(self):
         """An inconclusive TextMatch (confidence within escalation band) should trigger Embedding."""
         cfg = CascadingVerifierConfig(
             enable_embedding=True,
@@ -390,11 +391,11 @@ class TestCascadingVerifier:
         v._emb_verifier.verify = spy
 
         rel = _make_rel()
-        result = v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
+        result = await v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
         # Embedding SHOULD have been called because text match was inconclusive
         assert len(called) == 1
 
-    def test_decisive_fail_skips_later_stages(self):
+    async def test_decisive_fail_skips_later_stages(self):
         """A decisive FAIL from TextMatch (confidence < escalation_lower) should skip remaining stages."""
         cfg = CascadingVerifierConfig(
             enable_embedding=True,
@@ -414,23 +415,23 @@ class TestCascadingVerifier:
         v._emb_verifier.verify = spy
 
         rel = _make_rel()
-        result = v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
+        result = await v.verify(rel, "alpha related to beta", source_name="alpha", target_name="beta")
         assert len(called) == 0
         assert result.failed
 
-    def test_no_stages_enabled_returns_failed(self):
+    async def test_no_stages_enabled_returns_failed(self):
         cfg = CascadingVerifierConfig(
             enable_text_match=False,
             enable_embedding=False,
             enable_llm=False,
         )
         v = CascadingVerifier(config=cfg)
-        result = v.verify(_make_rel(), "ctx")
+        result = await v.verify(_make_rel(), "ctx")
         # No stages ran — aggregate should return FAILED with 0 confidence
         assert result.failed
         assert result.confidence == 0.0
 
-    def test_weighted_confidence_pass(self):
+    async def test_weighted_confidence_pass(self):
         """Single stage passes with high confidence → weighted confidence ≥ threshold → PASSED."""
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=False)
         v = CascadingVerifier(config=cfg)
@@ -438,27 +439,27 @@ class TestCascadingVerifier:
         # Patch text verifier to return PASSED with high confidence
         v._text_verifier.verify = lambda **kw: self._pass_result(VerificationStage.TEXT_MATCH)
 
-        result = v.verify(_make_rel(), "ctx")
+        result = await v.verify(_make_rel(), "ctx")
         assert result.passed
 
-    def test_stage_results_included_in_cascading_result(self):
+    async def test_stage_results_included_in_cascading_result(self):
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=False)
         v = CascadingVerifier(config=cfg)
-        result = v.verify(_make_rel(), "alpha beta", source_name="alpha", target_name="beta")
+        result = await v.verify(_make_rel(), "alpha beta", source_name="alpha", target_name="beta")
         assert len(result.stage_results) >= 1
         assert all(isinstance(r, VerificationResult) for r in result.stage_results)
 
-    def test_llm_stage_skipped_when_no_service_provided(self):
+    async def test_llm_stage_skipped_when_no_service_provided(self):
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=True)
         v = CascadingVerifier(config=cfg, llm_service=None)
-        result = v.verify(_make_rel(), "some context")
+        result = await v.verify(_make_rel(), "some context")
         # Should not raise; LLM stage just warns and skips
         assert result.stage == VerificationStage.CASCADING
 
-    def test_confidence_is_float_between_0_and_1(self):
+    async def test_confidence_is_float_between_0_and_1(self):
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=False)
         v = CascadingVerifier(config=cfg)
-        result = v.verify(_make_rel(), "alpha beta", source_name="alpha", target_name="beta")
+        result = await v.verify(_make_rel(), "alpha beta", source_name="alpha", target_name="beta")
         assert 0.0 <= result.confidence <= 1.0
 
 
@@ -476,27 +477,27 @@ class TestRelationshipVerificationUseCase:
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=False)
         return VerificationConfig(cascading=cfg)
 
-    def test_returns_success_result(self):
+    async def test_returns_success_result(self):
         rel = _make_rel(description="alpha related to beta")
         uc = self._make_use_case(rel)
-        result = uc.execute(self._text_only_config())
+        result = await uc.execute(self._text_only_config())
         assert result.success is True
 
-    def test_report_contains_one_entry_per_relationship(self):
+    async def test_report_contains_one_entry_per_relationship(self):
         rel = _make_rel()
         uc = self._make_use_case(rel)
-        result = uc.execute(self._text_only_config())
+        result = await uc.execute(self._text_only_config())
         assert len(result.data["report"]) == 1
 
-    def test_report_entry_shape(self):
+    async def test_report_entry_shape(self):
         rel = _make_rel()
         uc = self._make_use_case(rel)
-        result = uc.execute(self._text_only_config())
+        result = await uc.execute(self._text_only_config())
         entry = result.data["report"][0]
         for key in ("relationship_id", "status", "confidence", "reasoning", "stage_results"):
             assert key in entry
 
-    def test_passing_rel_annotated_correctly(self):
+    async def test_passing_rel_annotated_correctly(self):
         rel = _make_rel(description="alpha related to beta")
         graph = _make_graph_with_rel(rel)
         cfg = CascadingVerifierConfig(enable_embedding=False, enable_llm=False)
@@ -506,24 +507,24 @@ class TestRelationshipVerificationUseCase:
             entity_name_map={rel.source_entity_id: "alpha", rel.target_entity_id: "beta"},
         )
         uc = RelationshipVerificationUseCase(graph, llm_service=None)
-        uc.execute(ver_cfg)
+        await uc.execute(ver_cfg)
         # The relationship should be annotated in-place
         annotations = graph.relationships[rel.id].metadata.annotations
         assert "verification_confidence" in annotations
         assert "verification_reasoning" in annotations
 
-    def test_counts_correct_in_data(self):
+    async def test_counts_correct_in_data(self):
         rel = _make_rel()
         uc = self._make_use_case(rel)
-        result = uc.execute(self._text_only_config())
+        result = await uc.execute(self._text_only_config())
         d = result.data
         assert d["total"] == 1
         assert d["passed"] + d["failed"] + d["skipped"] == 1
 
-    def test_empty_graph_returns_zero_counts(self):
+    async def test_empty_graph_returns_zero_counts(self):
         graph = KnowledgeGraph()
         uc = RelationshipVerificationUseCase(graph, llm_service=None)
-        result = uc.execute(self._text_only_config())
+        result = await uc.execute(self._text_only_config())
         assert result.success
         assert result.data["total"] == 0
         assert result.data["passed"] == 0

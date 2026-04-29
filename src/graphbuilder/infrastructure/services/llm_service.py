@@ -36,9 +36,9 @@ from .metrics import get_metrics
 # at 30s per sleep. Honors the Retry-After header on RateLimitError when
 # the provider sends one.
 
-_RETRY_MAX_ATTEMPTS = int(os.getenv("LLM_RETRY_MAX_ATTEMPTS", "5"))
-_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))
-_RETRY_MAX_DELAY = float(os.getenv("LLM_RETRY_MAX_DELAY", "30.0"))
+_RETRY_MAX_ATTEMPTS = int(os.getenv("LLM_RETRY_MAX_ATTEMPTS", "3"))
+_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "0.5"))
+_RETRY_MAX_DELAY = float(os.getenv("LLM_RETRY_MAX_DELAY", "15.0"))
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -116,19 +116,26 @@ class PromptType(Enum):
     CONTENT_CLASSIFICATION = "content_classification"
     SUMMARIZATION = "summarization"
     VALIDATION = "validation"
+    VERIFICATION = "verification"
 
 
 @dataclass
 class LLMRequest:
     """Structured LLM request with metadata."""
-    
+
     prompt: str
     content: str
     prompt_type: PromptType
     temperature: float = 0.1
     max_tokens: int = 2000
     model_params: Dict[str, Any] = None
-    
+    # Override the default system prompt. When None, _execute_llm_call uses
+    # its built-in JSON-extraction system prompt.
+    system_prompt: Optional[str] = None
+    # Skip OpenAI's response_format=json_object guard (the verifier wants
+    # raw text and parses JSON itself, after stripping code fences).
+    json_response: bool = True
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "prompt": self.prompt,
@@ -836,11 +843,20 @@ RESPOND WITH VALID JSON:
         
         try:
             # Prepare messages
+            sys_prompt = request.system_prompt or (
+                "You are a helpful assistant that provides accurate, "
+                "structured responses in JSON format."
+            )
             messages = [
-                {"role": "system", "content": "You are a helpful assistant that provides accurate, structured responses in JSON format."},
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": request.prompt}
             ]
-            
+
+            wants_json = (
+                request.json_response
+                and self.config.llm.provider in [LLMProvider.OPENAI, LLMProvider.AZURE_OPENAI]
+            )
+
             # Execute API call. The retry wrapper handles 429s and transient
             # network errors with exponential-backoff + jitter; application
             # bugs (4xx other than 429) bubble up unchanged so we don't mask
@@ -851,7 +867,7 @@ RESPOND WITH VALID JSON:
                     messages=messages,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
-                    response_format={"type": "json_object"} if self.config.llm.provider in [LLMProvider.OPENAI, LLMProvider.AZURE_OPENAI] else None
+                    response_format={"type": "json_object"} if wants_json else None
                 )
             response = await _retryable_llm_call(_do_call, self.logger)
             
@@ -886,7 +902,38 @@ RESPOND WITH VALID JSON:
         except Exception as e:
             self.logger.error(f"LLM API call error: {str(e)}", exc_info=True)
             raise RuntimeError(f"LLM API call failed: {str(e)}")
-    
+
+    async def generate_text(
+        self,
+        *,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        prompt_type: PromptType = PromptType.VERIFICATION,
+    ) -> str:
+        """Free-form text completion that funnels through ``_execute_llm_call``.
+
+        Used by the cascading verifier's LLM stage (which expects a sync-like
+        ``generate_text(prompt, system_prompt, temperature) -> str`` shape but
+        is now driven from async code). Going through ``_execute_llm_call``
+        means metrics + retries are recorded the same way as every other LLM
+        call in the pipeline.
+        """
+        request = LLMRequest(
+            prompt=prompt,
+            content=prompt,
+            prompt_type=prompt_type,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            # The verifier strips its own code fences; don't force JSON mode
+            # because some providers reject it without a JSON-shaped prompt.
+            json_response=False,
+        )
+        response = await self._execute_llm_call(request)
+        return response.content
+
     async def _parse_json_response(self, content: str) -> Dict[str, Any]:
         """Parse and validate JSON response from LLM."""
         

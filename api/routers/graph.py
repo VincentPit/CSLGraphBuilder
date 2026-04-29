@@ -184,6 +184,17 @@ async def get_subgraph(
         "(case-insensitive). Default skips Document — those are GWAS "
         "studies and tend to clutter the visualisation.",
     ),
+    include_types: Optional[str] = Query(
+        None,
+        description="Comma-separated entity types to seed from "
+        "(case-insensitive). When set, only entities of these types "
+        "are picked as seeds — used by the frontend to load the "
+        "graph progressively, one type at a time, instead of waiting "
+        "for the full payload before rendering anything. "
+        "``exclude_types`` still applies to the *other-end* entities "
+        "pulled in to satisfy edges, so cross-type neighbours render "
+        "correctly while the user paints the graph in batches.",
+    ),
     max_neighbors: int = Query(2000, ge=0, le=10000),
     max_fanout_per_seed: int = Query(
         15, ge=1, le=500,
@@ -213,45 +224,85 @@ async def get_subgraph(
          from the response so the frontend doesn't render it as a
          disconnected dot in space.
     Every relationship returned has both endpoints in the entity list.
+
+    When ``include_types`` is provided, the seed pool is restricted to
+    those types — used by the frontend's progressive loader to paint
+    the graph one type at a time. Other-end entities of any non-
+    excluded type are still pulled in, so a per-type slice naturally
+    includes its cross-type neighbours.
     """
     exclude_set = {
         t.strip().lower() for t in exclude_types.split(",") if t.strip()
     }
-
-    all_entities = await repo.get_all_entities()
-    entities = list(all_entities.values())
-    total_entities = len(entities)
-
-    # Group by entity type, applying the exclusion filter.
-    by_type: dict[str, list] = {}
-    for e in entities:
-        type_str = e.entity_type.value
-        if type_str.lower() in exclude_set:
-            continue
-        by_type.setdefault(type_str, []).append(e)
-
-    # For each type, take the newest ``per_type_limit`` entities.
-    seed_entities = []
-    seed_per_type: dict[str, int] = {}
-    for type_str, ents in by_type.items():
-        ents.sort(
-            key=lambda e: (e.metadata.created_at if e.metadata and e.metadata.created_at else _EPOCH),
-            reverse=True,
-        )
-        picked = ents[:per_type_limit]
-        seed_entities.extend(picked)
-        seed_per_type[type_str] = len(picked)
-
-    seed_ids = {e.id for e in seed_entities}
-
-    # All edges with at least one endpoint in seed.
-    all_rels = await repo.get_all_relationships()
-    rels_full = list(all_rels.values())
-    total_relationships = len(rels_full)
-    edges = [
-        r for r in rels_full
-        if r.source_entity_id in seed_ids or r.target_entity_id in seed_ids
+    include_list = [
+        t.strip() for t in (include_types or "").split(",") if t.strip()
     ]
+    include_set = {t.lower() for t in include_list} or None
+
+    # ── Fast path ─────────────────────────────────────────────────────
+    # When the caller restricts seeds via ``include_types`` (the
+    # frontend's progressive loader does this for every request), the
+    # repo can fetch the slice with three indexed Cypher queries
+    # instead of a full-graph scan. This is the difference between a
+    # response in tens of milliseconds and one that grows linearly with
+    # graph size.
+    if include_set is not None:
+        (
+            entities_by_id,
+            edges_by_id,
+            seed_ids,
+            seed_per_type,
+            total_entities,
+            total_relationships,
+        ) = await repo.get_subgraph_slice(
+            seed_types=include_list,
+            per_type_limit=per_type_limit,
+            exclude_types=list(exclude_set),
+            max_neighbors=max_neighbors,
+        )
+        all_entities = entities_by_id
+        seed_entities = [entities_by_id[i] for i in seed_ids if i in entities_by_id]
+        edges = list(edges_by_id.values())
+    else:
+        # ── Legacy path ───────────────────────────────────────────────
+        # No include filter → fall back to the original full-scan
+        # implementation. Still useful for non-frontend callers that
+        # want every type at once; the frontend's progressive loader
+        # never hits this branch.
+        all_entities = await repo.get_all_entities()
+        entities = list(all_entities.values())
+        total_entities = len(entities)
+
+        # Group by entity type, applying the exclusion filter.
+        by_type: dict[str, list] = {}
+        for e in entities:
+            type_str = e.entity_type.value
+            if type_str.lower() in exclude_set:
+                continue
+            by_type.setdefault(type_str, []).append(e)
+
+        # For each type, take the newest ``per_type_limit`` entities.
+        seed_entities = []
+        seed_per_type = {}
+        for type_str, ents in by_type.items():
+            ents.sort(
+                key=lambda e: (e.metadata.created_at if e.metadata and e.metadata.created_at else _EPOCH),
+                reverse=True,
+            )
+            picked = ents[:per_type_limit]
+            seed_entities.extend(picked)
+            seed_per_type[type_str] = len(picked)
+
+        seed_ids = {e.id for e in seed_entities}
+
+        # All edges with at least one endpoint in seed.
+        all_rels = await repo.get_all_relationships()
+        rels_full = list(all_rels.values())
+        total_relationships = len(rels_full)
+        edges = [
+            r for r in rels_full
+            if r.source_entity_id in seed_ids or r.target_entity_id in seed_ids
+        ]
 
     # Per-seed fan-out cap. Sort so that:
     #   - Tier 0 (both endpoints seeds): kept first — these are the

@@ -1,0 +1,397 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue!60!black,
+  citecolor=black,
+}
+
+\definecolor{codebg}{HTML}{F6F8FA}
+\definecolor{codecomment}{HTML}{6A737D}
+\definecolor{codekw}{HTML}{D73A49}
+\definecolor{codestr}{HTML}{032F62}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  commentstyle=\color{codecomment}\itshape,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{codebg},
+  language=Python,
+  numbers=none,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+}
+
+\title{\textbf{CSL GraphBuilder --- Architectural Walk-through}\\
+  \large Coroutines, Threads, Queues, and Pools in the Backend}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+CSL GraphBuilder is a biomedical knowledge-graph construction service. It
+ingests documents (or external sources such as Open~Targets), extracts
+entities and relationships, embeds them with a domain-specific
+sentence-transformer (SapBERT), persists everything to Neo4j, and then runs
+a cascading verification pipeline before exposing the graph to a Next.js
+frontend.
+
+The system is split into three deployable units:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Frontend} --- Next.js dev server on port \texttt{3000}
+        (\texttt{frontend/}).
+  \item \textbf{Backend} --- FastAPI/Uvicorn on port \texttt{8000}
+        (\texttt{api/}).
+  \item \textbf{Database} --- Neo4j with native vector indexes for
+        embedding-based retrieval.
+\end{itemize}
+
+The startup script that wires the first two together is
+\texttt{start.sh}; it cleans up listeners on ports \texttt{3000}/\texttt{8000}
+(filtered with \texttt{lsof -sTCP:LISTEN} so only servers, not browser
+client connections, are killed), activates the Python venv, and launches
+both processes.
+
+\section{Backend Layered Architecture}
+
+The Python backend follows a hexagonal layering. Within
+\texttt{src/graphbuilder/}:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{domain/models/} --- pure dataclasses
+        (\texttt{KnowledgeGraph}, \texttt{GraphRelationship},
+        \texttt{DocumentChunk}). No I/O, no async.
+  \item \texttt{core/} --- domain services that don't own state:
+        \texttt{processing/semantic\_chunker.py},
+        \texttt{verification/cascading.py},
+        \texttt{verification/embedding.py},
+        \texttt{verification/llm\_verifier.py}.
+  \item \texttt{application/use\_cases/} --- orchestrators that compose
+        domain services with infrastructure ports
+        (\texttt{document\_pipeline.py},
+        \texttt{relationship\_verification.py},
+        \texttt{open\_targets\_ingestion.py}, ...).
+  \item \texttt{infrastructure/} --- adapters: Neo4j repository
+        (\texttt{repositories/graph\_repository.py}), embedding factory
+        (\texttt{services/embedding\_factory.py}), GPU pool
+        (\texttt{services/gpu\_embedding\_pool.py}), LLM service
+        (\texttt{services/llm\_service.py}), config
+        (\texttt{config/settings.py}).
+  \item \texttt{cli/main.py} --- Click CLI for offline batch processing.
+\end{itemize}
+
+The HTTP surface lives in \texttt{api/main.py} and the routers under
+\texttt{api/routers/} (\texttt{ingest.py}, \texttt{graph.py},
+\texttt{verification.py}, \texttt{documents.py}, \texttt{curation.py},
+\texttt{health.py}, \texttt{export.py}, \texttt{dev.py}). Routers are
+thin: they parse the request, call an application use-case, and shape
+the response.
+
+\section{The Three Concurrency Primitives}
+
+The backend deliberately mixes three forms of concurrency, each chosen
+for the workload it is best at. Understanding which primitive owns which
+job is the key to reading the codebase.
+
+\subsection{Coroutines (asyncio) --- request and pipeline orchestration}
+
+Every router handler is \texttt{async}. The application layer is
+\texttt{async} all the way down: use-cases stage their work as
+\texttt{await}-able steps, with a \texttt{cancel\_check} barrier between
+each stage so that long-running pipelines can be aborted cleanly when a
+user cancels a job. The canonical example is
+\texttt{DocumentPipelineUseCase} in
+\texttt{src/graphbuilder/application/use\_cases/document\_pipeline.py},
+which executes:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \texttt{\_stage\_chunk}     --- semantic chunking
+  \item \texttt{\_stage\_entities}  --- entity extraction
+  \item \texttt{\_stage\_relationships} --- relationship extraction
+  \item \texttt{\_stage\_persist}   --- save to Neo4j
+  \item \texttt{\_stage\_verify}    --- cascading verification
+\end{enumerate}
+
+Coroutines own \emph{orchestration}, not CPU-bound work. They are cheap
+to create, they preserve a single shared event loop, and they let the
+pipeline issue many concurrent network and database calls (e.g.\ Neo4j
+batch writes, LLM calls) without spawning OS threads.
+
+\paragraph{Why this matters for the LLM call.}
+\texttt{LLMVerifier.verify} in
+\texttt{src/graphbuilder/core/verification/llm\_verifier.py} is
+\texttt{async} and awaits the underlying \texttt{llm\_service.generate\_text}.
+Many such verifications can be in flight on the same loop at once,
+limited only by the \texttt{VERIFY\_PARALLEL\_WORKERS} setting in
+\texttt{src/graphbuilder/infrastructure/config/settings.py}.
+
+\subsection{Threads --- where blocking math happens}
+
+The event loop must \emph{never} block. Two situations force us into
+threads:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{PyTorch / sentence-transformers inference.}
+        \texttt{SentenceTransformer.encode} is a synchronous CUDA-or-CPU
+        call that takes tens to hundreds of milliseconds. Calling it
+        directly from an async handler freezes \texttt{/health} and
+        every other in-flight request.
+  \item \textbf{Model warm-up and pool initialisation.}
+        SapBERT is $\sim$440~MB and takes 5--15~s to load. Doing this
+        synchronously at FastAPI startup would delay the first request.
+\end{enumerate}
+
+The threading lives in
+\texttt{src/graphbuilder/infrastructure/services/gpu\_embedding\_pool.py}
+and \texttt{src/graphbuilder/infrastructure/services/embedding\_factory.py}:
+
+\begin{itemize}[leftmargin=*]
+  \item One \emph{init thread} (\texttt{daemon=True},
+        \texttt{name="GPUEmbeddingPool-init"}) loads + warms a base
+        model, measures per-worker GPU memory, then spawns the worker
+        threads. The constructor returns immediately so FastAPI startup
+        is not blocked.
+  \item $N$ \emph{worker threads}
+        (\texttt{name="GPUEmbeddingWorker-i"}), each owning its own
+        \texttt{SentenceTransformer} replica and a dedicated
+        \texttt{torch.cuda.Stream} so the GPU scheduler can interleave
+        kernels instead of serialising on the default stream.
+  \item On \emph{CPU-only} machines the pool is never instantiated; a
+        single \texttt{asyncio.Lock} plus the default
+        \texttt{run\_in\_executor} thread are used (see
+        \texttt{embed\_async} / \texttt{embed\_batch\_async} in
+        \texttt{embedding\_factory.py}). The lock is required because
+        PyTorch CPU inference on the same model is not safe under
+        concurrent access; on CPU there is also nothing to gain from
+        parallel encodes because MKL/OpenMP already saturates cores
+        from a single call.
+\end{itemize}
+
+\subsection{Queue --- the GPU work-stealing pool}
+
+The single coupling between the asyncio world and the worker threads is
+a \texttt{queue.Queue} of \texttt{\_Job} items inside
+\texttt{GPUEmbeddingPool}:
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class _Job:
+    payload: Union[str, List[str]]
+    is_batch: bool
+    batch_size: int
+    future: asyncio.Future
+    loop:   asyncio.AbstractEventLoop
+\end{lstlisting}
+
+The async API (\texttt{embed\_async}, \texttt{embed\_batch\_async}) creates
+an \texttt{asyncio.Future} on the calling loop, packages it into a
+\texttt{\_Job}, drops it on the queue, and \texttt{await}s the future.
+Worker threads pull from the queue with a 0.5~s timeout (so they can
+notice the \texttt{stop\_event} during shutdown), run the encode under
+their CUDA stream, and resolve the future with
+\texttt{loop.call\_soon\_threadsafe}---the result lands back on the
+event-loop thread cleanly, with no asyncio primitives touched
+off-loop.
+
+The load-balancing policy is \emph{whoever is free first grabs the
+next job}. This is the simplest correct algorithm and matches what the
+GPU actually wants: a busy worker does not get a new job, an idle one
+does. Per-worker counters (\texttt{jobs\_in\_flight}) are tracked under
+a \texttt{threading.Lock} for observability.
+
+\subsection{Pools --- one model replica per worker}
+
+The pool's worker count is sized once at start-up. After loading and
+warming a single model, peak GPU memory is read with
+\texttt{torch.cuda.max\_memory\_allocated} (this captures weights
+\emph{plus} activations for a 32-batch forward pass), then:
+
+\[
+n = \min\!\left(\, \mathrm{max\_workers},\;
+        \max\!\left(\mathrm{min\_workers},\;
+        \left\lfloor
+          \tfrac{\mathrm{free\_bytes}\;\cdot\;\mathrm{memory\_fraction}}
+                {\mathrm{per\_worker\_bytes}}
+        \right\rfloor
+        \right) \right)
+\]
+
+with defaults \texttt{min\_workers=1}, \texttt{max\_workers=8},
+\texttt{memory\_fraction=0.7}. Each of the resulting $n$ workers loads
+its own \texttt{SentenceTransformer} replica into VRAM. The number is
+\textbf{static for the lifetime of the process}: there is no
+auto-scaler, and \texttt{shutdown()} only signals workers to stop, it
+does not resize.
+
+Override knobs (read by \texttt{embedding\_factory.py}):
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{EMBEDDING\_GPU\_WORKERS} --- exact count, bypasses the
+        formula above.
+  \item \texttt{EMBEDDING\_GPU\_MIN\_WORKERS} / \texttt{\_MAX\_WORKERS} ---
+        clamp range.
+  \item \texttt{EMBEDDING\_GPU\_MEMORY\_FRACTION} --- fraction of free
+        VRAM the pool may consume.
+  \item \texttt{EMBEDDING\_GPU\_DEVICE} --- target device, default
+        \texttt{cuda:0}.
+\end{itemize}
+
+\section{End-to-End Flow of an Embedding}
+
+The following walk-through traces a single embedding request from the
+chunker down to the GPU and back, illustrating how all four primitives
+collaborate.
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item A document arrives via
+        \texttt{POST /documents} (router: \texttt{api/routers/documents.py}).
+        FastAPI's event loop schedules the handler as a coroutine.
+  \item The handler delegates to
+        \texttt{DocumentPipelineUseCase.execute}
+        (\texttt{src/graphbuilder/application/use\_cases/document\_pipeline.py}).
+        \texttt{\_stage\_chunk} constructs a \texttt{SemanticChunker}
+        and calls \texttt{await chunker.chunk(content, document.id)}.
+  \item Inside \texttt{SemanticChunker.\_embed}
+        (\texttt{src/graphbuilder/core/processing/semantic\_chunker.py})
+        the sentence list is passed to
+        \texttt{embed\_batch\_async(sentences)}.
+  \item \texttt{embed\_batch\_async} in
+        \texttt{embedding\_factory.py} probes for a GPU pool. If
+        present, it forwards to
+        \texttt{GPUEmbeddingPool.embed\_batch\_async}; if not, it takes
+        the per-loop \texttt{asyncio.Lock} and runs \texttt{embed\_batch}
+        in the default thread executor.
+  \item \emph{(GPU path.)} The pool builds a \texttt{\_Job} with the
+        coroutine's future and \texttt{put}s it on the worker queue.
+        The coroutine \texttt{await}s the future.
+  \item A free worker thread pops the job, switches to its dedicated
+        \texttt{torch.cuda.Stream}, and runs \texttt{model.encode}.
+  \item The worker resolves the future via
+        \texttt{loop.call\_soon\_threadsafe(future.set\_result,
+        result)}. The event loop's I/O thread re-enters the awaiting
+        coroutine on the next tick.
+  \item The chunker turns the returned \texttt{List[Optional[List[float]]]}
+        into an \texttt{(N, D)} \texttt{np.ndarray}, runs the
+        sentence-grouping algorithm, and returns
+        \texttt{DocumentChunk}s up the call stack.
+\end{enumerate}
+
+The same pattern recurs for entity / relationship embeddings during
+\texttt{save\_entities\_batch} and \texttt{save\_relationships\_batch}
+in \texttt{src/graphbuilder/infrastructure/repositories/graph\_repository.py}.
+
+\section{Verification Cascade}
+
+A second concurrency hot spot is verification, in
+\texttt{src/graphbuilder/core/verification/cascading.py}. Each
+relationship goes through up to three stages, in order of cost:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Text-match} --- substring/lexical, instant.
+  \item \textbf{Embedding} --- cosine similarity against the
+        relationship's source chunk; uses the same
+        \texttt{embed\_batch\_async} path.
+  \item \textbf{LLM} --- structured-JSON prompt to
+        \texttt{LLMVerifier} (\texttt{llm\_verifier.py}), gated by
+        \texttt{VERIFY\_BATCH\_SKIP\_LLM} (default \texttt{true}, so
+        Stage 3 is skipped during pipeline batches and runs only when
+        the user manually triggers it from the
+        \texttt{/verification} page).
+\end{enumerate}
+
+The verification use-case
+(\texttt{application/use\_cases/relationship\_verification.py}) iterates
+relationships in coroutine form and dispatches the three stages
+sequentially per relationship; concurrency between relationships is
+controlled by the bounded
+\texttt{VERIFY\_PARALLEL\_WORKERS} semaphore in the pipeline orchestrator.
+
+\section{Configuration Surface}
+
+All concurrency-related knobs live in
+\texttt{src/graphbuilder/infrastructure/config/settings.py}:
+
+\medskip
+\begin{tabular}{@{}lll@{}}
+  \toprule
+  Setting / env var & Default & Effect \\
+  \midrule
+  \texttt{PROCESSING\_MODE}         & \texttt{batch}  & Selects bulk vs single-doc paths \\
+  \texttt{VERIFY\_ENABLED}          & \texttt{true}   & Master switch for the verify stage \\
+  \texttt{VERIFY\_BATCH\_SKIP\_LLM} & \texttt{true}   & Skip LLM stage in pipeline batches \\
+  \texttt{VERIFY\_PARALLEL\_WORKERS}& \texttt{4}      & In-pipeline relationship concurrency \\
+  \texttt{EMBEDDING\_GPU\_WORKERS}  & ---             & Force exact pool size \\
+  \texttt{EMBEDDING\_GPU\_MIN\_WORKERS} & \texttt{1}  & Pool sizing floor \\
+  \texttt{EMBEDDING\_GPU\_MAX\_WORKERS} & \texttt{8}  & Pool sizing ceiling \\
+  \texttt{EMBEDDING\_GPU\_MEMORY\_FRACTION} & \texttt{0.7} & VRAM share for pool \\
+  \texttt{EMBEDDING\_GPU\_DEVICE}   & \texttt{cuda:0} & Target CUDA device \\
+  \texttt{EMBEDDING\_MODEL}         & SapBERT         & Sentence-transformer model name \\
+  \bottomrule
+\end{tabular}
+
+\section{File Index}
+
+\begin{tabular}{@{}p{0.45\linewidth}p{0.50\linewidth}@{}}
+  \toprule
+  Path & Role \\
+  \midrule
+  \texttt{start.sh}                                        & Process supervisor, port cleanup \\
+  \texttt{api/main.py}                                     & FastAPI app + lifespan hooks \\
+  \texttt{api/routers/*.py}                                & HTTP routers (ingest, graph, verify, ...) \\
+  \texttt{application/use\_cases/document\_pipeline.py}    & Async ingest pipeline \\
+  \texttt{application/use\_cases/relationship\_verification.py} & Verification orchestrator \\
+  \texttt{application/use\_cases/open\_targets\_ingestion.py} & External-source ingestion \\
+  \texttt{core/processing/semantic\_chunker.py}            & Sentence-aware async chunker \\
+  \texttt{core/verification/cascading.py}                  & Three-stage verifier \\
+  \texttt{core/verification/llm\_verifier.py}              & LLM JSON verifier \\
+  \texttt{infrastructure/services/embedding\_factory.py}   & Backend-selection async API \\
+  \texttt{infrastructure/services/gpu\_embedding\_pool.py} & Threaded GPU pool + queue \\
+  \texttt{infrastructure/services/llm\_service.py}         & LLM client \\
+  \texttt{infrastructure/repositories/graph\_repository.py}& Neo4j persistence \\
+  \texttt{infrastructure/config/settings.py}               & Env-driven configuration \\
+  \bottomrule
+\end{tabular}
+
+\section{Take-aways}
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Coroutines own orchestration.} Every router and use-case
+        is \texttt{async}; the event loop is the single coordination
+        point.
+  \item \textbf{Threads own blocking math.} GPU encodes and model loads
+        run on threads so the loop never blocks; an
+        \texttt{asyncio.Future} bridges the two worlds.
+  \item \textbf{The queue decouples them.} \texttt{queue.Queue} is the
+        only object shared between the loop and the workers; the
+        ``free worker grabs next job'' policy is implicit
+        load-balancing.
+  \item \textbf{The pool is statically sized.} Worker count is decided
+        once at boot from a peak-memory measurement and a fraction of
+        free VRAM, then frozen for the process lifetime.
+  \item \textbf{CPU mode degrades gracefully.} Without CUDA the pool is
+        skipped entirely; a single shared model behind an
+        \texttt{asyncio.Lock} plus \texttt{run\_in\_executor} keeps the
+        loop responsive even though encodes are serialised.
+\end{itemize}
+
+\end{document}

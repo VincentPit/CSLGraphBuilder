@@ -63,7 +63,7 @@ class SemanticChunker:
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def chunk(
+    async def chunk(
         self,
         content: str,
         document_id: str,
@@ -76,7 +76,7 @@ class SemanticChunker:
         if not sentences:
             return []
 
-        embeddings = self._embed(sentences)
+        embeddings = await self._embed(sentences)
         groups = self._group_sentences(sentences, embeddings, content)
         groups = self._merge_small_groups(groups)
         return self._to_chunks(groups, document_id)
@@ -129,17 +129,34 @@ class SemanticChunker:
             sentences.extend(s for s in subs if s.strip())
         return sentences
 
-    def _embed(self, sentences: List[str]) -> np.ndarray:
-        """Return (N, D) embedding matrix for *sentences*."""
-        from ...infrastructure.services.embedding_factory import get_model
+    async def _embed(self, sentences: List[str]) -> np.ndarray:
+        """Return (N, D) embedding matrix for *sentences*.
 
-        model = get_model()
-        if model is None:
+        Routes through ``embed_batch_async`` so encodes are queued onto
+        the GPU pool's workers (or the CPU lock+executor fallback) rather
+        than blocking the calling thread on a direct ``model.encode`` call.
+        """
+        from ...infrastructure.services.embedding_factory import (
+            embed_batch_async,
+            get_embedding_dim,
+            get_model,
+        )
+
+        if get_model() is None:
             raise RuntimeError(
                 "No embedding model available; semantic chunking requires "
                 "sentence-transformers (see infrastructure.services.embedding_factory)."
             )
-        return model.encode(sentences, show_progress_bar=False)
+
+        vectors = await embed_batch_async(sentences)
+        dim = get_embedding_dim() or next(
+            (len(v) for v in vectors if v is not None), 0
+        )
+        matrix = np.zeros((len(sentences), dim), dtype=np.float32)
+        for i, v in enumerate(vectors):
+            if v is not None:
+                matrix[i] = np.asarray(v, dtype=np.float32)
+        return matrix
 
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = (np.linalg.norm(a) * np.linalg.norm(b))

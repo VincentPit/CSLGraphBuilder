@@ -346,7 +346,7 @@ class ProcessDocumentUseCase(UseCase):
         
         # Create chunks
         content = content_result.data.get("content", "")
-        chunks = self._create_content_chunks(content, document.id, task.configuration)
+        chunks = await self._create_content_chunks(content, document.id, task.configuration)
         
         # Save chunks with linked-list edges
         if hasattr(self.document_repo, 'save_chunks_with_links'):
@@ -371,7 +371,7 @@ class ProcessDocumentUseCase(UseCase):
             }
         )
     
-    def _create_content_chunks(
+    async def _create_content_chunks(
         self,
         content: str,
         document_id: str,
@@ -391,7 +391,7 @@ class ProcessDocumentUseCase(UseCase):
                 similarity_threshold=config.get("similarity_threshold", 0.5),
             )
             chunker = SemanticChunker(chunker_cfg)
-            return chunker.chunk(content, document_id)
+            return await chunker.chunk(content, document_id)
 
         # Fallback: fixed-size character window
         chunk_size = config.get("chunk_size", 1000)

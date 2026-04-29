@@ -1138,7 +1138,7 @@ def verify(ctx: click.Context, output: str, no_embedding: bool, no_llm: bool,
                 context_map=context_map,
             )
             use_case = RelationshipVerificationUseCase(raw_graph, llm_service=llm_svc)
-            result = use_case.execute(ver_config)
+            result = await use_case.execute(ver_config)
 
             if result.success:
                 d = result.data or {}

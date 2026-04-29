@@ -88,7 +88,7 @@ class TextVerificationUseCase:
         self._llm_service = llm_service
         self._graph_repo = graph_repo
 
-    def execute(
+    async def execute(
         self,
         query_text: str,
         config: TextVerificationConfig,
@@ -117,7 +117,7 @@ class TextVerificationUseCase:
             source_name = entity_names.get(rel.source_entity_id, rel.source_entity_id)
             target_name = entity_names.get(rel.target_entity_id, rel.target_entity_id)
 
-            result = verifier.verify(
+            result = await verifier.verify(
                 relationship=rel,
                 context=query_text,
                 source_name=source_name,

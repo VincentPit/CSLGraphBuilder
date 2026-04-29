@@ -89,7 +89,7 @@ class LLMVerifier:
     # Public API
     # ------------------------------------------------------------------
 
-    def verify(
+    async def verify(
         self,
         relationship: GraphRelationship,
         context: str,
@@ -116,7 +116,7 @@ class LLMVerifier:
         )
 
         try:
-            raw = self._llm.generate_text(
+            raw = await self._llm.generate_text(
                 prompt=user_prompt,
                 system_prompt=_SYSTEM_PROMPT,
                 temperature=self._cfg.temperature,

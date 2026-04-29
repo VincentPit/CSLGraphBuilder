@@ -73,7 +73,7 @@ class RelationshipVerificationUseCase:
     # Public API
     # ------------------------------------------------------------------
 
-    def execute(self, config: VerificationConfig) -> ProcessingResult:
+    async def execute(self, config: VerificationConfig) -> ProcessingResult:
         verifier = CascadingVerifier(
             config=config.cascading,
             llm_service=self._llm_service,
@@ -90,7 +90,7 @@ class RelationshipVerificationUseCase:
             source_name = config.entity_name_map.get(rel.source_entity_id)
             target_name = config.entity_name_map.get(rel.target_entity_id)
 
-            result = verifier.verify(
+            result = await verifier.verify(
                 relationship=rel,
                 context=context,
                 source_name=source_name,

@@ -105,7 +105,7 @@ class CascadingVerifier:
     # Public API
     # ------------------------------------------------------------------
 
-    def verify(
+    async def verify(
         self,
         relationship: GraphRelationship,
         context: str,
@@ -151,7 +151,7 @@ class CascadingVerifier:
                     "LLM stage enabled but no llm_service was provided; skipping."
                 )
             else:
-                result = self._llm_verifier.verify(**kwargs)
+                result = await self._llm_verifier.verify(**kwargs)
                 stage_results.append(result)
                 # LLM is the last stage — its result is always decisive
                 return self._aggregate(stage_results, decisive=result)

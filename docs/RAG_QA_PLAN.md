@@ -1,8 +1,18 @@
 # RAG Q&A System — Design Plan
 
 Branch: `feature/chatbot`
-Status: planning (not yet implemented)
-Date: 2026-05-08
+Plan drafted: 2026-05-08
+Last updated: 2026-05-09
+
+## Status
+
+**Shipped (8 commits on `feature/chatbot`, 292 unit tests passing):**
+P0 plan · P1 conversation persistence · P2 observability spine · P3 retrieval orchestrator (Cypher + vector + BM25 + RRF + chunk hydration) · P4 cross-encoder rerank + chunk neighbour expansion · P5 minimal `/qa/ask` endpoint · P6 working memory + rolling summary · P7 episodic recall · P12 `/chat` frontend with per-source confidence + retrieval trace · plus an unplanned **lightweight browser identity** (X-User-Id, chat-only, see §14.1).
+
+**Open / next:**
+P13 eval harness (recommended next — gives numbers to ablate against) · P8 faithfulness check · P11 SSE streaming · P9/P10 tool-use surface (gated on §14.6 — mutation authority) · P14 cross-session semantic memory.
+
+See §13 for the full phase table with commit refs.
 
 ---
 
@@ -798,25 +808,38 @@ Implementations: `Neo4jConversationRepository` (prod) + `InMemoryConversationRep
 
 ## 13. Implementation phases
 
-| Phase | Deliverable | Verifiable by |
-|---|---|---|
-| **P0** | This plan | Reviewed |
-| **P1** | `ConversationRepository` + Neo4j schema migration | unit tests, Cypher schema reflection |
-| **P2** | **Observability skeleton** — `request_id` propagation, `qa.*` loggers, extended `PipelineMetrics`, audit-log `actor` column | log-shape tests, `/health/metrics` shows new counters at zero |
-| **P3** | Retrieval orchestrator: Cypher + vector + BM25 channels, RRF fusion, no rerank yet | unit tests on each channel + RRF ordering |
-| **P4** | Cross-encoder rerank + chunk hydration + neighbour expansion | retrieval eval harness, baseline F1 numbers |
-| **P5** | `/qa/ask` endpoint (non-streaming first), `RetrievedItem` + `RetrievalTrace` + `TurnTrace` shapes | integration test, manual smoke |
-| **P6** | Memory layers: working + rolling summary | conversation tests, token-budget tests |
-| **P7** | Memory layers: episodic recall via turn vector index | targeted multi-turn tests ("what about its side effects?") |
-| **P8** | Faithfulness check (CascadingVerifier on extracted claims) | adversarial prompts, manual review |
-| **P9** | **Tool-use surface (read-only)** — `search_graph`, `get_entity`, `verify_claim` exposed to LLM; no mutations yet | tool-validation tests, end-to-end "look up X" flows |
-| **P10** | **Tool-use surface (mutating)** — propose/update/merge/soft-delete with PendingMutation + confirmation flow + audit rows | confirmation TTL tests, audit-log assertions, undo within window |
-| **P11** | SSE streaming endpoint | manual + e2e |
-| **P12** | Frontend `/chat` page (mirrors `/verification` look) including `MutationCard` + subgraph preview + `DebugPane` | visual review at localhost:3010/chat |
-| **P13** | Eval harness + gold set + CI gate | F1 ≥ targets in §9.2 |
-| **P14** | Semantic (cross-session) memory + user persona summary | regression tests, manual |
+| Phase | Deliverable | Status | Commit |
+|---|---|---|---|
+| **P0** | This plan | ✅ shipped | `ad4589d` |
+| **P1** | `ConversationRepository` + Neo4j schema migration | ✅ shipped | `ad4589d` |
+| **P2** | Observability skeleton — `request_id` propagation, `qa.*` loggers, extended `PipelineMetrics`, audit-log `actor` column | ✅ shipped | `ad4589d` |
+| **P3** | Retrieval orchestrator: Cypher + vector + BM25 channels, RRF fusion, chunk hydration | ✅ shipped | `43408b4` |
+| **P4** | Cross-encoder rerank + chunk neighbour expansion (`NEXT_CHUNK ±1`) | ✅ shipped | `c958dd1` |
+| **P5** | `/qa/ask` endpoint (non-streaming), `RetrievedItem` + `RetrievalTrace` shapes | ✅ shipped | `43408b4` |
+| **P6** | Working memory + rolling summary | ✅ shipped | `1f0e989` |
+| **P7** | Episodic recall via `turn_query_vector` index | ✅ shipped | `1f0e989` |
+| **P12** | Frontend `/chat` page with per-source confidence + retrieval trace + sidebar | ✅ shipped | `69524d6` |
+| **+ Identity** | Lightweight browser identity (`X-User-Id`, `/users` router, ownership rules) — out-of-plan addition resolving §14.1 | ✅ shipped | `331cdf4` |
+| **P13** | Eval harness + gold set + CI gate | ⏳ next | — |
+| **P8** | Faithfulness check (`CascadingVerifier` on extracted claims) | pending | — |
+| **P11** | SSE streaming endpoint | pending | — |
+| **P9** | Tool-use surface (read-only) — `search_graph`, `get_entity`, `verify_claim` exposed to LLM | pending; gated on §14.6 | — |
+| **P10** | Tool-use surface (mutating) — propose/update/merge/soft-delete with PendingMutation + confirmation flow + audit rows | pending; gated on §14.6 | — |
+| **P14** | Cross-session semantic memory + user persona summary | pending | — |
+| **+ MutationCard / DebugPane in `/chat`** | UI for §7 + §8 (was bundled into P12 originally; now blocked on P10) | deferred | — |
 
-Each phase is independently shippable. P2 (observability) is deliberately early so every later phase emits structured traces from day one. P13 (eval) should be wired up by P5 so we get retrieval numbers as we tune (don't wait until the end). P9 ships before P10 so the LLM gets used to the tool schema with zero-risk reads before we open up writes.
+Each phase is independently shippable. P2 (observability) was deliberately first so every later phase emits structured traces from day one. P13 (eval) is recommended next so the remaining quality phases (P4 ablations, P6/P7 tuning, P8) have numbers to chase rather than vibes. P9 ships before P10 so the LLM gets used to the tool schema with zero-risk reads before we open up writes.
+
+### Implementation refinements (vs. the original plan)
+
+A few small details drifted from the §3–§7 sketches during build; recording them here so the plan stays a single source of truth.
+
+- **Rolling-summary freshness signal (§5.2).** Instead of adding a `summarised_through_idx` column to `ConversationSession`, the cached summary itself starts with a `[summary covers N turns]` marker line. Comparing that count against the live "older turns" count is enough to detect staleness — no schema migration needed. Regeneration runs on every `/qa/ask` whose older-turn count has changed since the cache was written; otherwise we reuse.
+- **Embedding shared across retrieval + memory (§3.1, §5.3).** `QAService.ask()` embeds the query once at the top, then runs retrieval and memory build in parallel via `asyncio.gather`. The orchestrator's `retrieve()` accepts an optional `query_embedding` kwarg so callers with a pre-computed vector skip internal embedding.
+- **Cross-encoder degradation (§3.3).** When the model fails to load (no internet on first run, missing dep, etc.) the reranker passes through the input order and `score_rerank` stays `None`. The pipeline never crashes because of rerank — it just degrades to RRF order.
+- **Final-confidence math (§4).** With rerank: `0.7·score_rerank + 0.3·channel_max + multi_channel_bonus`. Without rerank: `channel_max + bonus`. Citation-coverage (§6.3, weight 0.2) layers on later in the QA service after the LLM has cited.
+- **Logger-filter placement (P2).** `RequestIdFilter` is attached to each *handler* rather than to the loggers. Python only runs logger-level filters for records emitted directly on that logger, so a filter on root would have skipped child-logger propagation and crashed the `[%(request_id)s]` format string.
+- **Test ergonomics for P4.** A module-level autouse fixture in `tests/unit/test_retrieval.py` no-ops `CrossEncoderReranker.rerank` so the 28 channel/RRF/orchestrator tests stay hermetic. Tests that exercise the rerank path inject a fake encoder via the module-level `_MODEL_CACHE`.
 
 ---
 
@@ -827,7 +850,7 @@ Each phase is independently shippable. P2 (observability) is deliberately early 
    First visit → frontend prompts for a display name → `POST /users` mints a `user_id` and a `:User` Neo4j node → both stored in `localStorage`. Every `/qa/*` request carries the id in `X-User-Id`. Server validates the header against the user repo on every call; missing → falls through to anonymous (back-compat); present-but-unknown → 401 with "clear localStorage and re-register". `ConversationSession.user_id` is now a real foreign key for new sessions; ownership is enforced on `GET`/`DELETE /qa/sessions/{id}` (mismatch returns 404, not 403, so we don't leak existence). Anonymous sessions stay readable to anyone, matching pre-identity behaviour. Other surfaces (`/graph`, `/curation`, etc.) remain shared. Real auth is a follow-up.
 2. **LLM cost ceiling** — OK with gpt-4o for answer generation, or prefer gpt-4o-mini? Affects faithfulness defaults.
 3. **Cross-encoder model** — fine to start with `cross-encoder/ms-marco-MiniLM-L-6-v2` (general) and swap to a biomedical cross-encoder later, or want biomedical from day one?
-4. **Conversation persistence** — Neo4j (per this plan, keeps everything in one store) or Postgres/Redis (cleaner separation, more ops)?
+4. ~~**Conversation persistence**~~ — **resolved (implicit, 2026-05-09)**. Shipped on Neo4j per the plan: `:ConversationSession` and `:ConversationTurn` nodes with a `turn_query_vector` cosine index for episodic recall. Keeps everything in one store; no Postgres/Redis dependency added. Re-evaluate when we need horizontal scaling or the audit log grows past disk budget.
 5. **Gold set sourcing** — happy to pull seed questions from the existing `curation` review queue, or have a domain SME author from scratch?
 6. **Mutation authority** — should *every* user be allowed to confirm graph mutations, or gate `propose_*` / `merge_entities` / `soft_delete_*` behind a curator role? (Affects auth on `/qa/mutations/*/apply`.)
 7. **Hard delete** — confirm we ship soft-delete only in v1 (my recommendation), or is there a workflow that needs irreversible removal?

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import sys
 import os
-from typing import Annotated, Any
+from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
@@ -21,6 +21,7 @@ from ..dependencies import (
     get_document_repo,
     get_graph_repo,
     get_llm,
+    get_user_repo,
 )
 from ..schemas.qa import (
     AskRequest,
@@ -48,6 +49,44 @@ from graphbuilder.core.retrieval.qa_service import QAService  # noqa: E402
 logger = logging.getLogger("graphbuilder.qa.api")
 
 router = APIRouter(prefix="/qa", tags=["qa"])
+
+
+# ----------------------------------------------------------------------
+# X-User-Id resolver
+# ----------------------------------------------------------------------
+#
+# Lightweight chat-only identity (§14.1 of docs/RAG_QA_PLAN.md, revised
+# 2026-05-09). Lenient: the header is OPTIONAL — when missing we fall
+# through to the existing anonymous-bucket behaviour so older clients
+# keep working. When present and valid we ``touch_user`` for the
+# last-seen freshness signal and surface the id back to handlers.
+#
+# When present-but-unknown (id was deleted, or someone fabricated one)
+# we 401 — silently creating a stand-in would let stale localStorage
+# write into the wrong account if/when ids are ever recycled.
+
+async def get_chat_user_id(
+    request: Request,
+    user_repo=Depends(get_user_repo),
+) -> Optional[str]:
+    """Resolve and validate the X-User-Id header for /qa/* routes."""
+    raw = request.headers.get("X-User-Id")
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if len(raw) > 128:
+        raise HTTPException(status_code=400, detail="X-User-Id too long")
+    user = await user_repo.touch_user(raw)
+    if user is None:
+        # The id is well-formed but doesn't resolve to an account —
+        # surface that explicitly so the frontend can reset localStorage.
+        raise HTTPException(
+            status_code=401,
+            detail="Unknown X-User-Id; clear localStorage and re-register.",
+        )
+    return user.id
 
 
 # ----------------------------------------------------------------------
@@ -97,6 +136,7 @@ async def ask(
     document_repo=Depends(get_document_repo),
     conversation_repo=Depends(get_conversation_repo),
     llm_service=Depends(get_llm),
+    chat_user_id: Optional[str] = Depends(get_chat_user_id),
     _=Depends(require_api_key),
 ) -> AskResponse:
     if not body.query or not body.query.strip():
@@ -110,11 +150,16 @@ async def ask(
         llm_service=llm_service,
     )
 
+    # Header takes precedence over the deprecated body field — the
+    # header is what the new frontend sends, and is also the only
+    # value we've validated against the user repo.
+    effective_user_id = chat_user_id if chat_user_id is not None else body.user_id
+
     try:
         result = await service.ask(
             query=body.query,
             session_id=body.session_id,
-            user_id=body.user_id,
+            user_id=effective_user_id,
             top_k=body.top_k,
         )
     except LookupError as exc:
@@ -131,10 +176,16 @@ async def get_session(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     conversation_repo=Depends(get_conversation_repo),
+    chat_user_id: Optional[str] = Depends(get_chat_user_id),
     _=Depends(require_api_key),
 ):
     session = await conversation_repo.get_session(session_id)
     if session is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    # Authorisation: a session that belongs to a user can only be read
+    # by that user. Anonymous (user_id=None) sessions stay readable
+    # by anyone, matching the pre-identity behaviour.
+    if session.user_id is not None and session.user_id != chat_user_id:
         raise HTTPException(status_code=404, detail="session not found")
     turns = await conversation_repo.get_turns_by_session(
         session_id, limit=limit, offset=offset,
@@ -145,16 +196,27 @@ async def get_session(
     }
 
 
-@router.get("/sessions", summary="List sessions for the anonymous user (v1)")
+@router.get("/sessions", summary="List sessions for the current user (or anonymous)")
 async def list_sessions(
-    user_id: str | None = Query(None),
+    user_id: str | None = Query(
+        None,
+        description=(
+            "Override filter; when omitted, defaults to the X-User-Id "
+            "header (or anonymous if neither is set)."
+        ),
+    ),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     conversation_repo=Depends(get_conversation_repo),
+    chat_user_id: Optional[str] = Depends(get_chat_user_id),
     _=Depends(require_api_key),
 ):
+    # Default to the header-resolved user when no explicit filter is
+    # given, so the chat sidebar shows YOUR sessions without the
+    # frontend having to pass user_id twice.
+    effective = user_id if user_id is not None else chat_user_id
     sessions = await conversation_repo.list_sessions(
-        user_id=user_id, limit=limit, offset=offset
+        user_id=effective, limit=limit, offset=offset
     )
     return {"sessions": [s.to_dict() for s in sessions]}
 
@@ -167,8 +229,17 @@ async def list_sessions(
 async def delete_session(
     session_id: str,
     conversation_repo=Depends(get_conversation_repo),
+    chat_user_id: Optional[str] = Depends(get_chat_user_id),
     _=Depends(require_api_key),
 ):
+    # Same auth rule as get_session: only the owner can delete a
+    # user-scoped session. Treat ownership mismatch as 404 not 403
+    # so we don't leak whether the id exists for someone else.
+    existing = await conversation_repo.get_session(session_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    if existing.user_id is not None and existing.user_id != chat_user_id:
+        raise HTTPException(status_code=404, detail="session not found")
     deleted = await conversation_repo.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="session not found")

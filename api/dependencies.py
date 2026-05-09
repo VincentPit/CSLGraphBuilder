@@ -35,6 +35,10 @@ from graphbuilder.infrastructure.repositories.conversation_repository import (
     ConversationRepositoryInterface,
     create_conversation_repository,
 )
+from graphbuilder.infrastructure.repositories.user_repository import (
+    UserRepositoryInterface,
+    create_user_repository,
+)
 from graphbuilder.infrastructure.services.llm_service import create_llm_service
 
 logger = logging.getLogger(__name__)
@@ -131,6 +135,25 @@ async def get_conversation_repo(
             embedding_dim,
         )
     return _conversation_repo_instance
+
+
+_user_repo_instance: UserRepositoryInterface | None = None
+
+
+async def get_user_repo(
+    config: Annotated[GraphBuilderConfig, Depends(get_app_config)],
+) -> UserRepositoryInterface:
+    """Singleton user repo — like the conversation repo, we keep one
+    instance alive so the in-memory dev path doesn't drop accounts on
+    every request and the Neo4j schema-init task isn't re-spawned."""
+    global _user_repo_instance
+    if _user_repo_instance is None:
+        driver = _get_neo4j_driver() if config.database.provider == "neo4j" else None
+        _user_repo_instance = create_user_repository(config, neo4j_driver=driver)
+        logger.info(
+            "User repo initialised: %s", type(_user_repo_instance).__name__,
+        )
+    return _user_repo_instance
 
 
 async def get_llm(

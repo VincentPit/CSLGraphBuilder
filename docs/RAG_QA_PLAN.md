@@ -822,7 +822,9 @@ Each phase is independently shippable. P2 (observability) is deliberately early 
 
 ## 14. Open questions for the user
 
-1. **User identity** — is there an existing `user_id` we plug into sessions and audit rows, or do we treat unauthenticated traffic as a single anonymous user for v1?
+1. ~~**User identity**~~ — **resolved 2026-05-09**. Lightweight browser identity, chat-only.
+
+   First visit → frontend prompts for a display name → `POST /users` mints a `user_id` and a `:User` Neo4j node → both stored in `localStorage`. Every `/qa/*` request carries the id in `X-User-Id`. Server validates the header against the user repo on every call; missing → falls through to anonymous (back-compat); present-but-unknown → 401 with "clear localStorage and re-register". `ConversationSession.user_id` is now a real foreign key for new sessions; ownership is enforced on `GET`/`DELETE /qa/sessions/{id}` (mismatch returns 404, not 403, so we don't leak existence). Anonymous sessions stay readable to anyone, matching pre-identity behaviour. Other surfaces (`/graph`, `/curation`, etc.) remain shared. Real auth is a follow-up.
 2. **LLM cost ceiling** — OK with gpt-4o for answer generation, or prefer gpt-4o-mini? Affects faithfulness defaults.
 3. **Cross-encoder model** — fine to start with `cross-encoder/ms-marco-MiniLM-L-6-v2` (general) and swap to a biomedical cross-encoder later, or want biomedical from day one?
 4. **Conversation persistence** — Neo4j (per this plan, keeps everything in one store) or Postgres/Redis (cleaner separation, more ops)?

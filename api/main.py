@@ -10,7 +10,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .middleware import RequestIdMiddleware
-from .routers import health, graph, documents, ingest, curation, verification, export, dev, qa
+from .routers import (
+    curation,
+    dev,
+    documents,
+    export,
+    graph,
+    health,
+    ingest,
+    qa,
+    users,
+    verification,
+)
 
 
 def _configure_logging() -> None:
@@ -139,6 +150,7 @@ def create_app() -> FastAPI:
     app.include_router(export.router)
     app.include_router(dev.router)
     app.include_router(qa.router)
+    app.include_router(users.router)
 
     return app
 

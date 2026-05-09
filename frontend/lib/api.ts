@@ -1,11 +1,28 @@
 import axios from 'axios';
 
+import { getStoredIdentity } from './identity';
+
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? '';
 
 export const apiClient = axios.create({
   baseURL: BASE_URL,
   headers: API_KEY ? { 'X-API-Key': API_KEY } : {},
+});
+
+// Read the chatbot identity from localStorage on every outgoing request
+// so identity changes (sign in / rename / clear) take effect immediately
+// without rebuilding the axios instance. ``getStoredIdentity`` is
+// SSR-safe — returns null on the server, so this interceptor is a no-op
+// inside Next.js server components.
+apiClient.interceptors.request.use((config) => {
+  const identity = getStoredIdentity();
+  if (identity) {
+    config.headers = config.headers ?? {};
+    // axios v1 typing accepts setting via direct assignment.
+    (config.headers as Record<string, string>)['X-User-Id'] = identity.id;
+  }
+  return config;
 });
 
 /**
@@ -589,3 +606,24 @@ export const sendChatFeedback = (
   apiClient
     .post<{ turn_id: string; accepted: boolean }>(`/qa/turns/${turnId}/feedback`, body)
     .then((r) => r.data);
+
+// ── Chatbot users (lightweight browser identity, §14.1) ──────────────────
+
+export interface ChatUser {
+  id: string;
+  display_name: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  last_seen_at: string;
+}
+
+export const registerChatUser = (body: { display_name: string }) =>
+  apiClient.post<ChatUser>('/users', body).then((r) => r.data);
+
+export const getChatUser = (userId: string) =>
+  apiClient.get<ChatUser>(`/users/${userId}`).then((r) => r.data);
+
+export const updateChatUser = (
+  userId: string,
+  body: { display_name?: string; metadata?: Record<string, unknown> },
+) => apiClient.patch<ChatUser>(`/users/${userId}`, body).then((r) => r.data);

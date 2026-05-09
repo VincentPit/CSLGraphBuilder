@@ -30,8 +30,16 @@ import {
   askQuestion,
   formatApiError,
   getChatSession,
+  getChatUser,
   listChatSessions,
 } from '@/lib/api';
+import {
+  ChatIdentity,
+  getStoredIdentity,
+  onIdentityChange,
+  setStoredIdentity,
+} from '@/lib/identity';
+import IdentityPrompt from '@/components/chat/IdentityPrompt';
 import MessageBubble from '@/components/chat/MessageBubble';
 import SessionSidebar from '@/components/chat/SessionSidebar';
 
@@ -82,10 +90,61 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
 
+  // Identity. ``identityChecked`` distinguishes "still hydrating from
+  // localStorage on the client" (don't render anything yet) from
+  // "definitely no identity, show the prompt".
+  const [identity, setIdentity] = useState<ChatIdentity | null>(null);
+  const [identityChecked, setIdentityChecked] = useState(false);
+
+  // Hydrate identity once on mount + listen for storage events so a
+  // sign-in or sign-out in another tab updates this one.
+  useEffect(() => {
+    const stored = getStoredIdentity();
+    if (stored) {
+      // Validate the stored id against the backend — the user node may
+      // have been deleted out from under us; if so we drop the stale
+      // identity and re-prompt rather than 401-looping every request.
+      getChatUser(stored.id)
+        .then((u) => {
+          const validated: ChatIdentity = { id: u.id, displayName: u.display_name };
+          setStoredIdentity(validated);
+          setIdentity(validated);
+        })
+        .catch(() => {
+          setStoredIdentity(null);
+          setIdentity(null);
+        })
+        .finally(() => setIdentityChecked(true));
+    } else {
+      setIdentityChecked(true);
+    }
+    return onIdentityChange((next) => setIdentity(next));
+  }, []);
+
+  function handleIdentitySet(next: ChatIdentity) {
+    setIdentity(next);
+    setIdentityChecked(true);
+    // The sidebar list is keyed on the *current* user via the X-User-Id
+    // header; refresh it now that the header will be set on subsequent
+    // calls.
+    qc.invalidateQueries({ queryKey: ['chat-sessions'] });
+  }
+
+  function handleClearIdentity() {
+    setStoredIdentity(null);
+    setIdentity(null);
+    setSessionId(null);
+    setTurns([]);
+    qc.invalidateQueries({ queryKey: ['chat-sessions'] });
+  }
+
   // Sidebar list — refetched after each /ask + after deletes.
+  // Disabled while we don't yet have an identity so we don't list
+  // anonymous sessions to a soon-to-be-identified user.
   const { data: sessionList, isLoading: sessionsLoading } = useQuery({
-    queryKey: ['chat-sessions'],
+    queryKey: ['chat-sessions', identity?.id ?? 'anon'],
     queryFn: () => listChatSessions({ limit: 50 }),
+    enabled: identityChecked && identity !== null,
   });
   const sessions: ChatSession[] = sessionList?.sessions ?? [];
 
@@ -170,16 +229,40 @@ export default function ChatPage() {
   }
 
   const showWelcome = useMemo(() => turns.length === 0 && !sessionId, [turns, sessionId]);
+  const needsIdentity = identityChecked && identity === null;
 
   return (
     <div className="space-y-6 max-w-[1280px] mx-auto">
-      <header>
-        <h1 className="page-title">Chat</h1>
-        <p className="page-desc">
-          Ask the knowledge graph in natural language. Every answer cites the
-          entities, relationships, and source chunks it used, with per-channel
-          confidence so you can see how it got there.
-        </p>
+      <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+        <div>
+          <h1 className="page-title">Chat</h1>
+          <p className="page-desc">
+            Ask the knowledge graph in natural language. Every answer cites the
+            entities, relationships, and source chunks it used, with per-channel
+            confidence so you can see how it got there.
+          </p>
+        </div>
+        {identity && (
+          <div
+            className="flex items-center gap-2 text-xs"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <span>
+              Signed in as{' '}
+              <span style={{ color: 'var(--text-primary)' }}>
+                {identity.displayName}
+              </span>
+            </span>
+            <button
+              type="button"
+              onClick={handleClearIdentity}
+              className="btn-ghost text-xs"
+              title="Forget this browser identity"
+            >
+              Sign out
+            </button>
+          </div>
+        )}
       </header>
 
       <div
@@ -190,18 +273,27 @@ export default function ChatPage() {
           minHeight: 'min(calc(100vh - 14rem), 720px)',
         }}
       >
-        <SessionSidebar
-          sessions={sessions}
-          loading={sessionsLoading}
-          activeSessionId={sessionId}
-          onSelect={handleSelect}
-          onNew={handleNew}
-          onDeleted={handleDeleted}
-        />
+        {/* Hide the sidebar until identity is set so an anonymous reader
+            can't kick off retrieval queries without registering first. */}
+        {identity && (
+          <SessionSidebar
+            sessions={sessions}
+            loading={sessionsLoading}
+            activeSessionId={sessionId}
+            onSelect={handleSelect}
+            onNew={handleNew}
+            onDeleted={handleDeleted}
+          />
+        )}
 
         <div className="flex-1 flex flex-col min-w-0">
           <div className="flex-1 overflow-y-auto p-5 space-y-6">
-            {showWelcome && <WelcomeCard onUseExample={(q) => setDraft(q)} />}
+            {needsIdentity && (
+              <IdentityPrompt onIdentitySet={handleIdentitySet} />
+            )}
+            {!needsIdentity && showWelcome && (
+              <WelcomeCard onUseExample={(q) => setDraft(q)} />
+            )}
 
             {!showWelcome && turns.length === 0 && (
               <div
@@ -234,50 +326,52 @@ export default function ChatPage() {
             <div ref={threadEndRef} />
           </div>
 
-          <form
-            onSubmit={handleSubmit}
-            className="border-t p-3"
-            style={{ borderColor: 'var(--border-subtle)' }}
-          >
-            <div className="flex items-end gap-2">
-              <textarea
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  // Enter sends; Shift+Enter inserts a newline. Mirrors
-                  // the verification page's textarea ergonomics.
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSubmit(e as unknown as React.FormEvent);
-                  }
-                }}
-                placeholder="Ask about a gene, drug, disease, or relationship in the graph…"
-                rows={2}
-                disabled={sending}
-                className="input flex-1 resize-none"
-                style={{ minHeight: '52px', maxHeight: '160px' }}
-              />
-              <button
-                type="submit"
-                disabled={sending || !draft.trim()}
-                className="btn-primary"
-                aria-label="Send"
-              >
-                {sending ? (
-                  <Loader2 size={14} className="animate-spin" />
-                ) : (
-                  <Send size={14} />
-                )}
-                <span className="hidden sm:inline">Send</span>
-              </button>
-            </div>
-            <p
-              className="text-[10px] mt-1.5"
-              style={{ color: 'var(--text-muted)' }}
+          {identity && (
+            <form
+              onSubmit={handleSubmit}
+              className="border-t p-3"
+              style={{ borderColor: 'var(--border-subtle)' }}
             >
-              Enter to send · Shift+Enter for newline · Citations like [1] in the answer link to the matching source card.
-            </p>
-          </form>
+              <div className="flex items-end gap-2">
+                <textarea
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    // Enter sends; Shift+Enter inserts a newline. Mirrors
+                    // the verification page's textarea ergonomics.
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSubmit(e as unknown as React.FormEvent);
+                    }
+                  }}
+                  placeholder="Ask about a gene, drug, disease, or relationship in the graph…"
+                  rows={2}
+                  disabled={sending}
+                  className="input flex-1 resize-none"
+                  style={{ minHeight: '52px', maxHeight: '160px' }}
+                />
+                <button
+                  type="submit"
+                  disabled={sending || !draft.trim()}
+                  className="btn-primary"
+                  aria-label="Send"
+                >
+                  {sending ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <Send size={14} />
+                  )}
+                  <span className="hidden sm:inline">Send</span>
+                </button>
+              </div>
+              <p
+                className="text-[10px] mt-1.5"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                Enter to send · Shift+Enter for newline · Citations like [1] in the answer link to the matching source card.
+              </p>
+            </form>
+          )}
         </div>
       </div>
     </div>

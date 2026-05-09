@@ -12,6 +12,7 @@ import {
   Download,
   Hexagon,
   Layers,
+  MessageSquare,
   Menu,
   X,
 } from 'lucide-react';
@@ -23,6 +24,7 @@ const groups = [
     links: [
       { href: '/',      label: 'Dashboard', icon: LayoutDashboard, tip: 'Overview of the knowledge graph' },
       { href: '/graph', label: 'Graph',     icon: Network,         tip: 'Explore the knowledge graph visually' },
+      { href: '/chat',  label: 'Chat',      icon: MessageSquare,   tip: 'Ask the graph in natural language' },
     ],
   },
   {

@@ -467,3 +467,114 @@ export const getPendingReviews = (status = 'pending') =>
 
 export const decideReview = (body: { review_id: string; decision: 'approve' | 'reject'; notes?: string }) =>
   apiClient.post<{ review_id: string; status: string; notes: string | null }>('/verification/reviews/decide', body).then((r) => r.data);
+
+// ── Chat / QA ────────────────────────────────────────────────────────────
+
+export type RetrievalChannel =
+  | 'cypher'
+  | 'vector_entity'
+  | 'vector_relationship'
+  | 'bm25';
+
+export interface ChatSource {
+  kind: 'entity' | 'relationship' | 'chunk';
+  id: string;
+  label: string;
+  score_vector?: number | null;
+  score_bm25?: number | null;
+  score_cypher?: number | null;
+  score_rrf: number;
+  score_rerank?: number | null;
+  final_confidence: number;
+  source_url?: string | null;
+  source_doc_id?: string | null;
+  source_chunk_id?: string | null;
+  source_chunk_ids: string[];
+  chunk_preview?: string | null;
+  contributing_channels: RetrievalChannel[];
+  reasoning: string;
+}
+
+export interface ChannelTrace {
+  channel: RetrievalChannel;
+  hits: number;
+  latency_ms: number;
+  error?: string | null;
+}
+
+export interface RetrievalTrace {
+  query: string;
+  extracted_terms: string[];
+  channels: ChannelTrace[];
+  rrf_top_n: number;
+  final_top_k: number;
+  hydrated_chunks: number;
+  total_latency_ms: number;
+}
+
+export interface AskResponse {
+  session_id: string;
+  turn_id: string;
+  answer: string;
+  sources: ChatSource[];
+  cited_source_indices: number[];
+  retrieval_trace: RetrievalTrace;
+  request_id?: string | null;
+  latency_ms: number;
+}
+
+export interface ChatTurn {
+  id: string;
+  session_id: string;
+  idx: number;
+  user_query: string;
+  llm_answer: string;
+  request_id?: string | null;
+  cited_entity_ids: string[];
+  cited_relationship_ids: string[];
+  cited_chunk_ids: string[];
+  feedback_rating?: number | null;
+  feedback_comment?: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  latency_ms: number;
+  created_at: string;
+}
+
+export interface ChatSession {
+  id: string;
+  user_id?: string | null;
+  title?: string | null;
+  summary: string;
+  turn_count: number;
+  created_at: string;
+  last_active_at: string;
+}
+
+export const askQuestion = (body: {
+  query: string;
+  session_id?: string;
+  user_id?: string | null;
+  top_k?: number;
+}) => apiClient.post<AskResponse>('/qa/ask', body).then((r) => r.data);
+
+export const getChatSession = (sessionId: string) =>
+  apiClient
+    .get<{ session: ChatSession; turns: ChatTurn[] }>(`/qa/sessions/${sessionId}`)
+    .then((r) => r.data);
+
+export const listChatSessions = (params?: { user_id?: string | null; limit?: number; offset?: number }) =>
+  apiClient
+    .get<{ sessions: ChatSession[] }>('/qa/sessions', { params })
+    .then((r) => r.data);
+
+export const deleteChatSession = (sessionId: string) =>
+  apiClient.delete(`/qa/sessions/${sessionId}`).then((r) => r.status === 204);
+
+export const sendChatFeedback = (
+  turnId: string,
+  body: { rating: -1 | 0 | 1; comment?: string },
+) =>
+  apiClient
+    .post<{ turn_id: string; accepted: boolean }>(`/qa/turns/${turnId}/feedback`, body)
+    .then((r) => r.data);

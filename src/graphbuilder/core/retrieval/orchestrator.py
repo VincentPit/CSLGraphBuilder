@@ -32,6 +32,7 @@ from .models import (
     RetrievalTrace,
     RetrievedItem,
 )
+from .reranker import CrossEncoderConfig, CrossEncoderReranker
 from .rrf import reciprocal_rank_fusion
 from .term_extraction import extract_terms
 
@@ -52,6 +53,7 @@ class RetrievalOrchestrator:
         graph_repo: Any,
         document_repo: Optional[Any] = None,
         config: Optional[RetrievalConfig] = None,
+        reranker: Optional[CrossEncoderReranker] = None,
     ) -> None:
         self._graph_repo = graph_repo
         self._document_repo = document_repo
@@ -59,6 +61,11 @@ class RetrievalOrchestrator:
         self._vector_channel = VectorChannel(graph_repo, self._cfg)
         self._bm25_channel = Bm25Channel(graph_repo, self._cfg)
         self._cypher_channel = CypherChannel(graph_repo, self._cfg)
+        # Reranker is constructed lazily — the model only loads on the
+        # first `retrieve()` call, after the orchestrator is wired up.
+        self._reranker = reranker or CrossEncoderReranker(
+            CrossEncoderConfig(model_name=self._cfg.cross_encoder_model)
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -103,23 +110,37 @@ class RetrievalOrchestrator:
             rankings, k=self._cfg.rrf_k, top_n=self._cfg.rrf_top_n
         )
 
-        items: List[RetrievedItem] = []
-        for composite_id, rrf_score in fused[:final_top_k]:
+        # Build RetrievedItem objects for every top_n candidate so the
+        # cross-encoder reranks the full shortlist, not just the
+        # already-trimmed final_top_k. Rerank uses label + description,
+        # which doesn't need chunks to be hydrated yet — chunks are
+        # fetched after the trim so we don't hydrate items that the
+        # rerank would have dropped.
+        candidates: List[RetrievedItem] = []
+        for composite_id, rrf_score in fused:
             hits = hit_index.get(composite_id, [])
             if not hits:
                 continue
-            item = self._build_item(composite_id, hits, rrf_score)
-            items.append(item)
+            candidates.append(self._build_item(composite_id, hits, rrf_score))
 
-        # Chunk hydration — sequential and bounded so a slow doc-repo
-        # query can't blow up the turn latency budget.
+        if self._cfg.enable_cross_encoder and candidates:
+            t_rerank = time.perf_counter()
+            candidates = await self._reranker.rerank(query, candidates)
+            await self._record_rerank_latency(time.perf_counter() - t_rerank)
+
+        items = candidates[:final_top_k]
+
+        # Chunk hydration with optional ±radius :NEXT_CHUNK expansion so
+        # the LLM sees the surrounding paragraph not just the matched
+        # sentence. Sequential + bounded — a slow doc-repo query can't
+        # blow up the turn latency budget thanks to channel timeout.
         hydrated_count = 0
         if self._cfg.hydrate_chunks and self._document_repo is not None:
             hydrated_count = await self._hydrate_chunks(items)
 
-        # Final confidence — for v1 it's max(per-channel score) + a
-        # bump if multiple channels contributed. The cross-encoder
-        # rerank in P4 will replace this with a learned score.
+        # Final confidence — when the cross-encoder ran we use it as the
+        # primary signal; otherwise we fall back to the per-channel max
+        # plus a "multi-channel agreement" bonus.
         for item in items:
             item.final_confidence = _compute_final_confidence(item)
 
@@ -268,44 +289,90 @@ class RetrievalOrchestrator:
         )
 
     async def _hydrate_chunks(self, items: List[RetrievedItem]) -> int:
-        """Attach a short text preview to each item from its first cited chunk.
+        """Attach a chunk preview to each item, with ±radius neighbour
+        expansion so the LLM sees the surrounding paragraph.
 
-        Bounded by ``max_chunks_per_item`` (we currently use one) and
-        ``max_chunk_chars``. This is intentionally simple — neighbour
-        expansion via ``:NEXT_CHUNK`` belongs in P4.
+        For each item we walk the ``:NEXT_CHUNK`` linked list ±``cfg.
+        chunk_neighbour_radius`` from its first cited chunk, then
+        concatenate the neighbour contents (oldest → newest) capped at
+        ``max_chunk_chars``. Falls back to the legacy single-chunk
+        path when ``chunk_neighbour_radius == 0`` so callers can opt
+        out without taking an extra Cypher round-trip.
         """
         if self._document_repo is None:
             return 0
 
-        # Collect a unique set of chunk ids across items.
-        wanted: List[str] = []
-        for item in items:
-            for cid in item.source_chunk_ids[: self._cfg.max_chunks_per_item]:
-                if cid and cid not in wanted:
-                    wanted.append(cid)
+        radius = self._cfg.chunk_neighbour_radius
 
-        if not wanted:
-            return 0
+        # Fast path: radius=0 → batch fetch by id like the original
+        # behaviour. Saves N Cypher calls when neighbours aren't needed.
+        if radius <= 0:
+            wanted: List[str] = []
+            for item in items:
+                for cid in item.source_chunk_ids[: self._cfg.max_chunks_per_item]:
+                    if cid and cid not in wanted:
+                        wanted.append(cid)
+            if not wanted:
+                return 0
+            try:
+                chunks = await self._document_repo.get_chunks_by_ids(wanted)
+            except Exception as exc:
+                logger.warning("chunk hydration failed: %s", exc)
+                return 0
+            by_id = {c.id: c for c in (chunks or [])}
+            hydrated = 0
+            for item in items:
+                for cid in item.source_chunk_ids[: self._cfg.max_chunks_per_item]:
+                    chunk = by_id.get(cid)
+                    if not chunk:
+                        continue
+                    content = (chunk.content or "")[: self._cfg.max_chunk_chars]
+                    item.chunk_preview = content
+                    item.source_chunk_id = chunk.id
+                    item.source_doc_id = item.source_doc_id or chunk.document_id
+                    hydrated += 1
+                    break
+            return hydrated
 
-        try:
-            chunks = await self._document_repo.get_chunks_by_ids(wanted)
-        except Exception as exc:
-            logger.warning("chunk hydration failed: %s", exc)
-            return 0
+        # Neighbour-expanded path: one repo call per item, in parallel.
+        # Each call returns the chunk + its prev/next neighbours.
+        async def _fetch(item_chunk_id: str) -> List[Any]:
+            try:
+                return await self._document_repo.get_chunk_with_neighbours(
+                    item_chunk_id, radius=radius
+                )
+            except Exception as exc:
+                logger.debug("get_chunk_with_neighbours(%s) failed: %s", item_chunk_id, exc)
+                return []
 
-        by_id = {c.id: c for c in (chunks or [])}
+        targets = [
+            item.source_chunk_ids[0] if item.source_chunk_ids else None
+            for item in items
+        ]
+        fetched = await asyncio.gather(
+            *(_fetch(t) for t in targets if t),
+            return_exceptions=False,
+        )
+        # Re-index by item — gather drops the entries where target was
+        # None, so we walk both lists in step.
+        results_iter = iter(fetched)
         hydrated = 0
-        for item in items:
-            for cid in item.source_chunk_ids[: self._cfg.max_chunks_per_item]:
-                chunk = by_id.get(cid)
-                if not chunk:
-                    continue
-                content = (chunk.content or "")[: self._cfg.max_chunk_chars]
-                item.chunk_preview = content
-                item.source_chunk_id = chunk.id
-                item.source_doc_id = item.source_doc_id or chunk.document_id
-                hydrated += 1
-                break  # one preview per item is enough for v1
+        for item, target in zip(items, targets):
+            if not target:
+                continue
+            neighbours = next(results_iter, [])
+            if not neighbours:
+                continue
+            ordered = sorted(neighbours, key=lambda c: getattr(c, "chunk_index", 0))
+            joined = " … ".join(
+                (c.content or "").strip() for c in ordered if c.content
+            )
+            content = joined[: self._cfg.max_chunk_chars]
+            anchor = next((c for c in ordered if c.id == target), ordered[0])
+            item.chunk_preview = content
+            item.source_chunk_id = anchor.id
+            item.source_doc_id = item.source_doc_id or anchor.document_id
+            hydrated += 1
         return hydrated
 
     async def _record_metrics(
@@ -324,30 +391,50 @@ class RetrievalOrchestrator:
                 channel=cr.channel.value, count=cr.hit_count
             )
 
+    async def _record_rerank_latency(self, seconds: float) -> None:
+        try:
+            from ...infrastructure.services.metrics import get_metrics
+        except Exception:
+            return
+        await get_metrics().record_qa_latency(phase="rerank", seconds=seconds)
+
 
 # ----------------------------------------------------------------------
 # Confidence + reasoning helpers
 # ----------------------------------------------------------------------
 
 def _compute_final_confidence(item: RetrievedItem) -> float:
-    """Blend per-channel scores into a single 0..1 confidence.
+    """Blend per-channel + rerank scores into a single 0..1 confidence.
 
-    v1 formula (replaced by cross-encoder rerank in P4):
+    With cross-encoder rerank (P4):
 
-        base = max(score_vector, score_bm25, score_cypher)
-        bonus = 0.05 * (number_of_contributing_channels - 1)
-        final = clip(base + bonus, 0, 1)
+        primary = score_rerank                   (weight 0.7)
+        channel = max(score_vector, bm25, cypher)  (weight 0.3)
+        bonus   = 0.05 * (n_channels - 1)
+        final   = clip(0.7*primary + 0.3*channel + bonus, 0, 1)
 
-    The "multiple channels agreed" bonus rewards items that show up in
-    more than one ranking — those are unlikely to be coincidental.
+    Without rerank (cross-encoder unavailable / disabled):
+
+        base    = max(score_vector, bm25, cypher)
+        bonus   = 0.05 * (n_channels - 1)
+        final   = clip(base + bonus, 0, 1)
+
+    The "multiple channels agreed" bonus rewards items that show up
+    in more than one ranking — those are unlikely to be coincidental.
+    Citation-coverage (§4 of the plan, weight 0.2) is layered on later
+    by the QA service after the LLM has answered.
     """
     components = [
         s for s in (item.score_vector, item.score_bm25, item.score_cypher)
         if s is not None
     ]
-    base = max(components) if components else 0.0
+    channel_max = max(components) if components else 0.0
     bonus = 0.05 * max(0, len(item.contributing_channels) - 1)
-    return round(min(1.0, base + bonus), 4)
+    if item.score_rerank is not None:
+        blended = 0.7 * item.score_rerank + 0.3 * channel_max
+    else:
+        blended = channel_max
+    return round(min(1.0, blended + bonus), 4)
 
 
 def _build_reasoning(

@@ -31,7 +31,23 @@ from graphbuilder.core.retrieval.channels import (  # noqa: E402
     VectorChannel,
 )
 from graphbuilder.core.retrieval.models import ItemKind  # noqa: E402
+from graphbuilder.core.retrieval.reranker import CrossEncoderReranker  # noqa: E402
 from graphbuilder.core.retrieval.term_extraction import extract_terms  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _stub_cross_encoder(monkeypatch):
+    """No-op the cross-encoder for the whole module.
+
+    Existing channel/RRF/orchestrator tests don't care about rerank
+    quality and shouldn't pay the model-load cost (or hit the network
+    on a cold cache). Tests that *do* exercise rerank construct their
+    own ``CrossEncoderReranker`` and inject it via the orchestrator
+    constructor — bypassing this stub.
+    """
+    async def passthrough(self, query, items, *, top_k=None):
+        return items[: top_k] if top_k is not None else items
+    monkeypatch.setattr(CrossEncoderReranker, "rerank", passthrough)
 from graphbuilder.domain.models.graph_models import (  # noqa: E402
     EntityType,
     GraphEntity,
@@ -48,6 +64,7 @@ class FakeChunk:
     id: str
     content: str
     document_id: str = "doc_1"
+    chunk_index: int = 0
 
 
 class FakeGraphRepo:
@@ -95,6 +112,20 @@ class FakeDocumentRepo:
 
     async def get_chunks_by_ids(self, chunk_ids):
         return [self._chunks[cid] for cid in chunk_ids if cid in self._chunks]
+
+    async def get_chunk_with_neighbours(self, chunk_id, radius=1):
+        # Match the in-memory implementation: locate the target's
+        # document and slice ±radius around it by chunk_index.
+        if chunk_id not in self._chunks:
+            return []
+        target = self._chunks[chunk_id]
+        same_doc = [c for c in self._chunks.values() if c.document_id == target.document_id]
+        ordered = sorted(same_doc, key=lambda c: getattr(c, "chunk_index", 0))
+        idx = next((i for i, c in enumerate(ordered) if c.id == chunk_id), -1)
+        if idx < 0:
+            return []
+        bounded = max(0, min(int(radius), 5))
+        return ordered[max(0, idx - bounded) : idx + bounded + 1]
 
 
 def _make_entity(eid: str, name: str, *, chunk_ids: Optional[List[str]] = None) -> GraphEntity:

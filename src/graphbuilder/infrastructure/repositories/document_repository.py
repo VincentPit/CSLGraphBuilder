@@ -104,6 +104,21 @@ class DocumentRepositoryInterface(ABC):
         """Lookup multiple chunks by ID. Missing IDs are silently dropped."""
         pass
 
+    @abstractmethod
+    async def get_chunk_with_neighbours(
+        self, chunk_id: str, radius: int = 1
+    ) -> List[DocumentChunk]:
+        """Return *chunk_id* together with its ±``radius`` neighbours.
+
+        Walks the ``:NEXT_CHUNK`` linked list either way. Result is
+        ordered by ``chunk_index`` ascending. If the target chunk
+        doesn't exist, returns an empty list. Used by the retrieval
+        orchestrator (P4) to give the LLM the surrounding paragraph,
+        not just the single matched sentence (§3.4 of
+        docs/RAG_QA_PLAN.md).
+        """
+        pass
+
 
 class Neo4jDocumentRepository(DocumentRepositoryInterface):
     """
@@ -368,6 +383,46 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
                     self.logger.debug("Skipping malformed chunk: %s", exc)
             return chunks
 
+    async def get_chunk_with_neighbours(
+        self, chunk_id: str, radius: int = 1
+    ) -> List[DocumentChunk]:
+        """Walk the ``:NEXT_CHUNK`` linked list ±``radius`` from *chunk_id*.
+
+        Variable-length path patterns can't take the radius as a
+        bound parameter in Neo4j, so we substitute the integer into
+        the query template after clamping it. Without that bound a
+        malicious caller could ask for ``radius=10000`` and pull a
+        whole document.
+        """
+        if not chunk_id:
+            return []
+        # Clamp to a sane window: any chunk-neighbour use case fits in
+        # 0..5; bigger values point at a misuse of this method.
+        bounded = max(0, min(int(radius), 5))
+        async with self.driver.session() as session:
+            query = f"""
+            MATCH (c:DocumentChunk {{id: $chunk_id}})
+            OPTIONAL MATCH (prev:DocumentChunk)-[:NEXT_CHUNK*1..{bounded}]->(c)
+            OPTIONAL MATCH (c)-[:NEXT_CHUNK*1..{bounded}]->(next:DocumentChunk)
+            WITH c, collect(DISTINCT prev) AS prevs, collect(DISTINCT next) AS nexts
+            UNWIND prevs + [c] + nexts AS chunk
+            WITH DISTINCT chunk
+            WHERE chunk IS NOT NULL
+            RETURN chunk ORDER BY chunk.chunk_index ASC
+            """
+            try:
+                result = await session.run(query, {"chunk_id": chunk_id})
+            except Exception as exc:
+                self.logger.debug("get_chunk_with_neighbours failed: %s", exc)
+                return []
+            chunks: List[DocumentChunk] = []
+            async for record in result:
+                try:
+                    chunks.append(self._create_chunk_from_data(dict(record["chunk"])))
+                except Exception as exc:
+                    self.logger.debug("Skipping malformed neighbour chunk: %s", exc)
+            return chunks
+
     async def find_documents_by_url_pattern(self, url_pattern: str) -> List[SourceDocument]:
         """Find documents matching URL pattern."""
         
@@ -599,6 +654,29 @@ class InMemoryDocumentRepository(DocumentRepositoryInterface):
         for chunks in self.chunks.values():
             out.extend(c for c in chunks if c.id in wanted)
         return out
+
+    async def get_chunk_with_neighbours(
+        self, chunk_id: str, radius: int = 1
+    ) -> List[DocumentChunk]:
+        """In-memory equivalent: locate the target chunk's document, then
+        return ±``radius`` chunks around it by ``chunk_index``.
+
+        We don't model the ``:NEXT_CHUNK`` linked list in memory — same
+        as ``save_chunks_with_links`` — so the radius is computed on
+        the chunk_index axis. That gives the same ordered window the
+        Neo4j path traversal returns.
+        """
+        if not chunk_id:
+            return []
+        bounded = max(0, min(int(radius), 5))
+        for chunks in self.chunks.values():
+            sorted_chunks = sorted(chunks, key=lambda c: c.chunk_index)
+            for i, c in enumerate(sorted_chunks):
+                if c.id == chunk_id:
+                    lo = max(0, i - bounded)
+                    hi = min(len(sorted_chunks), i + bounded + 1)
+                    return list(sorted_chunks[lo:hi])
+        return []
 
 
 # Factory function for creating appropriate repository

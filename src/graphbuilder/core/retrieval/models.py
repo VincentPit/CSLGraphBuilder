@@ -199,10 +199,20 @@ class RetrievalConfig:
 
     final_top_k: int = 8
 
-    # Chunk hydration — neighbour expansion (NEXT_CHUNK ±1) lands in P4.
+    # Cross-encoder rerank (P4). Runs on the post-RRF shortlist, before
+    # final_top_k trim. Falls back to RRF order when the model is
+    # unavailable, so toggling this off is safe — it just degrades
+    # quality, never breaks the pipeline.
+    enable_cross_encoder: bool = True
+    cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    # Chunk hydration. Neighbour radius walks the :NEXT_CHUNK linked
+    # list ±N from the cited chunk so the LLM sees the surrounding
+    # paragraph, not just the matched sentence (P4).
     hydrate_chunks: bool = True
     max_chunks_per_item: int = 2
     max_chunk_chars: int = 1200
+    chunk_neighbour_radius: int = 1
 
     # Per-channel timeout so a slow channel can't stall the whole turn.
     channel_timeout_seconds: float = 5.0

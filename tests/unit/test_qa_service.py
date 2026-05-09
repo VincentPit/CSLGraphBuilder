@@ -50,7 +50,13 @@ class FakeOrchestrator:
         self._trace = trace
         self.calls: list[tuple[str, Optional[int]]] = []
 
-    async def retrieve(self, query: str, *, top_k: Optional[int] = None):
+    async def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: Optional[int] = None,
+        query_embedding: Optional[List[float]] = None,  # P6+P7: optional pre-embedded
+    ):
         self.calls.append((query, top_k))
         return list(self._items), self._trace
 

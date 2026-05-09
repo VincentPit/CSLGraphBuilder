@@ -512,6 +512,16 @@ export interface RetrievalTrace {
   total_latency_ms: number;
 }
 
+/** Compact view of which memory layers fed this turn (§5 of RAG_QA_PLAN.md).
+ *  v1 surfaces only the trace counts — the actual rendered block stays on the
+ *  server. Frontend may render this in a debug pane in a follow-up iteration. */
+export interface MemoryTrace {
+  working_turns: number;
+  summary_chars: number;
+  episodic_hit?: { turn_id: string; score: number } | null;
+  summary_regenerated: boolean;
+}
+
 export interface AskResponse {
   session_id: string;
   turn_id: string;
@@ -519,6 +529,7 @@ export interface AskResponse {
   sources: ChatSource[];
   cited_source_indices: number[];
   retrieval_trace: RetrievalTrace;
+  memory_trace?: MemoryTrace | null;
   request_id?: string | null;
   latency_ms: number;
 }

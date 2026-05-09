@@ -28,6 +28,8 @@ from ..schemas.qa import (
     ChannelTraceModel,
     FeedbackRequest,
     FeedbackResponse,
+    MemoryEpisodicHit,
+    MemoryTraceModel,
     RetrievalTraceModel,
     SourceModel,
 )
@@ -116,9 +118,9 @@ async def ask(
             top_k=body.top_k,
         )
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return _to_ask_response(result)
 
@@ -200,8 +202,25 @@ def _to_ask_response(result) -> AskResponse:
         sources=[_to_source_model(s) for s in result.sources],
         cited_source_indices=list(result.cited_source_indices),
         retrieval_trace=_to_trace_model(result.retrieval_trace),
+        memory_trace=_to_memory_trace_model(result.memory_trace),
         request_id=result.request_id,
         latency_ms=result.latency_ms,
+    )
+
+
+def _to_memory_trace_model(trace_dict) -> MemoryTraceModel | None:
+    """Adapt the dict shape MemoryContext.to_trace_dict() produces."""
+    if not trace_dict:
+        return None
+    hit = trace_dict.get("episodic_hit")
+    return MemoryTraceModel(
+        working_turns=int(trace_dict.get("working_turns") or 0),
+        summary_chars=int(trace_dict.get("summary_chars") or 0),
+        episodic_hit=(
+            MemoryEpisodicHit(turn_id=hit["turn_id"], score=float(hit["score"]))
+            if hit else None
+        ),
+        summary_regenerated=bool(trace_dict.get("summary_regenerated")),
     )
 
 

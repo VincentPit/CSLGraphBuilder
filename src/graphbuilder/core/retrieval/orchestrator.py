@@ -76,18 +76,23 @@ class RetrievalOrchestrator:
         query: str,
         *,
         top_k: Optional[int] = None,
+        query_embedding: Optional[List[float]] = None,
     ) -> Tuple[List[RetrievedItem], RetrievalTrace]:
         """Retrieve and fuse for one query.
 
-        Returns ``(items, trace)`` — items are already sorted by RRF
-        score, descending; trace is a structured record for the
-        debug pane and metrics.
+        ``query_embedding`` lets a caller (e.g. ``QAService``) pass in
+        an embedding it already has so we don't re-embed for retrieval +
+        memory recall on the same turn. ``None`` means "embed for me".
+
+        Returns ``(items, trace)`` — items are sorted by rerank score
+        when the cross-encoder ran, otherwise by RRF score descending.
         """
         final_top_k = top_k or self._cfg.final_top_k
         wall_start = time.perf_counter()
 
         terms = extract_terms(query)
-        query_embedding = await self._embed_query(query)
+        if query_embedding is None:
+            query_embedding = await self._embed_query(query)
 
         channel_results = await self._run_channels(query, query_embedding, terms)
 

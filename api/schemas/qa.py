@@ -71,6 +71,20 @@ class RetrievalTraceModel(BaseModel):
     total_latency_ms: int
 
 
+class MemoryEpisodicHit(BaseModel):
+    turn_id: str
+    score: float
+
+
+class MemoryTraceModel(BaseModel):
+    """Compact view of which memory layers fed this turn (§5 of the plan)."""
+
+    working_turns: int = 0
+    summary_chars: int = 0
+    episodic_hit: Optional[MemoryEpisodicHit] = None
+    summary_regenerated: bool = False
+
+
 class AskResponse(BaseModel):
     session_id: str
     turn_id: str
@@ -84,6 +98,7 @@ class AskResponse(BaseModel):
         ),
     )
     retrieval_trace: RetrievalTraceModel
+    memory_trace: Optional[MemoryTraceModel] = None
     request_id: Optional[str] = None
     latency_ms: int
 

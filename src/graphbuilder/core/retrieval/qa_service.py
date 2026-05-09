@@ -1,25 +1,30 @@
 """QA service — ties retrieval, the LLM, and conversation persistence
 together into the single ``ask(query)`` flow used by ``/qa/ask``.
 
-v1 scope (P5 of docs/RAG_QA_PLAN.md):
-- No memory layers yet (P6/P7) — prior turns are persisted but not
-  injected into the prompt.
-- No tool-use (P9/P10) — the LLM only generates an answer.
-- No faithfulness check (P8) — the answer is returned as-is, with
+v1 scope (P5 of docs/RAG_QA_PLAN.md), now extended for P6+P7:
+- Memory layers (working / rolling-summary / episodic recall) build
+  in parallel with retrieval and feed into the LLM prompt.
+- Per-turn ``query_embedding`` is persisted on the turn so future
+  turns in the same session can episodic-recall it.
+- No tool-use (P9/P10) yet — the LLM only generates an answer.
+- No faithfulness check (P8) yet — the answer is returned as-is, with
   citation IDs extracted for future blending into source confidence.
 
 Each call:
 1. Resolves or creates a session (anonymous if no user_id supplied).
-2. Runs the :class:`RetrievalOrchestrator` to produce sources.
-3. Renders a system + sources + question prompt.
-4. Calls the LLM service for a free-form answer.
-5. Extracts ``[n]`` citation indices from the answer and uses them to
+2. Embeds the query once.
+3. Runs retrieval + memory.build in parallel.
+4. Renders a system + memory + sources + question prompt.
+5. Calls the LLM service for a free-form answer.
+6. Extracts ``[n]`` citation indices from the answer and uses them to
    record which entity / relationship / chunk ids the turn cited.
-6. Persists a :class:`ConversationTurn` and returns the bundle.
+7. Persists a :class:`ConversationTurn` (with the embedding) and
+   returns the bundle.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -27,6 +32,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from .memory import MemoryConfig, MemoryContext, MemoryService
 from .models import RetrievalConfig, RetrievalTrace, RetrievedItem
 from .orchestrator import RetrievalOrchestrator
 
@@ -80,13 +86,22 @@ def _render_sources(items: List[RetrievedItem]) -> str:
     return "\n".join(lines)
 
 
-def _render_user_prompt(query: str, items: List[RetrievedItem]) -> str:
-    return (
-        "SOURCES\n"
-        f"{_render_sources(items)}\n\n"
-        "QUESTION\n"
-        f"{query}"
-    )
+def _render_user_prompt(
+    query: str,
+    items: List[RetrievedItem],
+    memory_block: str = "",
+) -> str:
+    """Stitch the prompt sections together. The memory block (if any)
+    sits ABOVE sources so the LLM has conversational context before it
+    starts grounding against the retrieved evidence."""
+    parts: List[str] = []
+    if memory_block:
+        parts.append(memory_block)
+    parts.extend([
+        f"SOURCES\n{_render_sources(items)}",
+        f"QUESTION\n{query}",
+    ])
+    return "\n\n".join(parts)
 
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
@@ -124,6 +139,7 @@ class AskResult:
     sources: List[RetrievedItem] = field(default_factory=list)
     cited_source_indices: List[int] = field(default_factory=list)
     retrieval_trace: Optional[RetrievalTrace] = None
+    memory_trace: Optional[dict] = None
     request_id: Optional[str] = None
     latency_ms: int = 0
 
@@ -133,7 +149,7 @@ class AskResult:
 # ----------------------------------------------------------------------
 
 class QAService:
-    """Glues retrieval + LLM + conversation persistence."""
+    """Glues retrieval + memory + LLM + conversation persistence."""
 
     def __init__(
         self,
@@ -142,11 +158,18 @@ class QAService:
         conversation_repo: Any,
         llm_service: Optional[Any],
         config: Optional[RetrievalConfig] = None,
+        memory: Optional[MemoryService] = None,
+        memory_config: Optional[MemoryConfig] = None,
     ):
         self._orch = orchestrator
         self._conv = conversation_repo
         self._llm = llm_service
         self._cfg = config or RetrievalConfig()
+        self._memory = memory or MemoryService(
+            conversation_repo=conversation_repo,
+            llm_service=llm_service,
+            config=memory_config or MemoryConfig(),
+        )
 
     async def ask(
         self,
@@ -167,9 +190,24 @@ class QAService:
 
         session = await self._resolve_session(session_id, user_id)
 
-        items, trace = await self._orch.retrieve(query, top_k=top_k)
+        # Embed once and share across retrieval + memory recall so we
+        # don't pay the model cost twice on a single turn.
+        query_embedding = await self._embed_query(query)
 
-        answer = await self._generate_answer(query, items)
+        # Retrieval and memory build are independent — gather them.
+        items_trace_task = self._orch.retrieve(
+            query, top_k=top_k, query_embedding=query_embedding,
+        )
+        memory_task = self._memory.build(
+            session_id=session.id,
+            query=query,
+            query_embedding=query_embedding,
+        )
+        (items, trace), memory_ctx = await asyncio.gather(
+            items_trace_task, memory_task,
+        )
+
+        answer = await self._generate_answer(query, items, memory_ctx)
         cited_indices = [
             i for i in _extract_cited_indices(answer)
             if 1 <= i <= len(items)
@@ -195,6 +233,7 @@ class QAService:
             cited_entity_ids=cited_entity_ids,
             cited_rel_ids=cited_rel_ids,
             cited_chunk_ids=cited_chunk_ids,
+            query_embedding=query_embedding,
         )
 
         latency_ms = int((time.perf_counter() - wall_start) * 1000)
@@ -202,10 +241,15 @@ class QAService:
         # qa_request metric — (intent="any", status="ok") as v1 baseline.
         await self._record_request_metric(status="ok")
         await self._record_total_latency(latency_ms)
+        await self._record_memory_tokens(memory_ctx)
 
         logger.info(
-            "ask done session=%s turn=%s query=%r sources=%d cited=%d latency_ms=%d",
-            session.id, turn.id, query[:100], len(items), len(cited_indices), latency_ms,
+            "ask done session=%s turn=%s query=%r sources=%d cited=%d "
+            "memory(working=%d summary=%d episodic=%s) latency_ms=%d",
+            session.id, turn.id, query[:100], len(items), len(cited_indices),
+            len(memory_ctx.working_turns), memory_ctx.summary_chars,
+            (memory_ctx.episodic_hit[0].id if memory_ctx.episodic_hit else None),
+            latency_ms,
         )
 
         return AskResult(
@@ -215,9 +259,25 @@ class QAService:
             sources=items,
             cited_source_indices=cited_indices,
             retrieval_trace=trace,
+            memory_trace=memory_ctx.to_trace_dict(),
             request_id=request_id,
             latency_ms=latency_ms,
         )
+
+    # ------------------------------------------------------------------
+    # Embedding helper
+    # ------------------------------------------------------------------
+
+    async def _embed_query(self, query: str) -> Optional[List[float]]:
+        try:
+            from ...infrastructure.services.embedding_factory import embed_async
+        except Exception:
+            return None
+        try:
+            return await embed_async(query)
+        except Exception as exc:
+            logger.debug("ask: query embedding failed: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -251,6 +311,7 @@ class QAService:
         cited_entity_ids: List[str],
         cited_rel_ids: List[str],
         cited_chunk_ids: List[str],
+        query_embedding: Optional[List[float]] = None,
     ):
         from ...domain.models.conversation_models import ConversationTurn
 
@@ -266,6 +327,7 @@ class QAService:
             cited_entity_ids=cited_entity_ids,
             cited_relationship_ids=cited_rel_ids,
             cited_chunk_ids=cited_chunk_ids,
+            query_embedding=query_embedding,
         )
         return await self._conv.append_turn(turn)
 
@@ -273,7 +335,12 @@ class QAService:
     # LLM
     # ------------------------------------------------------------------
 
-    async def _generate_answer(self, query: str, items: List[RetrievedItem]) -> str:
+    async def _generate_answer(
+        self,
+        query: str,
+        items: List[RetrievedItem],
+        memory_ctx: MemoryContext,
+    ) -> str:
         if self._llm is None:
             # Graceful degradation — if no LLM is configured, surface the
             # retrieved context so the user at least sees what would have
@@ -282,7 +349,7 @@ class QAService:
                 "(no LLM configured — retrieval returned "
                 f"{len(items)} source(s); see the Sources panel)"
             )
-        prompt = _render_user_prompt(query, items)
+        prompt = _render_user_prompt(query, items, memory_ctx.rendered_block)
         t0 = time.perf_counter()
         try:
             answer = await self._llm.generate_text(
@@ -323,9 +390,28 @@ class QAService:
             return
         await get_metrics().record_qa_latency(phase="llm", seconds=seconds)
 
+    async def _record_memory_tokens(self, ctx: MemoryContext) -> None:
+        """Surface the per-slot character counts as ``qa_context_tokens``
+        histograms. We use a coarse 4-chars-per-token heuristic for the
+        token-axis since the actual tokeniser depends on the LLM provider."""
+        try:
+            from ...infrastructure.services.metrics import get_metrics
+        except Exception:
+            return
+        m = get_metrics()
+        if ctx.working_chars:
+            await m.record_qa_context_tokens(slot="working", tokens=ctx.working_chars // 4)
+        if ctx.summary_chars:
+            await m.record_qa_context_tokens(slot="summary", tokens=ctx.summary_chars // 4)
+        if ctx.episodic_chars:
+            await m.record_qa_context_tokens(slot="episodic", tokens=ctx.episodic_chars // 4)
+
 
 __all__ = [
     "ANONYMOUS_USER_ID",
     "AskResult",
+    "MemoryConfig",
+    "MemoryContext",
+    "MemoryService",
     "QAService",
 ]

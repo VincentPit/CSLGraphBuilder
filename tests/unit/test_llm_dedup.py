@@ -261,6 +261,12 @@ class TestCheckRelationshipDuplicates:
 
 # ---------------------------------------------------------------------------
 # Embedding helpers (on ProcessDocumentUseCase)
+#
+# These helpers delegate to ``embedding_factory.embed``, which the use case
+# imports inside the function body — so we patch the factory module rather
+# than the use-case attribute. ``embedding_factory.embed`` itself returns
+# ``None`` when sentence-transformers is unavailable, when text is empty,
+# or when the encode call raises; the helpers just forward that contract.
 # ---------------------------------------------------------------------------
 
 
@@ -280,74 +286,61 @@ class TestEmbeddingHelpers:
         )
         return uc
 
-    def test_get_embedding_model_returns_none_when_missing(self, monkeypatch):
-        """If sentence-transformers is not installed, returns None."""
-        from graphbuilder.application.use_cases import document_processing as mod
-        # Reset class-level cache
-        mod.ProcessDocumentUseCase._embedding_model = None
+    def test_embed_returns_none_when_sentence_transformers_missing(self, monkeypatch):
+        """When the factory cannot load a model it returns None — the
+        use-case helpers must propagate that without raising."""
+        from graphbuilder.infrastructure.services import embedding_factory
 
-        import builtins
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "sentence_transformers":
-                raise ImportError("mocked")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        monkeypatch.setattr(embedding_factory, "get_model", lambda: None)
 
         uc = self._make_use_case()
-        result = uc._get_embedding_model()
-        assert result is None
-
-        # Clean up
-        mod.ProcessDocumentUseCase._embedding_model = None
-
-    def test_embed_entity_text_returns_none_when_no_model(self):
-        uc = self._make_use_case()
-        uc._get_embedding_model = MagicMock(return_value=None)
-
         entity = GraphEntity(name="Test", entity_type=EntityType.CONCEPT)
-        result = uc._embed_entity_text(entity)
-        assert result is None
+        assert uc._embed_entity_text(entity) is None
+        assert uc._embed_text("anything") is None
 
-    def test_embed_entity_text_uses_name_and_description(self):
-        import numpy as np
+    def test_embed_entity_text_uses_name_and_description(self, monkeypatch):
+        from graphbuilder.infrastructure.services import embedding_factory
+
+        captured: dict = {}
+
+        def fake_embed(text: str):
+            captured["text"] = text
+            return [0.1, 0.2, 0.3]
+
+        monkeypatch.setattr(embedding_factory, "embed", fake_embed)
 
         uc = self._make_use_case()
-        mock_model = MagicMock()
-        mock_model.encode.return_value = np.array([0.1, 0.2, 0.3])
-        uc._get_embedding_model = MagicMock(return_value=mock_model)
-
         entity = GraphEntity(
             name="Aspirin",
             entity_type=EntityType.PRODUCT,
             description="pain reliever",
         )
-        result = uc._embed_entity_text(entity)
+        assert uc._embed_entity_text(entity) == [0.1, 0.2, 0.3]
+        assert "Aspirin" in captured["text"]
+        assert "pain reliever" in captured["text"]
 
-        assert result == [0.1, 0.2, 0.3]
-        # Should join name + description
-        call_text = mock_model.encode.call_args[0][0]
-        assert "Aspirin" in call_text
-        assert "pain reliever" in call_text
+    def test_embed_text_returns_none_for_empty_string(self, monkeypatch):
+        """``embedding_factory.embed`` short-circuits on empty input —
+        ``_embed_text`` inherits that without any extra check of its own."""
+        from graphbuilder.infrastructure.services import embedding_factory
 
-    def test_embed_text_returns_none_for_empty_string(self):
+        # Real factory.embed already returns None for "", but for an isolated
+        # unit test we don't want to depend on a loaded model — patch it.
+        called: dict = {"hits": 0}
+
+        def fake_embed(text: str):
+            called["hits"] += 1
+            return [0.1] if (text or "").strip() else None
+
+        monkeypatch.setattr(embedding_factory, "embed", fake_embed)
+
         uc = self._make_use_case()
-        mock_model = MagicMock()
-        uc._get_embedding_model = MagicMock(return_value=mock_model)
+        assert uc._embed_text("") is None
 
-        result = uc._embed_text("")
-        assert result is None
-        mock_model.encode.assert_not_called()
+    def test_embed_text_returns_list(self, monkeypatch):
+        from graphbuilder.infrastructure.services import embedding_factory
 
-    def test_embed_text_returns_list(self):
-        import numpy as np
+        monkeypatch.setattr(embedding_factory, "embed", lambda text: [0.5, 0.6])
 
         uc = self._make_use_case()
-        mock_model = MagicMock()
-        mock_model.encode.return_value = np.array([0.5, 0.6])
-        uc._get_embedding_model = MagicMock(return_value=mock_model)
-
-        result = uc._embed_text("some text")
-        assert result == [0.5, 0.6]
+        assert uc._embed_text("some text") == [0.5, 0.6]

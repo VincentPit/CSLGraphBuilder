@@ -14,7 +14,36 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, List
+
+
+# Histograms are kept as simple lists of recent samples so the snapshot
+# endpoint can compute p50/p95/avg without a separate dependency. The cap
+# bounds memory at ~ samples * sizeof(float) per series.
+_HISTOGRAM_MAX_SAMPLES = 1000
+
+
+def _percentile(samples: List[float], pct: float) -> float:
+    if not samples:
+        return 0.0
+    s = sorted(samples)
+    k = (len(s) - 1) * pct
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    frac = k - lo
+    return s[lo] + (s[hi] - s[lo]) * frac
+
+
+def _histogram_snapshot(samples: List[float]) -> Dict[str, float]:
+    if not samples:
+        return {"count": 0, "p50": 0.0, "p95": 0.0, "avg": 0.0, "max": 0.0}
+    return {
+        "count": len(samples),
+        "p50": round(_percentile(samples, 0.50), 4),
+        "p95": round(_percentile(samples, 0.95), 4),
+        "avg": round(sum(samples) / len(samples), 4),
+        "max": round(max(samples), 4),
+    }
 
 
 @dataclass
@@ -32,6 +61,19 @@ class _Counters:
     chunks_processed: int = 0
     entities_saved: int = 0
     relationships_saved: int = 0
+    # ── qa.* counters (§8.3 of docs/RAG_QA_PLAN.md) ──
+    qa_requests: Dict[str, int] = field(default_factory=dict)          # key = "intent|status"
+    qa_tool_calls: Dict[str, int] = field(default_factory=dict)        # key = "tool|outcome"
+    qa_mutations: Dict[str, int] = field(default_factory=dict)         # key = "tool|operation"
+    qa_faithfulness_failures: int = 0
+    qa_memory_overflow_drops: Dict[str, int] = field(default_factory=dict)  # key = layer
+    qa_pending_confirmations: int = 0
+    qa_active_sessions: int = 0
+    # ── qa.* histograms ──
+    qa_latency_seconds: Dict[str, List[float]] = field(default_factory=dict)  # phase
+    qa_retrieval_hits: Dict[str, List[float]] = field(default_factory=dict)   # channel
+    qa_context_tokens: Dict[str, List[float]] = field(default_factory=dict)   # slot
+    qa_llm_tokens: Dict[str, List[float]] = field(default_factory=dict)       # direction
     started_at: float = field(default_factory=time.time)
 
 
@@ -85,6 +127,72 @@ class PipelineMetrics:
         async with self._lock:
             self._c.relationships_saved += n
 
+    # ------------------------------------------------------------------
+    # qa.* recorders (§8.3 of docs/RAG_QA_PLAN.md)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bump(d: Dict[str, int], key: str, n: int = 1) -> None:
+        d[key] = d.get(key, 0) + n
+
+    @staticmethod
+    def _record_sample(d: Dict[str, List[float]], key: str, value: float) -> None:
+        bucket = d.setdefault(key, [])
+        bucket.append(float(value))
+        if len(bucket) > _HISTOGRAM_MAX_SAMPLES:
+            # Keep most-recent N to bound memory.
+            del bucket[: len(bucket) - _HISTOGRAM_MAX_SAMPLES]
+
+    async def record_qa_request(self, *, intent: str, status: str) -> None:
+        async with self._lock:
+            self._bump(self._c.qa_requests, f"{intent}|{status}")
+
+    async def record_qa_tool_call(self, *, tool: str, outcome: str) -> None:
+        """outcome ∈ {ok, validation_error, denied, undone}."""
+        async with self._lock:
+            self._bump(self._c.qa_tool_calls, f"{tool}|{outcome}")
+
+    async def record_qa_mutation(self, *, tool: str, operation: str) -> None:
+        """operation ∈ {created, updated, merged, soft_deleted}."""
+        async with self._lock:
+            self._bump(self._c.qa_mutations, f"{tool}|{operation}")
+
+    async def record_qa_faithfulness_failure(self, n: int = 1) -> None:
+        async with self._lock:
+            self._c.qa_faithfulness_failures += n
+
+    async def record_qa_memory_overflow_drop(self, *, layer: str, n: int = 1) -> None:
+        async with self._lock:
+            self._bump(self._c.qa_memory_overflow_drops, layer, n)
+
+    async def set_qa_pending_confirmations(self, value: int) -> None:
+        async with self._lock:
+            self._c.qa_pending_confirmations = max(0, int(value))
+
+    async def set_qa_active_sessions(self, value: int) -> None:
+        async with self._lock:
+            self._c.qa_active_sessions = max(0, int(value))
+
+    async def record_qa_latency(self, *, phase: str, seconds: float) -> None:
+        """phase ∈ {planner, retrieval, rerank, llm, verify, total}."""
+        async with self._lock:
+            self._record_sample(self._c.qa_latency_seconds, phase, seconds)
+
+    async def record_qa_retrieval_hits(self, *, channel: str, count: int) -> None:
+        """channel ∈ {cypher, vector, bm25}."""
+        async with self._lock:
+            self._record_sample(self._c.qa_retrieval_hits, channel, count)
+
+    async def record_qa_context_tokens(self, *, slot: str, tokens: int) -> None:
+        """slot ∈ {system, working, summary, episodic, sources}."""
+        async with self._lock:
+            self._record_sample(self._c.qa_context_tokens, slot, tokens)
+
+    async def record_qa_llm_tokens(self, *, direction: str, tokens: int) -> None:
+        """direction ∈ {prompt, completion}."""
+        async with self._lock:
+            self._record_sample(self._c.qa_llm_tokens, direction, tokens)
+
     def snapshot(self) -> Dict[str, Any]:
         c = self._c
         non_cached = max(c.llm_calls - c.llm_cache_hits, 0)
@@ -115,6 +223,31 @@ class PipelineMetrics:
                 "chunks_processed": c.chunks_processed,
                 "entities_saved": c.entities_saved,
                 "relationships_saved": c.relationships_saved,
+            },
+            "qa": {
+                "requests": dict(c.qa_requests),
+                "tool_calls": dict(c.qa_tool_calls),
+                "mutations": dict(c.qa_mutations),
+                "faithfulness_failures": c.qa_faithfulness_failures,
+                "memory_overflow_drops": dict(c.qa_memory_overflow_drops),
+                "pending_confirmations": c.qa_pending_confirmations,
+                "active_sessions": c.qa_active_sessions,
+                "latency_seconds": {
+                    phase: _histogram_snapshot(s)
+                    for phase, s in c.qa_latency_seconds.items()
+                },
+                "retrieval_hits": {
+                    channel: _histogram_snapshot(s)
+                    for channel, s in c.qa_retrieval_hits.items()
+                },
+                "context_tokens": {
+                    slot: _histogram_snapshot(s)
+                    for slot, s in c.qa_context_tokens.items()
+                },
+                "llm_tokens": {
+                    direction: _histogram_snapshot(s)
+                    for direction, s in c.qa_llm_tokens.items()
+                },
             },
         }
 

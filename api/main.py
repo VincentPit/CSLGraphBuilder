@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .middleware import RequestIdMiddleware
 from .routers import health, graph, documents, ingest, curation, verification, export, dev
 
 
@@ -17,8 +18,18 @@ def _configure_logging() -> None:
     logs_dir = Path(__file__).resolve().parent.parent / "logs"
     logs_dir.mkdir(exist_ok=True)
 
+    # Attach a request-id filter to the root logger so every record has a
+    # ``request_id`` attribute — defaulting to "-" outside a request — and
+    # the format string below can reference it without KeyErrors.
+    import sys, os as _os
+    sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", "src"))
+    from graphbuilder.infrastructure.services.qa_observability import RequestIdFilter
+    root_logger = logging.getLogger()
+    if not any(isinstance(f, RequestIdFilter) for f in root_logger.filters):
+        root_logger.addFilter(RequestIdFilter())
+
     fmt = logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        "%(asctime)s  %(levelname)-8s  [%(request_id)s]  %(name)s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -99,6 +110,13 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # RequestIdMiddleware must be added before CORS so the id is set
+    # before any other middleware reads logs. Starlette runs middlewares
+    # in reverse order of addition (last added = outermost), so adding
+    # CORS *after* RequestIdMiddleware puts CORS on the outside and
+    # request-id on the inside — which is what we want: every handler
+    # and inner middleware sees the id.
+    app.add_middleware(RequestIdMiddleware)
     allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",")
     app.add_middleware(
         CORSMiddleware,

@@ -122,10 +122,37 @@ def _build_curation_request(event: Any) -> Any:
     return req
 
 
-def _audit_record(event: Any, *, success: bool, message: Optional[str] = None, error: Optional[str] = None) -> Dict[str, Any]:
-    """Build a single audit-log entry for one event."""
+def _audit_record(
+    event: Any,
+    *,
+    success: bool,
+    message: Optional[str] = None,
+    error: Optional[str] = None,
+    actor: str = "human",
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a single audit-log entry for one event.
+
+    ``actor`` distinguishes human curator actions ("human") from chatbot
+    mutations ("chatbot") — see §8.4 of docs/RAG_QA_PLAN.md. ``request_id``
+    is the QA observability spine id; for human-driven calls it falls
+    back to whatever the request middleware set on the ambient context.
+    """
+    if request_id is None:
+        # Pull from the qa observability contextvar so curation events
+        # initiated through the API also get correlated.
+        try:
+            from graphbuilder.infrastructure.services.qa_observability import (
+                get_request_id,
+            )
+            request_id = get_request_id()
+        except Exception:
+            request_id = None
+
     rec = {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "actor": actor,
+        "request_id": request_id,
         "action": getattr(event, "resolved_action", "unknown"),
         "target_id": getattr(event, "target_id", None),
         "curator": getattr(event, "curator_id", None) or "anonymous",
@@ -137,6 +164,53 @@ def _audit_record(event: Any, *, success: bool, message: Optional[str] = None, e
         rec["message"] = message
     if error is not None:
         rec["error"] = error
+    return rec
+
+
+def append_chatbot_audit_record(
+    *,
+    action: str,
+    target_id: Optional[str],
+    actor_user_id: Optional[str],
+    success: bool,
+    request_id: Optional[str] = None,
+    confirmation_id: Optional[str] = None,
+    before: Optional[Dict[str, Any]] = None,
+    after: Optional[Dict[str, Any]] = None,
+    reason: Optional[str] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Public helper for the QA tool layer to write into the same audit log.
+
+    Mirrors the shape ``_audit_record`` produces so existing readers
+    (``GET /curation/audit``, the curation review queue UI) work unchanged.
+    """
+    if request_id is None:
+        try:
+            from graphbuilder.infrastructure.services.qa_observability import (
+                get_request_id,
+            )
+            request_id = get_request_id()
+        except Exception:
+            request_id = None
+
+    rec: Dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "actor": "chatbot",
+        "request_id": request_id,
+        "action": action,
+        "target_id": target_id,
+        "curator": actor_user_id or "chatbot",
+        "reason": reason or "",
+        "corrections": {},
+        "before": before or {},
+        "after": after or {},
+        "confirmation_id": confirmation_id,
+        "success": success,
+    }
+    if error is not None:
+        rec["error"] = error
+    _audit_append([rec])
     return rec
 
 

@@ -31,6 +31,10 @@ from graphbuilder.infrastructure.repositories.graph_repository import (
 from graphbuilder.infrastructure.repositories.document_repository import (
     create_document_repository,
 )
+from graphbuilder.infrastructure.repositories.conversation_repository import (
+    ConversationRepositoryInterface,
+    create_conversation_repository,
+)
 from graphbuilder.infrastructure.services.llm_service import create_llm_service
 
 logger = logging.getLogger(__name__)
@@ -96,6 +100,37 @@ async def get_document_repo(
 ):
     driver = _get_neo4j_driver() if config.database.provider == "neo4j" else None
     return create_document_repository(config, neo4j_driver=driver)
+
+
+_conversation_repo_instance: ConversationRepositoryInterface | None = None
+
+
+async def get_conversation_repo(
+    config: Annotated[GraphBuilderConfig, Depends(get_app_config)],
+) -> ConversationRepositoryInterface:
+    """Singleton conversation repo — keeps the Neo4j schema-init task alive
+    and avoids creating a new InMemory store on every request (which would
+    drop history)."""
+    global _conversation_repo_instance
+    if _conversation_repo_instance is None:
+        driver = _get_neo4j_driver() if config.database.provider == "neo4j" else None
+        # Pull the embedding dim from the factory so the vector index matches
+        # the model that's actually loaded (768 SapBERT vs 384 MiniLM).
+        embedding_dim: int | None = None
+        try:
+            from graphbuilder.infrastructure.services.embedding_factory import get_embedding_dim
+            embedding_dim = get_embedding_dim()
+        except Exception:
+            embedding_dim = None
+        _conversation_repo_instance = create_conversation_repository(
+            config, neo4j_driver=driver, embedding_dim=embedding_dim
+        )
+        logger.info(
+            "Conversation repo initialised: %s (embedding_dim=%s)",
+            type(_conversation_repo_instance).__name__,
+            embedding_dim,
+        )
+    return _conversation_repo_instance
 
 
 async def get_llm(

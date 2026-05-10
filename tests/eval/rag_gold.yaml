@@ -1,0 +1,64 @@
+# RAG eval gold set — P13 of docs/RAG_QA_PLAN.md (§9.1).
+#
+# Each entry is one curated question/expected-source triple. The
+# harness reads this file via `graphbuilder.core.eval.gold.load_gold`,
+# which validates structure (unknown keys → load error) and uniqueness.
+#
+# Required fields:
+#   id                       short stable identifier
+#   question                 the user-facing query the bot will be asked
+#
+# Optional gold fields (at least one should be set, else the question
+# only contributes to coverage / latency stats):
+#   intent                   advisory; one of lookup | relational |
+#                            multi_hop | definitional | out_of_graph
+#   gold_entity_ids          list[str] — entity ids retrieval should surface
+#   gold_relationship_ids    list[str] — relationship ids retrieval should surface
+#   gold_chunk_ids           list[str] — DocumentChunk ids retrieval should hit
+#   gold_answer_substrings   list[str] — any-of, case-insensitive; at
+#                            least one must appear in the LLM answer
+#   notes                    free text; surfaced in the markdown report
+#
+# Growing the set:
+# - Seed from the curation review queue (§9.1) — pick recently-approved
+#   reviews and turn each into a question whose gold ids are the
+#   approved entity/relationship/chunk ids.
+# - Add a question whenever you fix a regression caught in production.
+# - Mark intents so the harness reports per-intent breakdowns later.
+#
+# The seed entries below intentionally cover the four main intents so
+# regressions in any one channel show up immediately. Replace the
+# placeholder ids with real graph ids as the gold set grows past ~10
+# questions; the hermetic test set under tests/eval/conftest.py uses
+# its own self-contained graph and does not depend on these.
+
+- id: q001
+  question: "What kinases does imatinib inhibit?"
+  intent: relational
+  gold_entity_ids: [ent_imatinib, ent_bcr_abl, ent_kit, ent_pdgfra]
+  gold_relationship_ids: [rel_imatinib_bcr_abl, rel_imatinib_kit, rel_imatinib_pdgfra]
+  gold_chunk_ids: [chunk_imatinib_targets]
+  gold_answer_substrings: ["BCR-ABL", "KIT"]
+  notes: "Seed question covering relational intent across the inhibition edge."
+
+- id: q002
+  question: "What is BCR-ABL?"
+  intent: definitional
+  gold_entity_ids: [ent_bcr_abl]
+  gold_chunk_ids: [chunk_bcr_abl_definition]
+  gold_answer_substrings: ["fusion", "tyrosine kinase"]
+  notes: "Definitional intent — entity vector channel should dominate."
+
+- id: q003
+  question: "BCR-ABL"
+  intent: lookup
+  gold_entity_ids: [ent_bcr_abl]
+  gold_answer_substrings: ["BCR-ABL"]
+  notes: "Bare-symbol lookup — guards the BM25 channel against gene-symbol regressions."
+
+- id: q004
+  question: "Which diseases share targets with chronic myeloid leukemia?"
+  intent: multi_hop
+  gold_entity_ids: [ent_cml, ent_gist, ent_bcr_abl, ent_kit]
+  gold_relationship_ids: [rel_cml_treats_imatinib, rel_imatinib_kit]
+  notes: "Two-hop intent — exercises the Cypher channel's multi-hop template."

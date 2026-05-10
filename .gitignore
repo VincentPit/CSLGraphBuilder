@@ -16,6 +16,9 @@ outputs/
 errors/
 record/
 
+# Eval harness — generated CSV/markdown reports (regenerated per run).
+tests/eval/_reports/
+
 # Python
 __pycache__/
 *.py[cod]

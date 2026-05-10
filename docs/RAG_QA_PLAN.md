@@ -6,11 +6,11 @@ Last updated: 2026-05-09
 
 ## Status
 
-**Shipped (8 commits on `feature/chatbot`, 292 unit tests passing):**
-P0 plan · P1 conversation persistence · P2 observability spine · P3 retrieval orchestrator (Cypher + vector + BM25 + RRF + chunk hydration) · P4 cross-encoder rerank + chunk neighbour expansion · P5 minimal `/qa/ask` endpoint · P6 working memory + rolling summary · P7 episodic recall · P12 `/chat` frontend with per-source confidence + retrieval trace · plus an unplanned **lightweight browser identity** (X-User-Id, chat-only, see §14.1).
+**Shipped (9 commits on `feature/chatbot`, 319 unit tests passing):**
+P0 plan · P1 conversation persistence · P2 observability spine · P3 retrieval orchestrator (Cypher + vector + BM25 + RRF + chunk hydration) · P4 cross-encoder rerank + chunk neighbour expansion · P5 minimal `/qa/ask` endpoint · P6 working memory + rolling summary · P7 episodic recall · P12 `/chat` frontend with per-source confidence + retrieval trace · P13 eval harness (gold loader + metrics + ablation runner + CSV/markdown reports + hermetic CI gate + live `run_rag_eval.py` CLI) · plus an unplanned **lightweight browser identity** (X-User-Id, chat-only, see §14.1).
 
 **Open / next:**
-P13 eval harness (recommended next — gives numbers to ablate against) · P8 faithfulness check · P11 SSE streaming · P9/P10 tool-use surface (gated on §14.6 — mutation authority) · P14 cross-session semantic memory.
+P8 faithfulness check (now unblocked — eval harness has a slot waiting for it) · P11 SSE streaming · P9/P10 tool-use surface (gated on §14.6 — mutation authority) · P14 cross-session semantic memory.
 
 See §13 for the full phase table with commit refs.
 
@@ -820,8 +820,8 @@ Implementations: `Neo4jConversationRepository` (prod) + `InMemoryConversationRep
 | **P7** | Episodic recall via `turn_query_vector` index | ✅ shipped | `1f0e989` |
 | **P12** | Frontend `/chat` page with per-source confidence + retrieval trace + sidebar | ✅ shipped | `69524d6` |
 | **+ Identity** | Lightweight browser identity (`X-User-Id`, `/users` router, ownership rules) — out-of-plan addition resolving §14.1 | ✅ shipped | `331cdf4` |
-| **P13** | Eval harness + gold set + CI gate | ⏳ next | — |
-| **P8** | Faithfulness check (`CascadingVerifier` on extracted claims) | pending | — |
+| **P13** | Eval harness + gold set + CI gate (`src/graphbuilder/core/eval/`, `tests/eval/`, hermetic smoke + live CLI) | ✅ shipped | `<pending-commit>` |
+| **P8** | Faithfulness check (`CascadingVerifier` on extracted claims) — harness slot reserved (`answer_faithfulness` returns null until wired) | pending | — |
 | **P11** | SSE streaming endpoint | pending | — |
 | **P9** | Tool-use surface (read-only) — `search_graph`, `get_entity`, `verify_claim` exposed to LLM | pending; gated on §14.6 | — |
 | **P10** | Tool-use surface (mutating) — propose/update/merge/soft-delete with PendingMutation + confirmation flow + audit rows | pending; gated on §14.6 | — |
@@ -840,6 +840,7 @@ A few small details drifted from the §3–§7 sketches during build; recording 
 - **Final-confidence math (§4).** With rerank: `0.7·score_rerank + 0.3·channel_max + multi_channel_bonus`. Without rerank: `channel_max + bonus`. Citation-coverage (§6.3, weight 0.2) layers on later in the QA service after the LLM has cited.
 - **Logger-filter placement (P2).** `RequestIdFilter` is attached to each *handler* rather than to the loggers. Python only runs logger-level filters for records emitted directly on that logger, so a filter on root would have skipped child-logger propagation and crashed the `[%(request_id)s]` format string.
 - **Test ergonomics for P4.** A module-level autouse fixture in `tests/unit/test_retrieval.py` no-ops `CrossEncoderReranker.rerank` so the 28 channel/RRF/orchestrator tests stay hermetic. Tests that exercise the rerank path inject a fake encoder via the module-level `_MODEL_CACHE`.
+- **Eval harness shape (P13, §9).** The harness library lives at `src/graphbuilder/core/eval/` (gold loader, metric math, async runner, CSV/markdown writers) with a transport-agnostic `ask_fn(query) -> AskLike` callback so the same code drives the hermetic CI gate, ablations, and the live API. The CI gate is `tests/eval/test_eval_smoke.py`: it builds a real `RetrievalOrchestrator + QAService` against an in-memory mini-graph and asserts the run clears every floor in `tests/eval/baselines.json::hermetic_floor`. The live counterpart is `tests/eval/run_rag_eval.py`, which posts `/qa/ask` and gates on `live_targets`. The `answer_faithfulness` slot is reserved in `EvalSummary` but reports `null` until P8 lands — pre-wired so the gate just needs threshold edits, not new code.
 
 ---
 

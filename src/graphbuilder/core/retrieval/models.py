@@ -216,3 +216,19 @@ class RetrievalConfig:
 
     # Per-channel timeout so a slow channel can't stall the whole turn.
     channel_timeout_seconds: float = 5.0
+
+    # Surface hydrated chunks as their own ``RetrievedItem(kind=chunk)``
+    # entries appended after the entity / relationship items. Off-by-
+    # default would have been a no-op for the LLM but breaks the eval
+    # harness ``gold_chunk_ids`` check (chunks are otherwise only
+    # ``chunk_preview`` metadata on their parent entity), so we keep
+    # this on. Set to False to restore the legacy "chunks only as
+    # metadata" behaviour for clients that count on the response not
+    # containing kind=chunk rows.
+    emit_chunk_items: bool = True
+    # Cap on chunk companions appended per turn — a turn with 8 hits
+    # citing 8 distinct chunks would otherwise grow the source list to
+    # 16, which is fine for the LLM but worth bounding for paranoid
+    # clients. Defaults to ``final_top_k`` so each entity can in
+    # principle promote its anchor chunk.
+    max_chunk_items: int = 8

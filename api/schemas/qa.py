@@ -13,6 +13,24 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class AblationOverride(BaseModel):
+    """Per-request retrieval-config overrides (P13 ablation matrix).
+
+    Every flag is optional — ``None`` means "use the server default".
+    The eval harness flips these between runs to isolate each
+    channel's contribution; production traffic should leave them all
+    null (the API singleton's ``RetrievalConfig`` is the source of
+    truth) unless a debug session needs to compare configs.
+    """
+
+    enable_cypher_channel: Optional[bool] = None
+    enable_vector_channel: Optional[bool] = None
+    enable_bm25_channel: Optional[bool] = None
+    enable_cross_encoder: Optional[bool] = None
+    chunk_neighbour_radius: Optional[int] = Field(None, ge=0, le=5)
+    emit_chunk_items: Optional[bool] = None
+
+
 class AskRequest(BaseModel):
     query: str = Field(..., description="The user's question.")
     session_id: Optional[str] = Field(
@@ -32,6 +50,13 @@ class AskRequest(BaseModel):
     top_k: Optional[int] = Field(
         None, ge=1, le=50,
         description="Override the configured number of sources to retrieve.",
+    )
+    ablation: Optional[AblationOverride] = Field(
+        None,
+        description=(
+            "Per-request override of channel/rerank flags. Used by the "
+            "P13 ablation matrix runner; null in production traffic."
+        ),
     )
 
 

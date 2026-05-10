@@ -155,12 +155,19 @@ async def ask(
     # value we've validated against the user repo.
     effective_user_id = chat_user_id if chat_user_id is not None else body.user_id
 
+    # Build a per-request RetrievalConfig override when the eval runner
+    # is asking for an ablation. Every flag is optional — unset fields
+    # fall back to the singleton's config so production traffic that
+    # never sets ``ablation`` is unaffected.
+    retrieval_override = _build_ablation_override(service, body.ablation)
+
     try:
         result = await service.ask(
             query=body.query,
             session_id=body.session_id,
             user_id=effective_user_id,
             top_k=body.top_k,
+            retrieval_override=retrieval_override,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -168,6 +175,30 @@ async def ask(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return _to_ask_response(result)
+
+
+def _build_ablation_override(service: QAService, ablation: Any) -> Any:
+    """Clone the service's ``RetrievalConfig`` and apply only the
+    fields the request actually set. Returns ``None`` when no override
+    is requested so the orchestrator stays on its singleton config.
+    """
+    if ablation is None:
+        return None
+    base = service._cfg  # noqa: SLF001 — singleton-only, not a public surface
+    from dataclasses import replace
+    overrides = {
+        k: v for k, v in {
+            "enable_cypher_channel": ablation.enable_cypher_channel,
+            "enable_vector_channel": ablation.enable_vector_channel,
+            "enable_bm25_channel":   ablation.enable_bm25_channel,
+            "enable_cross_encoder":  ablation.enable_cross_encoder,
+            "chunk_neighbour_radius": ablation.chunk_neighbour_radius,
+            "emit_chunk_items":      ablation.emit_chunk_items,
+        }.items() if v is not None
+    }
+    if not overrides:
+        return None
+    return replace(base, **overrides)
 
 
 @router.get("/sessions/{session_id}", summary="Fetch a session and its turns")

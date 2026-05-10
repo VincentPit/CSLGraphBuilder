@@ -52,7 +52,7 @@ from graphbuilder.infrastructure.repositories.conversation_repository import (  
 
 
 class _FakeRetrieval:
-    async def retrieve(self, query: str, *, top_k=None, query_embedding=None):
+    async def retrieve(self, query: str, *, top_k=None, query_embedding=None, config_override=None):
         items = [
             RetrievedItem(
                 kind=ItemKind.ENTITY,

@@ -77,6 +77,7 @@ class RetrievalOrchestrator:
         *,
         top_k: Optional[int] = None,
         query_embedding: Optional[List[float]] = None,
+        config_override: Optional[RetrievalConfig] = None,
     ) -> Tuple[List[RetrievedItem], RetrievalTrace]:
         """Retrieve and fuse for one query.
 
@@ -84,17 +85,24 @@ class RetrievalOrchestrator:
         an embedding it already has so we don't re-embed for retrieval +
         memory recall on the same turn. ``None`` means "embed for me".
 
+        ``config_override`` is the P13 ablation hook: callers (the eval
+        runner) can pass a per-request ``RetrievalConfig`` to flip
+        channel toggles, rerank, or chunk-promotion without rebuilding
+        the orchestrator singleton. ``None`` keeps the construction-
+        time config — the production-traffic path.
+
         Returns ``(items, trace)`` — items are sorted by rerank score
         when the cross-encoder ran, otherwise by RRF score descending.
         """
-        final_top_k = top_k or self._cfg.final_top_k
+        cfg = config_override or self._cfg
+        final_top_k = top_k or cfg.final_top_k
         wall_start = time.perf_counter()
 
         terms = extract_terms(query)
         if query_embedding is None:
             query_embedding = await self._embed_query(query)
 
-        channel_results = await self._run_channels(query, query_embedding, terms)
+        channel_results = await self._run_channels(query, query_embedding, terms, cfg=cfg)
 
         # Build hit index: composite_id -> list of RawHit (across channels)
         hit_index: Dict[str, List[RawHit]] = {}
@@ -112,7 +120,7 @@ class RetrievalOrchestrator:
             )
 
         fused = reciprocal_rank_fusion(
-            rankings, k=self._cfg.rrf_k, top_n=self._cfg.rrf_top_n
+            rankings, k=cfg.rrf_k, top_n=cfg.rrf_top_n
         )
 
         # Build RetrievedItem objects for every top_n candidate so the
@@ -128,7 +136,7 @@ class RetrievalOrchestrator:
                 continue
             candidates.append(self._build_item(composite_id, hits, rrf_score))
 
-        if self._cfg.enable_cross_encoder and candidates:
+        if cfg.enable_cross_encoder and candidates:
             t_rerank = time.perf_counter()
             candidates = await self._reranker.rerank(query, candidates)
             await self._record_rerank_latency(time.perf_counter() - t_rerank)
@@ -140,14 +148,27 @@ class RetrievalOrchestrator:
         # sentence. Sequential + bounded — a slow doc-repo query can't
         # blow up the turn latency budget thanks to channel timeout.
         hydrated_count = 0
-        if self._cfg.hydrate_chunks and self._document_repo is not None:
-            hydrated_count = await self._hydrate_chunks(items)
+        if cfg.hydrate_chunks and self._document_repo is not None:
+            hydrated_count = await self._hydrate_chunks(items, cfg=cfg)
 
         # Final confidence — when the cross-encoder ran we use it as the
         # primary signal; otherwise we fall back to the per-channel max
         # plus a "multi-channel agreement" bonus.
         for item in items:
             item.final_confidence = _compute_final_confidence(item)
+
+        # Promote each unique hydrated chunk to a first-class
+        # ``RetrievedItem(kind=chunk)``. Without this step a chunk only
+        # appears as ``chunk_preview`` metadata on its parent entity —
+        # the eval harness's ``gold_chunk_ids`` could never match, and
+        # the frontend's source list would never expose the chunk as
+        # its own row. Companions inherit the parent's confidence
+        # (slightly discounted) and are appended *after* the entity /
+        # relationship items so citation indices for the entities
+        # remain stable for clients that already render them.
+        if cfg.emit_chunk_items:
+            chunk_items = self._emit_chunk_items(items, cfg=cfg)
+            items = items + chunk_items
 
         total_latency_ms = int((time.perf_counter() - wall_start) * 1000)
         trace = RetrievalTrace(
@@ -192,13 +213,23 @@ class RetrievalOrchestrator:
         query: str,
         query_embedding: Optional[List[float]],
         terms: List[str],
+        *,
+        cfg: Optional[RetrievalConfig] = None,
     ) -> List[ChannelResult]:
-        """Run all channels concurrently with a per-channel timeout."""
+        """Run all channels concurrently with a per-channel timeout.
+
+        ``cfg.enable_*_channel`` flags act as per-request circuit
+        breakers — disabled channels are skipped entirely (no Cypher
+        round-trip, no embedding cost) so ablations measuring "what if
+        this channel was off?" stay honest about latency, not just
+        about which results came back.
+        """
+        cfg = cfg or self._cfg
 
         async def _bounded(label: str, coro):
             try:
                 return await asyncio.wait_for(
-                    coro, timeout=self._cfg.channel_timeout_seconds
+                    coro, timeout=cfg.channel_timeout_seconds
                 )
             except asyncio.TimeoutError:
                 logger.warning("%s channel timed out", label)
@@ -208,22 +239,26 @@ class RetrievalOrchestrator:
                 logger.warning("%s channel raised: %s", label, exc)
                 return []
 
-        results = await asyncio.gather(
-            _bounded(
+        coros = []
+        if cfg.enable_vector_channel:
+            coros.append(_bounded(
                 "channel:vector_entity",
                 self._vector_channel.run(query, query_embedding, terms),
-            ),
-            _bounded(
+            ))
+        if cfg.enable_bm25_channel:
+            coros.append(_bounded(
                 "channel:bm25",
                 self._bm25_channel.run(query, query_embedding, terms),
-            ),
-            _bounded(
+            ))
+        if cfg.enable_cypher_channel:
+            coros.append(_bounded(
                 "channel:cypher",
                 self._cypher_channel.run(query, query_embedding, terms),
-            ),
-            return_exceptions=False,
-        )
+            ))
 
+        if not coros:
+            return []
+        results = await asyncio.gather(*coros, return_exceptions=False)
         flat: List[ChannelResult] = []
         for sub in results:
             flat.extend(sub or [])
@@ -293,7 +328,12 @@ class RetrievalOrchestrator:
             metadata=merged_meta,
         )
 
-    async def _hydrate_chunks(self, items: List[RetrievedItem]) -> int:
+    async def _hydrate_chunks(
+        self,
+        items: List[RetrievedItem],
+        *,
+        cfg: Optional[RetrievalConfig] = None,
+    ) -> int:
         """Attach a chunk preview to each item, with ±radius neighbour
         expansion so the LLM sees the surrounding paragraph.
 
@@ -307,14 +347,15 @@ class RetrievalOrchestrator:
         if self._document_repo is None:
             return 0
 
-        radius = self._cfg.chunk_neighbour_radius
+        cfg = cfg or self._cfg
+        radius = cfg.chunk_neighbour_radius
 
         # Fast path: radius=0 → batch fetch by id like the original
         # behaviour. Saves N Cypher calls when neighbours aren't needed.
         if radius <= 0:
             wanted: List[str] = []
             for item in items:
-                for cid in item.source_chunk_ids[: self._cfg.max_chunks_per_item]:
+                for cid in item.source_chunk_ids[: cfg.max_chunks_per_item]:
                     if cid and cid not in wanted:
                         wanted.append(cid)
             if not wanted:
@@ -327,11 +368,11 @@ class RetrievalOrchestrator:
             by_id = {c.id: c for c in (chunks or [])}
             hydrated = 0
             for item in items:
-                for cid in item.source_chunk_ids[: self._cfg.max_chunks_per_item]:
+                for cid in item.source_chunk_ids[: cfg.max_chunks_per_item]:
                     chunk = by_id.get(cid)
                     if not chunk:
                         continue
-                    content = (chunk.content or "")[: self._cfg.max_chunk_chars]
+                    content = (chunk.content or "")[: cfg.max_chunk_chars]
                     item.chunk_preview = content
                     item.source_chunk_id = chunk.id
                     item.source_doc_id = item.source_doc_id or chunk.document_id
@@ -372,13 +413,76 @@ class RetrievalOrchestrator:
             joined = " … ".join(
                 (c.content or "").strip() for c in ordered if c.content
             )
-            content = joined[: self._cfg.max_chunk_chars]
+            content = joined[: cfg.max_chunk_chars]
             anchor = next((c for c in ordered if c.id == target), ordered[0])
             item.chunk_preview = content
             item.source_chunk_id = anchor.id
             item.source_doc_id = item.source_doc_id or anchor.document_id
             hydrated += 1
         return hydrated
+
+    def _emit_chunk_items(
+        self,
+        items: List[RetrievedItem],
+        *,
+        cfg: Optional[RetrievalConfig] = None,
+    ) -> List[RetrievedItem]:
+        """Build deduped chunk companions from hydrated entity/rel items.
+
+        Ordering: chunks appear in the order their parent items first
+        cite them. Each parent contributes at most one companion (its
+        ``source_chunk_id`` after hydration), so the total can never
+        exceed ``len(items)`` and is further capped by ``cfg.max_chunk_items``.
+        """
+        cfg = cfg or self._cfg
+        out: List[RetrievedItem] = []
+        seen: set[str] = set()
+        cap = max(0, cfg.max_chunk_items)
+        for parent in items:
+            if parent.kind is ItemKind.CHUNK:
+                continue  # never re-promote
+            cid = parent.source_chunk_id
+            if not cid or cid in seen:
+                continue
+            preview = parent.chunk_preview or ""
+            if not preview.strip():
+                # Hydration didn't run (no doc repo, or chunk lookup
+                # missed). Don't promote a phantom chunk row.
+                continue
+            seen.add(cid)
+            label = preview.strip().split("\n", 1)[0]
+            if not label:
+                label = f"chunk {cid[:8]}"
+            elif len(label) > 120:
+                label = label[:117].rstrip() + "…"
+            # Slight discount so a chunk companion never outranks its
+            # parent in confidence-sorted UIs. Keeps numerical ordering
+            # of the existing items unchanged.
+            confidence = max(0.0, round(parent.final_confidence - 0.05, 4))
+            out.append(
+                RetrievedItem(
+                    kind=ItemKind.CHUNK,
+                    id=cid,
+                    label=label,
+                    score_vector=parent.score_vector,
+                    score_bm25=parent.score_bm25,
+                    score_cypher=parent.score_cypher,
+                    score_rrf=parent.score_rrf,
+                    score_rerank=parent.score_rerank,
+                    final_confidence=confidence,
+                    source_url=parent.source_url,
+                    source_doc_id=parent.source_doc_id,
+                    source_chunk_id=cid,
+                    source_chunk_ids=[cid],
+                    chunk_preview=preview,
+                    contributing_channels=list(parent.contributing_channels),
+                    reasoning=f"hydrated from {parent.kind.value} {parent.id[:8]}",
+                    metadata={"promoted_from": parent.id, "promoted_kind": parent.kind.value},
+                )
+            )
+            if len(out) >= cap:
+                break
+        return out
 
     async def _record_metrics(
         self,

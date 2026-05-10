@@ -176,7 +176,7 @@ def test_patch_user_rejects_empty_body(users_client):
 class _FakeRetrieval:
     """Tiny fake — only exists so the qa router has something to call."""
 
-    async def retrieve(self, query, *, top_k=None, query_embedding=None):
+    async def retrieve(self, query, *, top_k=None, query_embedding=None, config_override=None):
         item = RetrievedItem(
             kind=ItemKind.ENTITY, id="e1", label="Imatinib",
             score_vector=0.9, score_rrf=0.5,

@@ -178,6 +178,7 @@ class QAService:
         session_id: Optional[str] = None,
         user_id: Optional[str] = ANONYMOUS_USER_ID,
         top_k: Optional[int] = None,
+        retrieval_override: Optional[RetrievalConfig] = None,
     ) -> AskResult:
         wall_start = time.perf_counter()
         if not (query or "").strip():
@@ -195,8 +196,11 @@ class QAService:
         query_embedding = await self._embed_query(query)
 
         # Retrieval and memory build are independent — gather them.
+        # ``retrieval_override`` is the P13 ablation hook; the orchestrator
+        # treats ``None`` as "use my construction-time config".
         items_trace_task = self._orch.retrieve(
             query, top_k=top_k, query_embedding=query_embedding,
+            config_override=retrieval_override,
         )
         memory_task = self._memory.build(
             session_id=session.id,

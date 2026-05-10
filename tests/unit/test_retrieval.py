@@ -443,6 +443,62 @@ async def test_orchestrator_hydrates_chunk_preview(orchestrator_setup, monkeypat
     assert trace.hydrated_chunks >= 1
 
 
+async def test_orchestrator_promotes_chunks_to_first_class_items(orchestrator_setup, monkeypatch):
+    """Hydrated chunks must appear as their own ``RetrievedItem(kind=chunk)``
+    rows after the entity / relationship items.
+
+    Locks in the P13 fix: without this promotion the eval harness's
+    ``gold_chunk_ids`` check could never match because chunks were
+    only metadata on their parent entity. The chunk row carries the
+    real chunk id (so eval composite ids line up) and inherits the
+    parent's confidence (slightly discounted) so confidence-sorted
+    UIs don't surface a chunk above the entity it came from.
+    """
+    repo, docs = orchestrator_setup
+
+    from graphbuilder.infrastructure.services import embedding_factory
+
+    async def fake_embed_async(text):
+        return [0.1] * 4
+
+    monkeypatch.setattr(embedding_factory, "embed_async", fake_embed_async)
+
+    orch = RetrievalOrchestrator(graph_repo=repo, document_repo=docs)
+    items, _ = await orch.retrieve("Imatinib")
+
+    chunk_items = [i for i in items if i.kind is ItemKind.CHUNK]
+    assert chunk_items, "expected at least one promoted chunk item"
+    parent = next(i for i in items if i.id == "e1")
+    chunk = next((c for c in chunk_items if c.id == parent.source_chunk_id), None)
+    assert chunk is not None
+    # Chunk row carries the real chunk id and a content preview.
+    assert chunk.id == "c1"
+    assert "Imatinib" in (chunk.chunk_preview or "")
+    # Confidence discounted vs parent so confidence-sorted UIs keep order.
+    assert chunk.final_confidence <= parent.final_confidence
+    # The metadata pointer back to the promoting parent helps the
+    # frontend group chunk rows under their entity.
+    assert chunk.metadata.get("promoted_from") == parent.id
+
+
+async def test_orchestrator_chunk_promotion_can_be_disabled(orchestrator_setup, monkeypatch):
+    """``cfg.emit_chunk_items=False`` restores the legacy 'chunks only
+    as metadata' behaviour for callers that depend on it."""
+    repo, docs = orchestrator_setup
+
+    from graphbuilder.infrastructure.services import embedding_factory
+
+    async def fake_embed_async(text):
+        return [0.1] * 4
+
+    monkeypatch.setattr(embedding_factory, "embed_async", fake_embed_async)
+
+    cfg = RetrievalConfig(emit_chunk_items=False)
+    orch = RetrievalOrchestrator(graph_repo=repo, document_repo=docs, config=cfg)
+    items, _ = await orch.retrieve("Imatinib")
+    assert all(i.kind is not ItemKind.CHUNK for i in items)
+
+
 async def test_orchestrator_no_doc_repo_skips_hydration(monkeypatch):
     e1 = _make_entity("e1", "Imatinib", chunk_ids=["c1"])
     repo = FakeGraphRepo(

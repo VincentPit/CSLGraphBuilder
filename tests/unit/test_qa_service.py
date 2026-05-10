@@ -56,6 +56,7 @@ class FakeOrchestrator:
         *,
         top_k: Optional[int] = None,
         query_embedding: Optional[List[float]] = None,  # P6+P7: optional pre-embedded
+        config_override: Optional[Any] = None,           # P13 ablation hook
     ):
         self.calls.append((query, top_k))
         return list(self._items), self._trace

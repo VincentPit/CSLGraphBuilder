@@ -152,6 +152,7 @@ async def _run_processing(
         tags=request.tags or [],
         chunk_size=request.chunk_size,
         chunk_overlap=request.chunk_overlap,
+        force=request.force,
     )
 
     try:

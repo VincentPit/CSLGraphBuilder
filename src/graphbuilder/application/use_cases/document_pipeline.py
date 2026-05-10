@@ -81,6 +81,13 @@ class DocumentInput:
     chunk_overlap: Optional[int] = None
     allowed_nodes: Optional[List[str]] = None
     allowed_relationships: Optional[List[str]] = None
+    # Re-parse guard. The pipeline keys on ``source_url`` to decide
+    # whether a document is already in the graph (every prior ingest
+    # writes ``:Document.source_url``). When a match is found and the
+    # node has ``HAS_CHUNK`` edges, the run is short-circuited and the
+    # existing document_id is returned. Set ``force=True`` to force a
+    # full re-ingest (creates a new :Document and chunks).
+    force: bool = False
 
 
 @dataclass
@@ -103,6 +110,7 @@ class PipelineResult:
     entities_rejected: int = 0
     entities_unreviewed: int = 0
     cancelled: bool = False
+    skipped: bool = False  # True when re-parse guard short-circuited the run
     duration_seconds: float = 0.0
     error: Optional[str] = None
 
@@ -125,6 +133,7 @@ class PipelineResult:
             "relationships_rejected": self.relationships_rejected,
             "relationships_unreviewed": self.relationships_unreviewed,
             "cancelled": self.cancelled,
+            "skipped": self.skipped,
             "duration_seconds": round(self.duration_seconds, 2),
             "error": self.error,
         }
@@ -189,6 +198,32 @@ class DocumentExtractionPipeline:
         cancel_check = cancel_check or (lambda: False)
 
         try:
+            # Stage 0 — re-parse guard. If a :Document with this
+            # ``source_url`` is already in the graph and has at least
+            # one chunk, skip the entire pipeline and reuse it. This is
+            # what keeps ingestion idempotent and avoids producing the
+            # cross-type entity duplicates we saw in the eval (BRCA1
+            # Concept + Brca1 GENE) every time the same paper is
+            # re-fed.
+            if not doc_input.force:
+                existing = await self._lookup_existing(doc_input)
+                if existing is not None:
+                    doc, chunk_count = existing
+                    result.document_id = doc.id
+                    result.chunks_created = chunk_count
+                    result.skipped = True
+                    result.message = (
+                        f"Skipped re-ingest: document {doc.id} already in graph "
+                        f"({chunk_count} chunks). Pass force=True to override."
+                    )
+                    await _maybe_await(
+                        progress("finalize", result.message, 1.0, {"skipped": True})
+                    )
+                    result.duration_seconds = (
+                        datetime.now(timezone.utc) - started
+                    ).total_seconds()
+                    return result
+
             await _maybe_await(progress("fetch", "Resolving content", 0.0, None))
             document, content = await self._stage_fetch(doc_input, progress)
             result.document_id = document.id
@@ -287,6 +322,38 @@ class DocumentExtractionPipeline:
             datetime.now(timezone.utc) - started
         ).total_seconds()
         return result
+
+    # ------------------------------------------------------------------
+    # Stage 0 — re-parse guard
+    # ------------------------------------------------------------------
+
+    async def _lookup_existing(
+        self, doc_input: DocumentInput
+    ) -> Optional[tuple[SourceDocument, int]]:
+        """Return ``(existing_document, chunk_count)`` if this source is
+        already in the graph and has been processed, else ``None``.
+
+        Keying by ``source_url`` is enough today because every prior
+        ingest writes that field — see ``_stage_fetch`` which synthesises
+        a ``text://<uuid>`` URL when the caller passes plain content
+        (those synthesised URLs are unique per call so they won't
+        accidentally match across runs).
+
+        We require at least one ``HAS_CHUNK`` edge before counting a
+        document as "ingested". Without that check, a half-finished
+        prior run that crashed between fetch and chunk would block all
+        future re-ingests of the same source.
+        """
+        url = doc_input.source_url
+        if not url:
+            return None
+        existing = await self.document_repo.get_by_source_url(url)
+        if existing is None:
+            return None
+        chunks = await self.document_repo.get_chunks_by_document_id(existing.id)
+        if not chunks:
+            return None
+        return existing, len(chunks)
 
     # ------------------------------------------------------------------
     # Stage 1 — fetch (URL → text or use provided content)

@@ -146,6 +146,44 @@ async def test_pipeline_respects_cancellation(pipeline):
     assert result.success is False
 
 
+async def test_reparse_guard_skips_already_ingested_url(pipeline):
+    """Re-running the pipeline against the same ``source_url`` must
+    short-circuit before the expensive entity/relationship stages.
+
+    The stub LLM counts every extraction call; the second run is
+    expected to make zero extra calls and return ``skipped=True`` with
+    the existing document_id reused. Setting ``force=True`` bypasses
+    the guard and re-parses, restoring the old behaviour for callers
+    who really want a fresh run.
+    """
+    content = "TNF-alpha is implicated in Hemophilia A. Both are studied widely."
+    url = "https://example.com/paper-42"
+
+    first = await pipeline.run(
+        DocumentInput(title="Run 1", content=content, source_url=url)
+    )
+    assert first.success and not first.skipped
+    assert first.chunks_created >= 1
+    llm = pipeline.llm_service
+    calls_after_first = (llm.entity_calls, llm.rel_calls)
+
+    second = await pipeline.run(
+        DocumentInput(title="Run 2", content=content, source_url=url)
+    )
+    assert second.success and second.skipped
+    # Reused document, no new extraction calls.
+    assert second.document_id == first.document_id
+    assert second.chunks_created == first.chunks_created
+    assert (llm.entity_calls, llm.rel_calls) == calls_after_first
+
+    # ``force=True`` must override and re-parse end-to-end.
+    forced = await pipeline.run(
+        DocumentInput(title="Run 3", content=content, source_url=url, force=True)
+    )
+    assert forced.success and not forced.skipped
+    assert (llm.entity_calls, llm.rel_calls) > calls_after_first
+
+
 async def test_repeated_dedup_calls_use_cache(pipeline):
     """Same dedup signature across runs should hit the cache the second time."""
     # Pre-populate one entity in the graph so the vector pre-filter has a

@@ -68,7 +68,18 @@ class DocumentRepositoryInterface(ABC):
     async def get_by_id(self, document_id: str) -> Optional[SourceDocument]:
         """Get document by ID."""
         pass
-    
+
+    @abstractmethod
+    async def get_by_source_url(self, source_url: str) -> Optional[SourceDocument]:
+        """Look up a document by ``source_url``.
+
+        Used by the ingestion pipeline to skip already-parsed sources
+        instead of creating a duplicate :Document node and re-running
+        the (expensive) chunk + LLM extraction stages. Returns ``None``
+        when no document with that URL exists.
+        """
+        pass
+
     @abstractmethod
     async def update(self, document: SourceDocument) -> SourceDocument:
         """Update existing document."""
@@ -185,22 +196,44 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
     
     async def get_by_id(self, document_id: str) -> Optional[SourceDocument]:
         """Get document by ID from Neo4j database."""
-        
+
         async with self.driver.session() as session:
             query = """
             MATCH (d:Document {id: $id})
             RETURN d
             """
-            
+
             result = await session.run(query, {'id': document_id})
             record = await result.single()
-            
+
             if record:
                 doc_data = dict(record['d'])
                 return self._create_document_from_data(doc_data)
-            
+
             return None
-    
+
+    async def get_by_source_url(self, source_url: str) -> Optional[SourceDocument]:
+        """Look up a document by ``source_url`` (uses ``document_url_idx``).
+
+        When multiple documents share the same URL (legacy duplicate
+        ingests), return the most recently created one — that's the
+        node any subsequent stages would have written into anyway.
+        """
+        if not source_url:
+            return None
+        async with self.driver.session() as session:
+            result = await session.run(
+                """
+                MATCH (d:Document {source_url: $url})
+                RETURN d ORDER BY d.created_at DESC LIMIT 1
+                """,
+                {"url": source_url},
+            )
+            record = await result.single()
+            if record:
+                return self._create_document_from_data(dict(record["d"]))
+            return None
+
     async def update(self, document: SourceDocument) -> SourceDocument:
         """Update existing document in Neo4j database."""
         
@@ -594,7 +627,17 @@ class InMemoryDocumentRepository(DocumentRepositoryInterface):
     async def get_by_id(self, document_id: str) -> Optional[SourceDocument]:
         """Get document by ID from memory."""
         return self.documents.get(document_id)
-    
+
+    async def get_by_source_url(self, source_url: str) -> Optional[SourceDocument]:
+        """Look up a document by source URL in the in-memory repo."""
+        if not source_url:
+            return None
+        # Most-recently-created wins, matching the Neo4j impl's tie-break.
+        matches = [d for d in self.documents.values() if d.source_url == source_url]
+        if not matches:
+            return None
+        return max(matches, key=lambda d: getattr(d, "created_at", None) or datetime.min)
+
     async def update(self, document: SourceDocument) -> SourceDocument:
         """Update document in memory."""
         document.metadata.update()

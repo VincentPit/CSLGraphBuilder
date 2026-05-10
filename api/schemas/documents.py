@@ -13,6 +13,15 @@ class ProcessDocumentRequest(BaseModel):
     tags: List[str] = []
     chunk_size: Optional[int] = Field(None, ge=64, le=4096)
     chunk_overlap: Optional[int] = Field(None, ge=0, le=512)
+    force: bool = Field(
+        False,
+        description=(
+            "If true, ingest even when a :Document with the same source_url "
+            "already exists. Default behaviour skips the run and returns the "
+            "existing document_id, preventing the duplicate-entity blowups "
+            "the eval surfaced (BRCA1 Concept + Brca1 Gene from re-parses)."
+        ),
+    )
 
     @model_validator(mode="after")
     def coalesce_title(self) -> "ProcessDocumentRequest":

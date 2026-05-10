@@ -1,19 +1,23 @@
 """QA router — POST /qa/ask + a few session helpers (P5 of docs/RAG_QA_PLAN.md).
 
 The router is deliberately thin: it adapts FastAPI dependencies to the
-``QAService`` and translates dataclasses to Pydantic responses. Streaming
-(P11) and tool-use (P9/P10) are not wired here yet; faithfulness (P8)
-rides along on the ``faithfulness`` field of ``AskResponse``.
+``QAService`` and translates dataclasses to Pydantic responses. Tool-use
+(P9/P10) is not wired here yet; faithfulness (P8) rides along on the
+``faithfulness`` field of ``AskResponse``. Streaming (P11) is exposed
+as ``POST /qa/ask/stream`` using the same SSE pattern as
+``/documents/jobs/{id}/stream``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import os
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sse_starlette.sse import EventSourceResponse
 
 from ..auth import require_api_key
 from ..dependencies import (
@@ -178,6 +182,82 @@ async def ask(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return _to_ask_response(result)
+
+
+@router.post("/ask/stream", summary="Streaming /qa/ask via SSE (P11)")
+async def ask_stream(
+    request: Request,
+    body: AskRequest,
+    config=Depends(get_app_config),
+    graph_repo=Depends(get_graph_repo),
+    document_repo=Depends(get_document_repo),
+    conversation_repo=Depends(get_conversation_repo),
+    llm_service=Depends(get_llm),
+    chat_user_id: Optional[str] = Depends(get_chat_user_id),
+    _=Depends(require_api_key),
+) -> EventSourceResponse:
+    """Server-Sent Events: same data as ``/qa/ask`` but streamed.
+
+    Event sequence per turn:
+
+    1. ``phase`` (``retrieving``)
+    2. ``retrieval`` — sources + retrieval_trace + memory_trace
+    3. ``phase`` (``generating``)
+    4. ``delta`` — repeated; each carries a token chunk
+    5. ``done`` — turn_id, session_id, cited indices, faithfulness, latency
+
+    On any failure an ``error`` event is emitted instead of the next
+    expected event and the stream closes; the client should display
+    ``error.message`` and stop reading.
+    """
+    if not body.query or not body.query.strip():
+        raise HTTPException(status_code=400, detail="query must not be empty")
+
+    service = _get_qa_service(
+        config=config,
+        graph_repo=graph_repo,
+        document_repo=document_repo,
+        conversation_repo=conversation_repo,
+        llm_service=llm_service,
+    )
+
+    effective_user_id = chat_user_id if chat_user_id is not None else body.user_id
+    retrieval_override = _build_ablation_override(service, body.ablation)
+
+    async def event_generator():
+        try:
+            async for ev in service.ask_stream(
+                query=body.query,
+                session_id=body.session_id,
+                user_id=effective_user_id,
+                top_k=body.top_k,
+                retrieval_override=retrieval_override,
+            ):
+                # Each event is a {"event": <name>, "data": <dict>} pair.
+                # ``sse_starlette`` accepts that shape directly when we
+                # JSON-encode the data field — keeps the SSE frame's
+                # ``data:`` line a single-line JSON object the client
+                # can ``JSON.parse``.
+                yield {
+                    "event": ev["event"],
+                    "data": json.dumps(ev["data"]),
+                }
+                # If the service signalled the end of the stream, close
+                # cleanly. ``sse_starlette`` would also close on return,
+                # but being explicit avoids a wasted iteration if the
+                # generator yields anything after ``done`` / ``error``.
+                if ev["event"] in ("done", "error"):
+                    return
+        except Exception as exc:  # noqa: BLE001 — last-line safety net
+            logger.error("/qa/ask/stream generator crashed: %s", exc, exc_info=True)
+            yield {
+                "event": "error",
+                "data": json.dumps(
+                    {"message": str(exc), "kind": "internal_error"}
+                ),
+            }
+
+    return EventSourceResponse(event_generator())
 
 
 def _build_ablation_override(service: QAService, ablation: Any) -> Any:

@@ -1,7 +1,7 @@
 """QA service — ties retrieval, the LLM, and conversation persistence
 together into the single ``ask(query)`` flow used by ``/qa/ask``.
 
-v1 scope (P5 of docs/RAG_QA_PLAN.md), now extended for P6+P7+P8:
+v1 scope (P5 of docs/RAG_QA_PLAN.md), now extended for P6–P8 + P11:
 - Memory layers (working / rolling-summary / episodic recall) build
   in parallel with retrieval and feed into the LLM prompt.
 - Per-turn ``query_embedding`` is persisted on the turn so future
@@ -10,6 +10,10 @@ v1 scope (P5 of docs/RAG_QA_PLAN.md), now extended for P6+P7+P8:
 - Faithfulness check (P8) runs after generation; per-claim confidence
   + an aggregate ``answer_faithfulness`` score ride along on the
   result for the frontend's yellow-underline UI and the eval harness.
+- Streaming counterpart ``ask_stream`` (P11) yields the same data as
+  ``ask`` but as a sequence of SSE-shaped events: phase / retrieval /
+  delta / done / error. Same retrieval + memory + faithfulness wiring;
+  the LLM step uses the provider's stream API when available.
 
 Each call:
 1. Resolves or creates a session (anonymous if no user_id supplied).
@@ -32,7 +36,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .faithfulness import (
     FaithfulnessChecker,
@@ -257,17 +261,9 @@ class QAService:
             if 1 <= i <= len(items)
         ]
 
-        cited_entity_ids: List[str] = []
-        cited_rel_ids: List[str] = []
-        cited_chunk_ids: List[str] = []
-        for idx in cited_indices:
-            item = items[idx - 1]
-            if item.kind.value == "entity":
-                cited_entity_ids.append(item.id)
-            elif item.kind.value == "relationship":
-                cited_rel_ids.append(item.id)
-            if item.source_chunk_id and item.source_chunk_id not in cited_chunk_ids:
-                cited_chunk_ids.append(item.source_chunk_id)
+        cited_entity_ids, cited_rel_ids, cited_chunk_ids = self._collect_cited_ids(
+            items, cited_indices,
+        )
 
         # Faithfulness check (P8). Runs against the same 1-indexed
         # source list the LLM saw so [n] markers line up. Lexical-only
@@ -326,6 +322,231 @@ class QAService:
             latency_ms=latency_ms,
             faithfulness=faithfulness_result,
         )
+
+    # ------------------------------------------------------------------
+    # Streaming variant (P11)
+    # ------------------------------------------------------------------
+    #
+    # Same flow as ``ask`` but yields a sequence of structured event
+    # dicts rather than building one ``AskResult``. The router maps
+    # each event dict to one SSE frame:
+    #
+    #   - ``phase``        — coarse progress signal ("retrieving",
+    #                        "generating") so the frontend can swap
+    #                        spinner copy without parsing details.
+    #   - ``retrieval``    — sources + retrieval_trace + memory_trace,
+    #                        emitted once retrieval+memory complete.
+    #   - ``delta``        — token chunk(s) from the LLM. May fire many
+    #                        times per turn.
+    #   - ``done``         — final event: turn_id, session_id,
+    #                        cited_source_indices, faithfulness, total
+    #                        latency. Indicates the stream is closed.
+    #   - ``error``        — emitted in place of ``done`` when the call
+    #                        fails. The frontend should surface the
+    #                        ``error.message`` and stop reading.
+    #
+    # Persistence + metrics + faithfulness all run inside the generator
+    # so a client that hangs up mid-stream still triggers the cleanup
+    # path via the ``finally`` blocks below.
+
+    async def ask_stream(
+        self,
+        *,
+        query: str,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = ANONYMOUS_USER_ID,
+        top_k: Optional[int] = None,
+        retrieval_override: Optional[RetrievalConfig] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Yield streaming events for a single ``/qa/ask/stream`` turn."""
+        wall_start = time.perf_counter()
+        if not (query or "").strip():
+            raise ValueError("query must not be empty")
+
+        from ...infrastructure.services.qa_observability import get_request_id
+        request_id = get_request_id()
+
+        try:
+            session = await self._resolve_session(session_id, user_id)
+        except LookupError as exc:
+            yield {"event": "error", "data": {"message": str(exc), "kind": "session_not_found"}}
+            return
+
+        # Tell the client retrieval has started before we await anything
+        # expensive — keeps the spinner snappy.
+        yield {"event": "phase", "data": {"phase": "retrieving", "request_id": request_id}}
+
+        query_embedding = await self._embed_query(query)
+
+        if retrieval_override is not None:
+            intent_label: Optional[str] = None
+            cfg_for_turn: Optional[RetrievalConfig] = retrieval_override
+        else:
+            intent_label = classify_intent(query)
+            cfg_for_turn = apply_profile(self._cfg, INTENT_PROFILES[intent_label])
+
+        items_trace_task = self._orch.retrieve(
+            query, top_k=top_k, query_embedding=query_embedding,
+            config_override=cfg_for_turn,
+        )
+        memory_task = self._memory.build(
+            session_id=session.id,
+            query=query,
+            query_embedding=query_embedding,
+        )
+        try:
+            (items, trace), memory_ctx = await asyncio.gather(
+                items_trace_task, memory_task,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("ask_stream retrieval failed: %s", exc, exc_info=True)
+            yield {"event": "error", "data": {"message": str(exc), "kind": "retrieval_failed"}}
+            return
+
+        if intent_label is not None:
+            trace.intent = intent_label
+
+        # Snapshot retrieval result so the frontend can render source
+        # cards + the retrieval-trace panel before the LLM finishes.
+        yield {
+            "event": "retrieval",
+            "data": {
+                "sources": [it.to_dict() for it in items],
+                "retrieval_trace": trace.to_dict(),
+                "memory_trace": memory_ctx.to_trace_dict(),
+                "intent": intent_label,
+            },
+        }
+
+        # Generation phase — actual token streaming below.
+        yield {"event": "phase", "data": {"phase": "generating"}}
+
+        answer_chunks: List[str] = []
+        prompt = _render_user_prompt(query, items, memory_ctx.rendered_block)
+        gen_start = time.perf_counter()
+
+        try:
+            async for chunk in self._stream_answer(prompt):
+                answer_chunks.append(chunk)
+                yield {"event": "delta", "data": {"text": chunk}}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("ask_stream generation failed: %s", exc, exc_info=True)
+            # Still record the (partial) answer so the turn isn't lost.
+            answer = "".join(answer_chunks) or f"(LLM stream failed: {exc})"
+            yield {"event": "error", "data": {"message": str(exc), "kind": "llm_failed"}}
+            await self._record_llm_latency(time.perf_counter() - gen_start)
+            return
+
+        await self._record_llm_latency(time.perf_counter() - gen_start)
+
+        answer = "".join(answer_chunks)
+        cited_indices = [
+            i for i in _extract_cited_indices(answer)
+            if 1 <= i <= len(items)
+        ]
+        cited_entity_ids, cited_rel_ids, cited_chunk_ids = self._collect_cited_ids(
+            items, cited_indices,
+        )
+
+        faithfulness_result = await self._check_faithfulness(answer, items)
+
+        turn = await self._append_turn(
+            session_id=session.id,
+            query=query,
+            answer=answer,
+            request_id=request_id,
+            cited_entity_ids=cited_entity_ids,
+            cited_rel_ids=cited_rel_ids,
+            cited_chunk_ids=cited_chunk_ids,
+            query_embedding=query_embedding,
+        )
+
+        latency_ms = int((time.perf_counter() - wall_start) * 1000)
+
+        await self._record_request_metric(status="ok", intent=intent_label or "any")
+        await self._record_total_latency(latency_ms)
+        await self._record_memory_tokens(memory_ctx)
+        if faithfulness_result and faithfulness_result.failed_claims:
+            await self._record_faithfulness_failures(faithfulness_result.failed_claims)
+
+        logger.info(
+            "ask_stream done session=%s turn=%s intent=%s sources=%d cited=%d "
+            "chunks=%d faithfulness=%s latency_ms=%d",
+            session.id, turn.id, intent_label or "override",
+            len(items), len(cited_indices), len(answer_chunks),
+            (
+                f"{faithfulness_result.overall_score:.2f}"
+                if faithfulness_result and faithfulness_result.overall_score is not None
+                else "n/a"
+            ),
+            latency_ms,
+        )
+
+        yield {
+            "event": "done",
+            "data": {
+                "session_id": session.id,
+                "turn_id": turn.id,
+                "answer": answer,
+                "cited_source_indices": cited_indices,
+                "faithfulness": (
+                    faithfulness_result.to_dict() if faithfulness_result else None
+                ),
+                "request_id": request_id,
+                "latency_ms": latency_ms,
+            },
+        }
+
+    async def _stream_answer(self, prompt: str) -> AsyncIterator[str]:
+        """Yield answer chunks. Falls back to a single chunk when the LLM
+        service doesn't expose a streaming method (e.g. test fakes or a
+        provider without ``stream=True`` support)."""
+        if self._llm is None:
+            yield (
+                "(no LLM configured — retrieval already streamed; see Sources panel)"
+            )
+            return
+        stream_fn = getattr(self._llm, "generate_text_stream", None)
+        if stream_fn is None:
+            # Graceful fallback: call the non-streaming method and emit
+            # the full answer as one chunk. Keeps the SSE contract the
+            # same shape regardless of provider capability.
+            answer = await self._llm.generate_text(
+                prompt=prompt,
+                system_prompt=_SYSTEM_PROMPT,
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            yield answer
+            return
+
+        async for chunk in stream_fn(
+            prompt=prompt,
+            system_prompt=_SYSTEM_PROMPT,
+            temperature=0.1,
+            max_tokens=1024,
+        ):
+            if chunk:
+                yield chunk
+
+    @staticmethod
+    def _collect_cited_ids(
+        items: List[RetrievedItem],
+        cited_indices: List[int],
+    ) -> tuple[List[str], List[str], List[str]]:
+        """Bucket cited source ids by kind for ``ConversationTurn``."""
+        cited_entity_ids: List[str] = []
+        cited_rel_ids: List[str] = []
+        cited_chunk_ids: List[str] = []
+        for idx in cited_indices:
+            item = items[idx - 1]
+            if item.kind.value == "entity":
+                cited_entity_ids.append(item.id)
+            elif item.kind.value == "relationship":
+                cited_rel_ids.append(item.id)
+            if item.source_chunk_id and item.source_chunk_id not in cited_chunk_ids:
+                cited_chunk_ids.append(item.source_chunk_id)
+        return cited_entity_ids, cited_rel_ids, cited_chunk_ids
 
     # ------------------------------------------------------------------
     # Embedding helper

@@ -230,3 +230,109 @@ def test_post_feedback_unknown_turn_404(client):
         "/qa/turns/missing/feedback", json={"rating": 1},
     )
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------- P11 streaming
+
+
+class _StreamingFakeLLM:
+    """LLM with both streaming and non-streaming methods.
+
+    The router test only cares about the SSE frame shape, so we keep
+    chunks small and predictable.
+    """
+
+    async def generate_text_stream(self, *, prompt, system_prompt=None,
+                                   temperature: float = 0.0, max_tokens: int = 1024):
+        for piece in ("Imatinib ", "targets ", "BCR-ABL ", "[1]."):
+            yield piece
+
+    async def generate_text(self, **kwargs):
+        return "Imatinib targets BCR-ABL [1]."
+
+
+def _parse_sse(body: str):
+    """Parse the raw SSE response body into ``[{event, data}]`` dicts.
+
+    ``sse_starlette`` writes frames with CRLF line terminators
+    (``event: <name>\\r\\ndata: <json>\\r\\n\\r\\n``). We normalise to
+    LF before splitting so the blank-line delimiter is unambiguous,
+    then pull the ``event:`` + ``data:`` fields out of each frame.
+    """
+    import json as _json
+
+    normalised = body.replace("\r\n", "\n").strip()
+    out = []
+    for frame in normalised.split("\n\n"):
+        if not frame.strip():
+            continue
+        ev_name = None
+        data_lines: list[str] = []
+        for line in frame.split("\n"):
+            if line.startswith("event:"):
+                ev_name = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:"):].strip())
+        if ev_name is None or not data_lines:
+            continue
+        try:
+            payload = _json.loads("\n".join(data_lines))
+        except _json.JSONDecodeError:
+            payload = {"_raw": "\n".join(data_lines)}
+        out.append({"event": ev_name, "data": payload})
+    return out
+
+
+def test_post_ask_stream_emits_complete_event_sequence(client, conv_repo):
+    """The streaming endpoint must emit phase → retrieval → phase →
+    delta(s) → done in order."""
+    # Replace the singleton's LLM with the streaming fake — the
+    # fixture-built service used the non-streaming _FakeLLM.
+    qa_router._qa_service_singleton._llm = _StreamingFakeLLM()
+    qa_router._qa_service_singleton._faithfulness._llm = _StreamingFakeLLM()
+
+    resp = client.post("/qa/ask/stream", json={"query": "tell me about Imatinib"})
+    assert resp.status_code == 200, resp.text
+    # sse_starlette sets content-type text/event-stream
+    assert resp.headers["content-type"].startswith("text/event-stream")
+
+    events = _parse_sse(resp.text)
+    kinds = [e["event"] for e in events]
+    assert kinds[0] == "phase"
+    assert events[0]["data"]["phase"] == "retrieving"
+    assert "retrieval" in kinds
+    # second phase event = generating
+    assert any(
+        e["event"] == "phase" and e["data"]["phase"] == "generating"
+        for e in events
+    )
+    assert kinds[-1] == "done"
+    deltas = [e["data"]["text"] for e in events if e["event"] == "delta"]
+    assert "".join(deltas) == "Imatinib targets BCR-ABL [1]."
+
+    done = events[-1]["data"]
+    assert done["session_id"].startswith("session_")
+    assert done["turn_id"].startswith("turn_")
+    assert done["cited_source_indices"] == [1]
+    assert done["faithfulness"] is not None
+
+
+def test_post_ask_stream_rejects_empty_query(client):
+    resp = client.post("/qa/ask/stream", json={"query": "   "})
+    assert resp.status_code == 400
+
+
+def test_post_ask_stream_unknown_session_yields_error_event(client):
+    qa_router._qa_service_singleton._llm = _StreamingFakeLLM()
+    resp = client.post(
+        "/qa/ask/stream",
+        json={"query": "q", "session_id": "session_missing"},
+    )
+    # We don't 404 here because the SSE stream is already open by the
+    # time we try to resolve the session — surface the error inside the
+    # stream instead so the client can render it the same way as a
+    # mid-stream LLM failure.
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    assert events[-1]["event"] == "error"
+    assert events[-1]["data"]["kind"] == "session_not_found"

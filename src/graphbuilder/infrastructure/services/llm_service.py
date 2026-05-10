@@ -934,6 +934,80 @@ RESPOND WITH VALID JSON:
         response = await self._execute_llm_call(request)
         return response.content
 
+    async def generate_text_stream(
+        self,
+        *,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        prompt_type: PromptType = PromptType.VERIFICATION,
+    ):
+        """Streaming variant of ``generate_text`` (P11 of docs/RAG_QA_PLAN.md).
+
+        Yields successive ``str`` chunks of the completion as the provider
+        emits them. The retry wrapper from ``_retryable_llm_call`` only
+        guards the *opening* of the stream — once tokens start flowing,
+        a mid-stream failure surfaces directly so the SSE endpoint can
+        send a clean ``error`` event rather than silently retrying a
+        half-rendered answer (which would jumble token order in the
+        client).
+
+        Metrics are recorded once at end-of-stream, like the non-streaming
+        path; ``processing_time`` covers the full open → drain → close
+        window so latency dashboards stay comparable.
+        """
+        sys_prompt = system_prompt or (
+            "You are a helpful assistant that provides accurate, "
+            "structured responses in JSON format."
+        )
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+        async def _open_stream():
+            return await self.client.chat.completions.create(
+                model=self.config.llm.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+
+        start = datetime.now(timezone.utc)
+        try:
+            stream = await _retryable_llm_call(_open_stream, self.logger)
+        except Exception as exc:
+            self.logger.error(f"LLM stream open failed: {exc}", exc_info=True)
+            raise RuntimeError(f"LLM stream open failed: {exc}")
+
+        completion_tokens = 0
+        try:
+            async for chunk in stream:
+                # OpenAI Python SDK ≥ 1.0: chunk.choices[0].delta.content
+                # may be None on role-only chunks at the start. Skip those
+                # rather than emit empty deltas to the client.
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta
+                content = getattr(delta, "content", None)
+                if not content:
+                    continue
+                completion_tokens += 1  # rough — OpenAI doesn't bill per chunk
+                yield content
+        finally:
+            processing_time = (datetime.now(timezone.utc) - start).total_seconds()
+            try:
+                await get_metrics().record_llm_call(
+                    prompt_type=prompt_type.value,
+                    prompt_tokens=0,  # streaming responses don't carry usage server-side
+                    completion_tokens=completion_tokens,
+                    latency_seconds=processing_time,
+                )
+            except Exception:  # metrics never break the call path
+                pass
+
     async def _parse_json_response(self, content: str) -> Dict[str, Any]:
         """Parse and validate JSON response from LLM."""
         

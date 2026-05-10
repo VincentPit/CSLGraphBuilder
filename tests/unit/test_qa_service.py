@@ -481,3 +481,141 @@ async def test_ask_faithfulness_check_failure_does_not_break_response(items, con
     result = await svc.ask(query="q")
     assert result.faithfulness is None
     assert "ok" in result.answer  # answer still came back
+
+
+# ---------------------------------------------------------------- P11 streaming
+
+
+class StreamingFakeLLM:
+    """LLM with a streaming method that emits a fixed list of chunks.
+
+    Mirrors the duck-typed shape ``QAService._stream_answer`` looks for:
+    ``generate_text_stream(prompt=..., system_prompt=..., temperature=...,
+    max_tokens=...)`` returning an async generator of strings.
+    """
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.calls: list[dict] = []
+
+    async def generate_text_stream(self, *, prompt, system_prompt=None,
+                                   temperature: float = 0.0, max_tokens: int = 1024):
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt})
+        for c in self._chunks:
+            yield c
+
+    # Keep a non-streaming method too, so the fallback path test can
+    # exercise the "no streaming method" branch by deleting this attribute.
+    async def generate_text(self, *, prompt, system_prompt=None,
+                            temperature: float = 0.0, max_tokens: int = 1024):
+        self.calls.append({"prompt": prompt, "system_prompt": system_prompt})
+        return "".join(self._chunks)
+
+
+async def _drain(gen):
+    """Collect every event a streaming generator yields."""
+    out = []
+    async for ev in gen:
+        out.append(ev)
+    return out
+
+
+async def test_ask_stream_emits_phase_retrieval_delta_done(items, conv_repo):
+    """Happy path: phase → retrieval → phase → delta(s) → done."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = StreamingFakeLLM(["Imati", "nib targets BCR-ABL ", "[1]."])
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    events = await _drain(svc.ask_stream(query="tell me about Imatinib"))
+    kinds = [e["event"] for e in events]
+    assert kinds[:2] == ["phase", "retrieval"]
+    assert "phase" in kinds  # second phase = generating
+    assert kinds[-1] == "done"
+    deltas = [e["data"]["text"] for e in events if e["event"] == "delta"]
+    assert "".join(deltas) == "Imatinib targets BCR-ABL [1]."
+
+    # Done event carries the same metadata fields a non-stream caller
+    # would read off AskResult.
+    done = events[-1]["data"]
+    assert done["session_id"].startswith("session_")
+    assert done["turn_id"].startswith("turn_")
+    assert done["cited_source_indices"] == [1]
+    assert done["faithfulness"] is not None
+    assert done["latency_ms"] >= 0
+
+
+async def test_ask_stream_persists_turn_with_full_answer(items, conv_repo):
+    """The turn saved at end-of-stream must contain the joined answer
+    + the citation metadata, just like the non-stream path."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = StreamingFakeLLM(["Part one ", "[1] part two."])
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    events = await _drain(svc.ask_stream(query="q"))
+    done = events[-1]["data"]
+    turns = await conv_repo.get_turns_by_session(done["session_id"])
+    saved = turns[0]
+    assert saved.llm_answer == "Part one [1] part two."
+    assert saved.cited_entity_ids == ["e1"]
+
+
+async def test_ask_stream_falls_back_when_no_streaming_method(items, conv_repo):
+    """If the LLM service exposes only ``generate_text``, the streamer
+    must still produce one delta with the full answer + a clean done."""
+
+    class _NonStreamingLLM:
+        async def generate_text(self, *, prompt, system_prompt=None,
+                                temperature: float = 0.0, max_tokens: int = 1024):
+            return "everything in one shot [1]"
+
+    orch = FakeOrchestrator(items, _trace())
+    svc = QAService(
+        orchestrator=orch, conversation_repo=conv_repo,
+        llm_service=_NonStreamingLLM(),
+    )
+
+    events = await _drain(svc.ask_stream(query="q"))
+    deltas = [e for e in events if e["event"] == "delta"]
+    assert len(deltas) == 1
+    assert deltas[0]["data"]["text"] == "everything in one shot [1]"
+    assert events[-1]["event"] == "done"
+
+
+async def test_ask_stream_unknown_session_emits_error_event(items, conv_repo):
+    orch = FakeOrchestrator(items, _trace())
+    llm = StreamingFakeLLM(["never reached"])
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    events = await _drain(svc.ask_stream(query="q", session_id="session_missing"))
+    assert len(events) == 1
+    assert events[0]["event"] == "error"
+    assert events[0]["data"]["kind"] == "session_not_found"
+
+
+async def test_ask_stream_llm_failure_emits_error_after_partial_answer(items, conv_repo):
+    """If the stream raises mid-way, an error event closes the stream
+    and the partial chunks the client already received are not retracted."""
+
+    class BoomStream:
+        async def generate_text_stream(self, **kwargs):
+            yield "first half "
+            raise RuntimeError("provider hiccup")
+
+    orch = FakeOrchestrator(items, _trace())
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=BoomStream())
+
+    events = await _drain(svc.ask_stream(query="q"))
+    deltas = [e for e in events if e["event"] == "delta"]
+    assert deltas == [{"event": "delta", "data": {"text": "first half "}}]
+    assert events[-1]["event"] == "error"
+    assert events[-1]["data"]["kind"] == "llm_failed"
+
+
+async def test_ask_stream_empty_query_raises_value_error(conv_repo, items):
+    orch = FakeOrchestrator(items, _trace())
+    llm = StreamingFakeLLM(["x"])
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    with pytest.raises(ValueError):
+        async for _ in svc.ask_stream(query="   "):
+            pass

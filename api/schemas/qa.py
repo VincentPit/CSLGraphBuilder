@@ -77,6 +77,18 @@ class AskRequest(BaseModel):
             "tool_calls field. Default false keeps single-shot generation."
         ),
     )
+    enable_mutations: bool = Field(
+        False,
+        description=(
+            "Opt-in to mutating tools (P10). When true, the LLM may "
+            "additionally call propose_entity / propose_relationship / "
+            "update_entity / merge_entities / soft_delete_entity / "
+            "soft_delete_relationship. Each call queues a proposal in "
+            "/qa/proposals; nothing applies to the graph until a curator "
+            "promotes the proposal. Independent from enable_tools — set "
+            "both to give the LLM full read+write access."
+        ),
+    )
 
 
 class SourceModel(BaseModel):
@@ -205,3 +217,42 @@ class FeedbackRequest(BaseModel):
 class FeedbackResponse(BaseModel):
     turn_id: str
     accepted: bool
+
+
+# ----------------------------------------------------------------------
+# P10 — proposed mutations
+# ----------------------------------------------------------------------
+
+
+class ProposedMutationModel(BaseModel):
+    """One row from the proposed-mutation queue (chatbot → curator)."""
+
+    proposal_id: str
+    tool: str
+    args: dict
+    summary: str
+    proposer_user_id: Optional[str] = None
+    proposer_session_id: Optional[str] = None
+    proposer_turn_id: Optional[str] = None
+    request_id: Optional[str] = None
+    submitted_at: str
+    status: str = Field(..., description='One of "pending" | "approved" | "rejected".')
+    decided_at: Optional[str] = None
+    decision_notes: Optional[str] = None
+    applied_target_id: Optional[str] = None
+    applied_at: Optional[str] = None
+    apply_error: Optional[str] = None
+
+
+class ProposalListResponse(BaseModel):
+    total: int
+    items: List[ProposedMutationModel] = Field(default_factory=list)
+
+
+class ProposalDecisionRequest(BaseModel):
+    notes: Optional[str] = None
+
+
+class ProposalApplyResponse(BaseModel):
+    proposal: ProposedMutationModel
+    applied_target_id: Optional[str] = None

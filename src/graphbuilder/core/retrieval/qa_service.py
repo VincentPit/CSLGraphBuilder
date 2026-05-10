@@ -48,6 +48,7 @@ from .intent import INTENT_PROFILES, apply_profile, classify_intent
 from .memory import MemoryConfig, MemoryContext, MemoryService
 from .models import RetrievalConfig, RetrievalTrace, RetrievedItem
 from .orchestrator import RetrievalOrchestrator
+from .mutation_tools import MutationToolDispatcher, is_mutation
 from .tools import ToolCallRecord, ToolDispatcher
 
 
@@ -88,6 +89,21 @@ target exists. Call tools sparingly; the SOURCES block is usually enough.
 When you have what you need, produce the final answer in the usual format
 (no further tool calls). If the tools return nothing useful, reply with the
 configured refusal phrase rather than guessing.
+"""
+
+
+_MUTATION_PROMPT_SUFFIX = """
+
+MUTATING TOOLS
+You may also propose graph changes when the user explicitly asks for them:
+- propose_entity / propose_relationship: create new content
+- update_entity: patch fields on an existing entity
+- merge_entities: collapse two duplicate entities
+- soft_delete_entity / soft_delete_relationship: hide rejected content
+
+Mutating tools never apply directly — they queue a proposal that a human
+curator must approve. Always confirm the user's intent before calling one.
+Tell the user the proposal_id you got back so they can track the review.
 """
 
 
@@ -227,7 +243,24 @@ class QAService:
         # §7.7's ``RAGToolConfig.max_tool_calls_per_turn`` so a
         # runaway loop can't fan out forever.
         self._tools = tool_dispatcher
+        # P10 — mutating tools are a separate dispatcher so the read-
+        # only and write surfaces can be enabled / disabled
+        # independently. Wired up via ``set_mutation_dispatcher`` from
+        # the API layer (the dispatcher needs access to the api/
+        # proposed-mutation store, which core/ shouldn't import).
+        self._mutation_tools: Optional[MutationToolDispatcher] = None
         self._max_tool_calls = max(0, int(max_tool_calls_per_turn))
+
+    def set_mutation_dispatcher(
+        self, dispatcher: Optional[MutationToolDispatcher],
+    ) -> None:
+        """Wire the mutating tool dispatcher post-construction (P10).
+
+        The dispatcher needs the api/ proposed-mutation store, which
+        core/ shouldn't import — so the API layer constructs it and
+        injects via this setter rather than via ``__init__``.
+        """
+        self._mutation_tools = dispatcher
 
     async def ask(
         self,
@@ -238,6 +271,7 @@ class QAService:
         top_k: Optional[int] = None,
         retrieval_override: Optional[RetrievalConfig] = None,
         enable_tools: bool = False,
+        enable_mutations: bool = False,
     ) -> AskResult:
         wall_start = time.perf_counter()
         if not (query or "").strip():
@@ -288,9 +322,21 @@ class QAService:
             trace.intent = intent_label
 
         tool_calls: List[ToolCallRecord] = []
-        if enable_tools and self._tools is not None and self._llm is not None:
+        # The agentic loop runs whenever EITHER tool surface is
+        # enabled. Read-only and mutating dispatchers are merged
+        # inside the loop; the LLM picks any tool from the union, and
+        # we route by name. With both flags off we keep the original
+        # single-shot path for zero overhead.
+        agentic_active = self._llm is not None and (
+            (enable_tools and self._tools is not None)
+            or (enable_mutations and self._mutation_tools is not None)
+        )
+        if agentic_active:
             answer, tool_calls = await self._generate_answer_agentic(
                 query, items, memory_ctx,
+                enable_tools=enable_tools,
+                enable_mutations=enable_mutations,
+                proposer_user_id=user_id,
             )
         else:
             answer = await self._generate_answer(query, items, memory_ctx)
@@ -578,6 +624,10 @@ class QAService:
         query: str,
         items: List[RetrievedItem],
         memory_ctx: MemoryContext,
+        *,
+        enable_tools: bool = True,
+        enable_mutations: bool = False,
+        proposer_user_id: Optional[str] = None,
     ) -> tuple[str, List[ToolCallRecord]]:
         """Run the tool-using loop and return ``(answer, tool_calls)``.
 
@@ -590,7 +640,10 @@ class QAService:
         Either fallback still records every tool call that DID fire so
         the trace stays honest.
         """
-        if self._tools is None or self._llm is None:
+        # Build the union of dispatcher schemas the LLM may pick from.
+        read_active = enable_tools and self._tools is not None
+        mut_active = enable_mutations and self._mutation_tools is not None
+        if not (read_active or mut_active) or self._llm is None:
             return await self._generate_answer(query, items, memory_ctx), []
 
         tools_fn = getattr(self._llm, "generate_with_tools", None)
@@ -601,11 +654,18 @@ class QAService:
             return await self._generate_answer(query, items, memory_ctx), []
 
         user_prompt = _render_user_prompt(query, items, memory_ctx.rendered_block)
+        system_prompt = _SYSTEM_PROMPT + _TOOLS_PROMPT_SUFFIX
+        if mut_active:
+            system_prompt += _MUTATION_PROMPT_SUFFIX
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": _SYSTEM_PROMPT + _TOOLS_PROMPT_SUFFIX},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        tools_schema = self._tools.openai_tool_schemas()
+        tools_schema: List[Dict[str, Any]] = []
+        if read_active:
+            tools_schema += self._tools.openai_tool_schemas()
+        if mut_active:
+            tools_schema += self._mutation_tools.openai_tool_schemas()
         records: List[ToolCallRecord] = []
 
         for _ in range(self._max_tool_calls + 1):
@@ -669,8 +729,13 @@ class QAService:
                 return final.get("content") or "(no answer generated)", records
 
             for tc in tool_calls:
-                record = await self._tools.execute(
-                    tc["name"], tc["arguments"], tool_call_id=tc["id"],
+                record = await self._dispatch_tool_call(
+                    name=tc["name"],
+                    args=tc["arguments"],
+                    tool_call_id=tc["id"],
+                    proposer_user_id=proposer_user_id,
+                    read_active=read_active,
+                    mut_active=mut_active,
                 )
                 records.append(record)
                 messages.append({
@@ -685,6 +750,52 @@ class QAService:
         # check above, but stay defensive.
         logger.warning("agentic loop fell through without an answer")
         return await self._generate_answer(query, items, memory_ctx), records
+
+    async def _dispatch_tool_call(
+        self,
+        *,
+        name: str,
+        args: Dict[str, Any],
+        tool_call_id: str,
+        proposer_user_id: Optional[str],
+        read_active: bool,
+        mut_active: bool,
+    ) -> ToolCallRecord:
+        """Route one tool call to the right dispatcher.
+
+        Mutating tools always go through the mutation dispatcher (so
+        provenance is recorded on the proposal); read-only tools go
+        through the read dispatcher. A model that calls a mutating
+        tool when ``enable_mutations`` is False gets an explicit error
+        record so it can recover instead of silently producing nothing.
+        """
+        if is_mutation(name):
+            if not mut_active:
+                return ToolCallRecord(
+                    tool=name, args=args,
+                    error=(
+                        "mutating tools are not enabled for this request "
+                        "(set enable_mutations=true)"
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+            return await self._mutation_tools.execute(
+                name, args,
+                tool_call_id=tool_call_id,
+                proposer_user_id=proposer_user_id,
+            )
+        if not read_active:
+            return ToolCallRecord(
+                tool=name, args=args,
+                error=(
+                    "read-only tools are not enabled for this request "
+                    "(set enable_tools=true)"
+                ),
+                tool_call_id=tool_call_id,
+            )
+        return await self._tools.execute(
+            name, args, tool_call_id=tool_call_id,
+        )
 
     @staticmethod
     def _collect_cited_ids(
@@ -882,6 +993,7 @@ __all__ = [
     "MemoryConfig",
     "MemoryContext",
     "MemoryService",
+    "MutationToolDispatcher",
     "QAService",
     "ToolCallRecord",
     "ToolDispatcher",

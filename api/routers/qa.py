@@ -28,6 +28,13 @@ from ..dependencies import (
     get_llm,
     get_user_repo,
 )
+from ..proposed_mutation_store import (
+    add_proposal,
+    get_proposal,
+    list_proposals,
+    mark_applied,
+    mark_decided,
+)
 from ..schemas.qa import (
     AskRequest,
     AskResponse,
@@ -38,6 +45,10 @@ from ..schemas.qa import (
     FeedbackResponse,
     MemoryEpisodicHit,
     MemoryTraceModel,
+    ProposalApplyResponse,
+    ProposalDecisionRequest,
+    ProposalListResponse,
+    ProposedMutationModel,
     RetrievalTraceModel,
     SourceModel,
     ToolCallModel,
@@ -50,6 +61,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 from graphbuilder.core.retrieval import (  # noqa: E402
     RetrievalConfig,
     RetrievalOrchestrator,
+)
+from graphbuilder.core.retrieval.mutation_applier import MutationApplier  # noqa: E402
+from graphbuilder.core.retrieval.mutation_tools import (  # noqa: E402
+    MutationToolDispatcher,
 )
 from graphbuilder.core.retrieval.qa_service import QAService  # noqa: E402
 from graphbuilder.core.retrieval.tools import ToolDispatcher  # noqa: E402
@@ -139,6 +154,13 @@ def _get_qa_service(
             config=retrieval_cfg,
             tool_dispatcher=dispatcher,
         )
+        # P10 — wire the mutating dispatcher. The api/ proposed-mutation
+        # store is injected via the enqueue_fn so core/retrieval stays
+        # API-package-free. Lives behind enable_mutations=true on
+        # AskRequest, same opt-in pattern as enable_tools.
+        _qa_service_singleton.set_mutation_dispatcher(
+            MutationToolDispatcher(enqueue_fn=add_proposal),
+        )
         logger.info("QAService initialised (single-process singleton)")
     return _qa_service_singleton
 
@@ -189,6 +211,7 @@ async def ask(
             top_k=body.top_k,
             retrieval_override=retrieval_override,
             enable_tools=body.enable_tools,
+            enable_mutations=body.enable_mutations,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -247,6 +270,10 @@ async def ask_stream(
                 top_k=body.top_k,
                 retrieval_override=retrieval_override,
             ):
+                # P10 note: ask_stream doesn't run the agentic loop in
+                # v1 — streaming + tool-use is a follow-up. enable_tools
+                # / enable_mutations are silently ignored on this path
+                # for now; clients that need both should use /qa/ask.
                 # Each event is a {"event": <name>, "data": <dict>} pair.
                 # ``sse_starlette`` accepts that shape directly when we
                 # JSON-encode the data field — keeps the SSE frame's
@@ -394,6 +421,108 @@ async def post_feedback(
     if not accepted:
         raise HTTPException(status_code=404, detail="turn not found")
     return FeedbackResponse(turn_id=turn_id, accepted=True)
+
+
+# ----------------------------------------------------------------------
+# P10 — proposed-mutation queue (chatbot → curator)
+# ----------------------------------------------------------------------
+#
+# Per the §14.6 resolution: chatbot mutations queue here. A curator
+# (any authenticated caller for now — auth + roles is a follow-up) can
+# approve a proposal via /apply, which runs MutationApplier against
+# the graph repo, or reject it with a reason. The queue is process-
+# scoped (api/proposed_mutation_store.py), same pattern as the
+# verification review queue.
+
+
+@router.get("/proposals", response_model=ProposalListResponse,
+            summary="List chatbot-proposed mutations (P10)")
+async def list_chatbot_proposals(
+    status: Optional[str] = Query(
+        "pending",
+        description='Filter by status: "pending", "approved", "rejected", or "all".',
+    ),
+    limit: int = Query(50, ge=1, le=500),
+    _=Depends(require_api_key),
+) -> ProposalListResponse:
+    raw_status = None if status in (None, "", "all") else status
+    rows = list_proposals(status=raw_status, limit=limit)  # type: ignore[arg-type]
+    return ProposalListResponse(
+        total=len(rows),
+        items=[ProposedMutationModel(**r.to_dict()) for r in rows],
+    )
+
+
+@router.post("/proposals/{proposal_id}/apply",
+             response_model=ProposalApplyResponse,
+             summary="Curator approves a proposal and applies it (P10)")
+async def apply_chatbot_proposal(
+    proposal_id: str,
+    body: Optional[ProposalDecisionRequest] = None,
+    graph_repo=Depends(get_graph_repo),
+    _=Depends(require_api_key),
+) -> ProposalApplyResponse:
+    """Run the apply-handler for a pending proposal.
+
+    Marks the row ``approved`` first (so a crash mid-apply leaves the
+    decision visible), then runs :class:`MutationApplier`. On success
+    the resulting target id pins back to the row; on failure the
+    error is recorded so the curator UI can show a retry button.
+    """
+    proposal = get_proposal(proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="proposal not found")
+    if proposal.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"proposal is not pending (status={proposal.status})",
+        )
+
+    notes = body.notes if body else None
+    mark_decided(proposal_id, "approved", notes=notes)
+
+    applier = MutationApplier(graph_repo=graph_repo)
+    try:
+        target_id = await applier.apply(tool=proposal.tool, args=proposal.args)
+    except (LookupError, ValueError) as exc:
+        # Recoverable: bad args or missing target. Record the error,
+        # leave status as approved so the curator can edit + retry.
+        mark_applied(proposal_id, error=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NotImplementedError as exc:
+        mark_applied(proposal_id, error=str(exc))
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        mark_applied(proposal_id, error=str(exc))
+        logger.error("apply proposal %s failed: %s", proposal_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"apply failed: {exc}") from exc
+
+    updated = mark_applied(proposal_id, target_id=target_id)
+    return ProposalApplyResponse(
+        proposal=ProposedMutationModel(**updated.to_dict()),
+        applied_target_id=target_id,
+    )
+
+
+@router.post("/proposals/{proposal_id}/reject",
+             response_model=ProposedMutationModel,
+             summary="Curator rejects a proposal (P10)")
+async def reject_chatbot_proposal(
+    proposal_id: str,
+    body: Optional[ProposalDecisionRequest] = None,
+    _=Depends(require_api_key),
+) -> ProposedMutationModel:
+    proposal = get_proposal(proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="proposal not found")
+    if proposal.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"proposal is not pending (status={proposal.status})",
+        )
+    notes = body.notes if body else None
+    updated = mark_decided(proposal_id, "rejected", notes=notes)
+    return ProposedMutationModel(**updated.to_dict())
 
 
 # ----------------------------------------------------------------------

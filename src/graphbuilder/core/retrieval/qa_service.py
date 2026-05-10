@@ -1,14 +1,15 @@
 """QA service — ties retrieval, the LLM, and conversation persistence
 together into the single ``ask(query)`` flow used by ``/qa/ask``.
 
-v1 scope (P5 of docs/RAG_QA_PLAN.md), now extended for P6+P7:
+v1 scope (P5 of docs/RAG_QA_PLAN.md), now extended for P6+P7+P8:
 - Memory layers (working / rolling-summary / episodic recall) build
   in parallel with retrieval and feed into the LLM prompt.
 - Per-turn ``query_embedding`` is persisted on the turn so future
   turns in the same session can episodic-recall it.
 - No tool-use (P9/P10) yet — the LLM only generates an answer.
-- No faithfulness check (P8) yet — the answer is returned as-is, with
-  citation IDs extracted for future blending into source confidence.
+- Faithfulness check (P8) runs after generation; per-claim confidence
+  + an aggregate ``answer_faithfulness`` score ride along on the
+  result for the frontend's yellow-underline UI and the eval harness.
 
 Each call:
 1. Resolves or creates a session (anonymous if no user_id supplied).
@@ -18,7 +19,8 @@ Each call:
 5. Calls the LLM service for a free-form answer.
 6. Extracts ``[n]`` citation indices from the answer and uses them to
    record which entity / relationship / chunk ids the turn cited.
-7. Persists a :class:`ConversationTurn` (with the embedding) and
+7. Runs the faithfulness checker against the cited sources.
+8. Persists a :class:`ConversationTurn` (with the embedding) and
    returns the bundle.
 """
 
@@ -32,6 +34,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from .faithfulness import (
+    FaithfulnessChecker,
+    FaithfulnessConfig,
+    FaithfulnessResult,
+)
 from .intent import INTENT_PROFILES, apply_profile, classify_intent
 from .memory import MemoryConfig, MemoryContext, MemoryService
 from .models import RetrievalConfig, RetrievalTrace, RetrievedItem
@@ -143,6 +150,11 @@ class AskResult:
     memory_trace: Optional[dict] = None
     request_id: Optional[str] = None
     latency_ms: int = 0
+    # Per-claim faithfulness verdicts + the aggregate score (P8). The
+    # eval harness reads ``faithfulness.overall_score`` to populate
+    # ``answer_faithfulness``; ``None`` means the answer had no
+    # scorable cited claims (e.g. an LLM that didn't cite anything).
+    faithfulness: Optional[FaithfulnessResult] = None
 
 
 # ----------------------------------------------------------------------
@@ -161,6 +173,8 @@ class QAService:
         config: Optional[RetrievalConfig] = None,
         memory: Optional[MemoryService] = None,
         memory_config: Optional[MemoryConfig] = None,
+        faithfulness: Optional[FaithfulnessChecker] = None,
+        faithfulness_config: Optional[FaithfulnessConfig] = None,
     ):
         self._orch = orchestrator
         self._conv = conversation_repo
@@ -170,6 +184,14 @@ class QAService:
             conversation_repo=conversation_repo,
             llm_service=llm_service,
             config=memory_config or MemoryConfig(),
+        )
+        # Faithfulness checker is constructed eagerly so production
+        # traffic never pays the import on the hot path. The default
+        # config is lexical-only; flip ``enable_llm_escalation`` on
+        # the config to opt into LLM verdicts on borderline claims.
+        self._faithfulness = faithfulness or FaithfulnessChecker(
+            config=faithfulness_config or FaithfulnessConfig(),
+            llm_service=llm_service,
         )
 
     async def ask(
@@ -247,6 +269,12 @@ class QAService:
             if item.source_chunk_id and item.source_chunk_id not in cited_chunk_ids:
                 cited_chunk_ids.append(item.source_chunk_id)
 
+        # Faithfulness check (P8). Runs against the same 1-indexed
+        # source list the LLM saw so [n] markers line up. Lexical-only
+        # by default — borderline-band escalation to the LLM is opt-in
+        # via FaithfulnessConfig.enable_llm_escalation.
+        faithfulness_result = await self._check_faithfulness(answer, items)
+
         turn = await self._append_turn(
             session_id=session.id,
             query=query,
@@ -267,14 +295,22 @@ class QAService:
         await self._record_request_metric(status="ok", intent=intent_label or "any")
         await self._record_total_latency(latency_ms)
         await self._record_memory_tokens(memory_ctx)
+        if faithfulness_result and faithfulness_result.failed_claims:
+            await self._record_faithfulness_failures(faithfulness_result.failed_claims)
 
         logger.info(
             "ask done session=%s turn=%s intent=%s query=%r sources=%d cited=%d "
-            "memory(working=%d summary=%d episodic=%s) latency_ms=%d",
+            "memory(working=%d summary=%d episodic=%s) faithfulness=%s "
+            "latency_ms=%d",
             session.id, turn.id, intent_label or "override", query[:100],
             len(items), len(cited_indices),
             len(memory_ctx.working_turns), memory_ctx.summary_chars,
             (memory_ctx.episodic_hit[0].id if memory_ctx.episodic_hit else None),
+            (
+                f"{faithfulness_result.overall_score:.2f}"
+                if faithfulness_result and faithfulness_result.overall_score is not None
+                else "n/a"
+            ),
             latency_ms,
         )
 
@@ -288,6 +324,7 @@ class QAService:
             memory_trace=memory_ctx.to_trace_dict(),
             request_id=request_id,
             latency_ms=latency_ms,
+            faithfulness=faithfulness_result,
         )
 
     # ------------------------------------------------------------------
@@ -416,6 +453,31 @@ class QAService:
             return
         await get_metrics().record_qa_latency(phase="llm", seconds=seconds)
 
+    async def _record_faithfulness_failures(self, n: int) -> None:
+        try:
+            from ...infrastructure.services.metrics import get_metrics
+        except Exception:
+            return
+        await get_metrics().record_qa_faithfulness_failure(n=n)
+
+    # ------------------------------------------------------------------
+    # Faithfulness
+    # ------------------------------------------------------------------
+
+    async def _check_faithfulness(
+        self,
+        answer: str,
+        items: List[RetrievedItem],
+    ) -> Optional[FaithfulnessResult]:
+        """Run the per-claim faithfulness cascade. Failures degrade
+        gracefully — a checker exception leaves the field as ``None``
+        rather than taking the whole response down."""
+        try:
+            return await self._faithfulness.check(answer=answer, sources=items)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("faithfulness check failed: %s", exc, exc_info=True)
+            return None
+
     async def _record_memory_tokens(self, ctx: MemoryContext) -> None:
         """Surface the per-slot character counts as ``qa_context_tokens``
         histograms. We use a coarse 4-chars-per-token heuristic for the
@@ -436,6 +498,9 @@ class QAService:
 __all__ = [
     "ANONYMOUS_USER_ID",
     "AskResult",
+    "FaithfulnessChecker",
+    "FaithfulnessConfig",
+    "FaithfulnessResult",
     "MemoryConfig",
     "MemoryContext",
     "MemoryService",

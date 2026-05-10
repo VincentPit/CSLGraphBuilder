@@ -2,7 +2,8 @@
 
 The router is deliberately thin: it adapts FastAPI dependencies to the
 ``QAService`` and translates dataclasses to Pydantic responses. Streaming
-(P11), tool-use (P9/P10), and faithfulness (P8) are not wired here yet.
+(P11) and tool-use (P9/P10) are not wired here yet; faithfulness (P8)
+rides along on the ``faithfulness`` field of ``AskResponse``.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from ..schemas.qa import (
     AskRequest,
     AskResponse,
     ChannelTraceModel,
+    ClaimVerificationModel,
+    FaithfulnessModel,
     FeedbackRequest,
     FeedbackResponse,
     MemoryEpisodicHit,
@@ -312,8 +315,33 @@ def _to_ask_response(result) -> AskResponse:
         cited_source_indices=list(result.cited_source_indices),
         retrieval_trace=_to_trace_model(result.retrieval_trace),
         memory_trace=_to_memory_trace_model(result.memory_trace),
+        faithfulness=_to_faithfulness_model(getattr(result, "faithfulness", None)),
         request_id=result.request_id,
         latency_ms=result.latency_ms,
+    )
+
+
+def _to_faithfulness_model(fr) -> FaithfulnessModel | None:
+    """Adapt a ``FaithfulnessResult`` into the response schema."""
+    if fr is None:
+        return None
+    return FaithfulnessModel(
+        overall_score=fr.overall_score,
+        failed_claims=fr.failed_claims,
+        is_refusal=fr.is_refusal,
+        claims=[
+            ClaimVerificationModel(
+                claim_text=c.claim_text,
+                cited_indices=list(c.cited_indices),
+                confidence=c.confidence,
+                method=c.method,
+                reasoning=c.reasoning,
+                escalated_to_llm=c.escalated_to_llm,
+                matched_terms=list(c.matched_terms),
+                missing_terms=list(c.missing_terms),
+            )
+            for c in fr.claims
+        ],
     )
 
 

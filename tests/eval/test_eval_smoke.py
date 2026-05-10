@@ -308,11 +308,19 @@ def _load_floors() -> Dict[str, float]:
 
 async def test_hermetic_eval_clears_baseline_floors(hermetic_qa_service):
     """The smoke gate: full harness against a known-good in-memory graph
-    must clear every floor in baselines.json."""
+    must clear every floor in baselines.json.
+
+    Routing (§9.9) is bypassed here via ``retrieval_override`` — the
+    relational profile's ``final_top_k=16`` would push the smoke
+    precision below floor on a graph this small (only 4 entities), and
+    routing has its own unit tests in ``test_qa_service.py`` and
+    ``test_intent.py``. The gate's job is to catch regressions in
+    fusion / hydration / rerank pass-through / faithfulness wiring.
+    """
     svc = hermetic_qa_service
 
     async def ask_fn(query: str):
-        return await svc.ask(query=query)
+        return await svc.ask(query=query, retrieval_override=svc._cfg)
 
     records, summary = await run_eval(ask_fn=ask_fn, gold=HERMETIC_GOLD)
     floors = _load_floors()
@@ -340,6 +348,17 @@ async def test_hermetic_eval_clears_baseline_floors(hermetic_qa_service):
         f"answer_coverage={summary.answer_coverage:.3f} below floor "
         f"{floors['answer_coverage']:.3f}"
     )
+    # P8 — every smoke question cites known sources, so the harness
+    # should produce a score on every record. None means the wiring
+    # broke (faithfulness field stripped from AskResult, runner not
+    # reading it, etc.).
+    assert summary.answer_faithfulness is not None, (
+        "answer_faithfulness is None — P8 plumbing missing on the eval path"
+    )
+    assert summary.answer_faithfulness >= floors["answer_faithfulness"], (
+        f"answer_faithfulness={summary.answer_faithfulness:.3f} below floor "
+        f"{floors['answer_faithfulness']:.3f}"
+    )
     assert summary.latency_ms_p95 <= floors["latency_ms_p95_max"]
 
 
@@ -352,7 +371,7 @@ async def test_eval_records_round_trip_through_reports(hermetic_qa_service, tmp_
     svc = hermetic_qa_service
 
     async def ask_fn(query: str):
-        return await svc.ask(query=query)
+        return await svc.ask(query=query, retrieval_override=svc._cfg)
 
     records, summary = await run_eval(ask_fn=ask_fn, gold=HERMETIC_GOLD)
 
@@ -383,7 +402,7 @@ async def test_runner_captures_per_question_failures(hermetic_qa_service):
     async def ask_fn(query: str):
         if query == "anything":
             raise RuntimeError("synthetic failure")
-        return await svc.ask(query=query)
+        return await svc.ask(query=query, retrieval_override=svc._cfg)
 
     records, summary = await run_eval(
         ask_fn=ask_fn,

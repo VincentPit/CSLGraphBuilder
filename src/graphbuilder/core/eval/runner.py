@@ -40,7 +40,14 @@ class _SourceLike(Protocol):
 
 
 class AskLike(Protocol):
-    """Subset of :class:`AskResult` the runner needs."""
+    """Subset of :class:`AskResult` the runner needs.
+
+    ``faithfulness`` is duck-typed (any object with an
+    ``overall_score`` attribute) so the live HTTP runner can pass a
+    plain dict-wrapping shim and the in-process AskResult can pass its
+    ``FaithfulnessResult`` dataclass. Missing or ``None`` is fine —
+    the runner reads the score defensively.
+    """
 
     answer: str
     sources: Sequence[_SourceLike]
@@ -120,6 +127,7 @@ async def _run_one(ask_fn: AskFn, question: GoldQuestion) -> EvalRecord:
     ]
     cited = list(getattr(result, "cited_source_indices", []) or [])
     answer = getattr(result, "answer", "") or ""
+    faithfulness_score = _extract_faithfulness_score(result)
 
     return EvalRecord.from_run(
         question=question,
@@ -127,7 +135,31 @@ async def _run_one(ask_fn: AskFn, question: GoldQuestion) -> EvalRecord:
         answer=answer,
         cited_indices=cited,
         latency_ms=latency_ms,
+        answer_faithfulness=faithfulness_score,
     )
+
+
+def _extract_faithfulness_score(result: Any) -> Optional[float]:
+    """Pull the aggregate faithfulness score off whatever shape we got.
+
+    In-process: ``AskResult.faithfulness`` is a dataclass with
+    ``overall_score``. Live HTTP: the wrapper exposes a ``raw`` payload
+    dict whose ``faithfulness`` key carries the same field. Missing,
+    ``None``, or a non-numeric value all collapse to ``None`` so a
+    transport quirk never invents a metric.
+    """
+    fr = getattr(result, "faithfulness", None)
+    if fr is None:
+        return None
+    score = getattr(fr, "overall_score", None)
+    if score is None and isinstance(fr, dict):
+        score = fr.get("overall_score")
+    if score is None:
+        return None
+    try:
+        return float(score)
+    except (TypeError, ValueError):
+        return None
 
 
 def _kind_value(source: Any) -> str:

@@ -120,6 +120,36 @@ class MemoryTraceModel(BaseModel):
     summary_regenerated: bool = False
 
 
+class ClaimVerificationModel(BaseModel):
+    """One claim's faithfulness verdict (§6.2 of the plan)."""
+
+    claim_text: str
+    cited_indices: List[int] = Field(default_factory=list)
+    confidence: float
+    method: str = Field(
+        ..., description='One of "text_match", "llm", "uncited", "refusal".',
+    )
+    reasoning: str = ""
+    escalated_to_llm: bool = False
+    matched_terms: List[str] = Field(default_factory=list)
+    missing_terms: List[str] = Field(default_factory=list)
+
+
+class FaithfulnessModel(BaseModel):
+    """Aggregate faithfulness check + per-claim verdicts (§6.2)."""
+
+    overall_score: Optional[float] = Field(
+        None,
+        description=(
+            "Mean confidence over scorable cited claims. None when the "
+            "answer had no [n] citations or every claim was uncited."
+        ),
+    )
+    failed_claims: int = 0
+    is_refusal: bool = False
+    claims: List[ClaimVerificationModel] = Field(default_factory=list)
+
+
 class AskResponse(BaseModel):
     session_id: str
     turn_id: str
@@ -134,6 +164,7 @@ class AskResponse(BaseModel):
     )
     retrieval_trace: RetrievalTraceModel
     memory_trace: Optional[MemoryTraceModel] = None
+    faithfulness: Optional[FaithfulnessModel] = None
     request_id: Optional[str] = None
     latency_ms: int
 

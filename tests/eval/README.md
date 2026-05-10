@@ -72,10 +72,17 @@ the plan and should track that document.
 
 ## What's not yet here
 
-- **Faithfulness scoring** — gated on P8. The harness has a slot for
-  `answer_faithfulness` but reports `null` until the cascading
-  verifier is wired into the QA service. Plan-target ≥ 0.85 will
-  apply once that lands.
 - **Per-intent breakdowns** — the records carry intent, but the
   markdown summary aggregates them all. Easy follow-up; deferred to
   keep the diff bounded.
+
+## Faithfulness scoring (P8 — shipped)
+
+Every record now carries `answer_faithfulness` and `EvalSummary`
+exposes the macro-average. The QA service runs
+[`FaithfulnessChecker`](../../src/graphbuilder/core/retrieval/faithfulness.py)
+after answer generation: each `[n]`-bounded claim is scored by
+lexical overlap against its cited source's chunk preview, with
+optional LLM escalation in the inconclusive band (off by default to
+keep the eval cost bounded). Refusals short-circuit to 1.0. Hermetic
+floor is `0.50`; live target mirrors §9.2 at `0.85`.

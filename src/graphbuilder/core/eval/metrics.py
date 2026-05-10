@@ -51,6 +51,10 @@ class EvalRecord:
     recall_at_k: float = 0.0
     f1_at_k: float = 0.0
     context_recall: float = 0.0   # 1.0 iff at least one retrieved id is gold
+    # Faithfulness aggregate from the QA service (P8). ``None`` means
+    # the answer had no scorable cited claims (refusals + empty
+    # answers also surface as ``None`` so they don't drag the average).
+    answer_faithfulness: Optional[float] = None
 
     @classmethod
     def from_run(
@@ -62,6 +66,7 @@ class EvalRecord:
         cited_indices: Sequence[int] = (),
         latency_ms: int = 0,
         error: Optional[str] = None,
+        answer_faithfulness: Optional[float] = None,
     ) -> "EvalRecord":
         gold_set = question.all_gold_source_ids()
         retrieved_list = list(retrieved_ids)
@@ -119,6 +124,7 @@ class EvalRecord:
             recall_at_k=recall,
             f1_at_k=f1,
             context_recall=context_recall,
+            answer_faithfulness=answer_faithfulness,
         )
 
 
@@ -139,6 +145,10 @@ class EvalSummary:
     answer_coverage: Optional[float]      # None when no question has substrings
     latency_ms_p50: float
     latency_ms_p95: float
+    # P8 — averaged ``answer_faithfulness`` over records that produced
+    # a score. ``None`` until the QA service ships per-claim verdicts
+    # *and* at least one question yields a scorable answer.
+    answer_faithfulness: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -150,6 +160,10 @@ class EvalSummary:
             "context_recall": round(self.context_recall, 4),
             "answer_coverage": (
                 round(self.answer_coverage, 4) if self.answer_coverage is not None else None
+            ),
+            "answer_faithfulness": (
+                round(self.answer_faithfulness, 4)
+                if self.answer_faithfulness is not None else None
             ),
             "latency_ms_p50": round(self.latency_ms_p50, 1),
             "latency_ms_p95": round(self.latency_ms_p95, 1),
@@ -188,6 +202,7 @@ def compute_metrics(records: Sequence[EvalRecord]) -> EvalSummary:
             answer_coverage=None,
             latency_ms_p50=0.0,
             latency_ms_p95=0.0,
+            answer_faithfulness=None,
         )
 
     n = len(records)
@@ -207,6 +222,16 @@ def compute_metrics(records: Sequence[EvalRecord]) -> EvalSummary:
     else:
         coverage = None
 
+    # Faithfulness averages over the records that actually produced a
+    # score. Refusals + empty/uncited answers are ``None`` and are
+    # excluded so an honest "I cannot find this" doesn't drag the
+    # number down — context recall already penalises those.
+    faith_records = [r for r in records if r.answer_faithfulness is not None]
+    if faith_records:
+        faithfulness = sum(r.answer_faithfulness for r in faith_records) / len(faith_records)
+    else:
+        faithfulness = None
+
     latencies = [r.latency_ms for r in records if r.error is None]
     if latencies:
         p50 = _percentile(latencies, 50.0)
@@ -225,6 +250,7 @@ def compute_metrics(records: Sequence[EvalRecord]) -> EvalSummary:
         answer_coverage=coverage,
         latency_ms_p50=p50,
         latency_ms_p95=p95,
+        answer_faithfulness=faithfulness,
     )
 
 

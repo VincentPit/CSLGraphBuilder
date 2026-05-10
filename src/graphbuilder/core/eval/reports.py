@@ -33,6 +33,7 @@ _CSV_FIELDS = [
     "context_recall",
     "answer_substring_hit",
     "chunk_hit",
+    "answer_faithfulness",
     "latency_ms",
     "error",
 ]
@@ -60,6 +61,10 @@ def write_csv_report(records: Sequence[EvalRecord], path: str | Path) -> Path:
                 "context_recall": f"{r.context_recall:.4f}",
                 "answer_substring_hit": _tribool(r.answer_substring_hit),
                 "chunk_hit": _tribool(r.chunk_hit),
+                "answer_faithfulness": (
+                    f"{r.answer_faithfulness:.4f}"
+                    if r.answer_faithfulness is not None else ""
+                ),
                 "latency_ms": r.latency_ms,
                 "error": r.error or "",
             })
@@ -106,40 +111,53 @@ def write_markdown_report(
             buf, "Answer coverage", summary.answer_coverage, 0.8,
             baseline_value(baseline, "answer_coverage"),
         )
+    if summary.answer_faithfulness is not None:
+        _write_headline_row(
+            buf, "Answer faithfulness", summary.answer_faithfulness, 0.85,
+            baseline_value(baseline, "answer_faithfulness"),
+        )
     buf.write(f"| Latency p50 | {summary.latency_ms_p50:.0f} ms | — | |\n")
     buf.write(f"| Latency p95 | {summary.latency_ms_p95:.0f} ms | ≤ 6000 ms | "
               f"{'✅' if summary.latency_ms_p95 <= 6000 else '⚠️'} |\n\n")
 
     if ablations:
         buf.write("## Ablations\n\n")
-        buf.write("| Config | P@k | R@k | F1@k | Ctx recall | Cov | p95 (ms) |\n")
-        buf.write("|---|---|---|---|---|---|---|\n")
+        buf.write("| Config | P@k | R@k | F1@k | Ctx recall | Cov | Faith | p95 (ms) |\n")
+        buf.write("|---|---|---|---|---|---|---|---|\n")
         for ab in ablations:
             s = ab.summary
             cov = f"{s.answer_coverage:.3f}" if s.answer_coverage is not None else "—"
+            faith = (
+                f"{s.answer_faithfulness:.3f}"
+                if s.answer_faithfulness is not None else "—"
+            )
             buf.write(
                 f"| {ab.name} | {s.precision_at_k:.3f} | {s.recall_at_k:.3f} | "
-                f"{s.f1_at_k:.3f} | {s.context_recall:.3f} | {cov} | "
+                f"{s.f1_at_k:.3f} | {s.context_recall:.3f} | {cov} | {faith} | "
                 f"{s.latency_ms_p95:.0f} |\n"
             )
             if ab.description:
                 # Inline description as a small italic line so the table
                 # stays scannable.
-                buf.write(f"|   _{ab.description}_ | | | | | | |\n")
+                buf.write(f"|   _{ab.description}_ | | | | | | | |\n")
         buf.write("\n")
 
     buf.write("## Per-question results\n\n")
-    buf.write("| ID | Intent | P | R | F1 | Ctx | Sub | Lat (ms) | Note |\n")
-    buf.write("|---|---|---|---|---|---|---|---|---|\n")
+    buf.write("| ID | Intent | P | R | F1 | Ctx | Sub | Faith | Lat (ms) | Note |\n")
+    buf.write("|---|---|---|---|---|---|---|---|---|---|\n")
     for r in records:
         note = r.error if r.error else ""
         if note and len(note) > 60:
             note = note[:57] + "…"
+        faith = (
+            f"{r.answer_faithfulness:.2f}"
+            if r.answer_faithfulness is not None else "-"
+        )
         buf.write(
             f"| {r.question_id} | {r.intent or '-'} | "
             f"{r.precision_at_k:.2f} | {r.recall_at_k:.2f} | {r.f1_at_k:.2f} | "
             f"{r.context_recall:.0f} | {_tribool(r.answer_substring_hit)} | "
-            f"{r.latency_ms} | {note} |\n"
+            f"{faith} | {r.latency_ms} | {note} |\n"
         )
 
     out_path.write_text(buf.getvalue(), encoding="utf-8")

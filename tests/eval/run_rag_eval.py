@@ -71,12 +71,22 @@ class _LiveSource:
 
 
 @dataclass
+class _LiveFaithfulness:
+    """Mirror of api/schemas/qa.py::FaithfulnessModel for duck-typing."""
+
+    overall_score: Optional[float]
+    failed_claims: int = 0
+    is_refusal: bool = False
+
+
+@dataclass
 class _LiveAskResult:
     answer: str
     sources: list[Any]
     cited_source_indices: list[int]
     latency_ms: int
     raw: dict
+    faithfulness: Optional[_LiveFaithfulness] = None
 
 
 def _wrap_kind(kind: str) -> Any:
@@ -95,12 +105,28 @@ def _parse_response(payload: dict) -> _LiveAskResult:
             id: str
             kind: Any
         sources.append(_S(id=s["id"], kind=_wrap_kind(s["kind"])))
+
+    faith_payload = payload.get("faithfulness")
+    faithfulness: Optional[_LiveFaithfulness] = None
+    if isinstance(faith_payload, dict):
+        score = faith_payload.get("overall_score")
+        try:
+            score_f = float(score) if score is not None else None
+        except (TypeError, ValueError):
+            score_f = None
+        faithfulness = _LiveFaithfulness(
+            overall_score=score_f,
+            failed_claims=int(faith_payload.get("failed_claims") or 0),
+            is_refusal=bool(faith_payload.get("is_refusal")),
+        )
+
     return _LiveAskResult(
         answer=payload.get("answer", "") or "",
         sources=sources,
         cited_source_indices=list(payload.get("cited_source_indices", []) or []),
         latency_ms=int(payload.get("latency_ms", 0) or 0),
         raw=payload,
+        faithfulness=faithfulness,
     )
 
 
@@ -338,19 +364,28 @@ async def _amain(args: argparse.Namespace) -> int:
     print(f"Context recall:{summary.context_recall:.3f}")
     if summary.answer_coverage is not None:
         print(f"Answer cov:    {summary.answer_coverage:.3f}")
+    if summary.answer_faithfulness is not None:
+        print(f"Faithfulness:  {summary.answer_faithfulness:.3f}")
     print(f"Latency p95:   {summary.latency_ms_p95:.0f} ms")
     print(f"Errors:        {summary.n_errors} / {summary.n_questions}")
 
     if ablation_results:
         print("\nAblations:")
-        print(f"  {'config':<14} {'P':>6} {'R':>6} {'F1':>6} {'ctx':>6} {'cov':>6} {'p95':>7}")
+        print(
+            f"  {'config':<14} {'P':>6} {'R':>6} {'F1':>6} {'ctx':>6} "
+            f"{'cov':>6} {'faith':>7} {'p95':>7}"
+        )
         for ab in ablation_results:
             s = ab.summary
             cov = f"{s.answer_coverage:.3f}" if s.answer_coverage is not None else "  -  "
+            faith = (
+                f"{s.answer_faithfulness:.3f}"
+                if s.answer_faithfulness is not None else "   -   "
+            )
             print(
                 f"  {ab.name:<14} "
                 f"{s.precision_at_k:>6.3f} {s.recall_at_k:>6.3f} {s.f1_at_k:>6.3f} "
-                f"{s.context_recall:>6.3f} {cov:>6} {s.latency_ms_p95:>6.0f}ms"
+                f"{s.context_recall:>6.3f} {cov:>6} {faith:>7} {s.latency_ms_p95:>6.0f}ms"
             )
 
     if args.no_gate:
@@ -387,6 +422,9 @@ def _gate_against_targets(summary: EvalSummary, baseline_path: str) -> int:
     if summary.answer_coverage is not None:
         _check("answer_coverage", summary.answer_coverage,
                targets.get("answer_coverage", 0.0))
+    if summary.answer_faithfulness is not None:
+        _check("answer_faithfulness", summary.answer_faithfulness,
+               targets.get("answer_faithfulness", 0.0))
     p95_max = targets.get("latency_ms_p95_max")
     if p95_max is not None and summary.latency_ms_p95 > p95_max + 1e-6:
         misses.append(f"latency_ms_p95={summary.latency_ms_p95:.0f} > target {p95_max:.0f}")

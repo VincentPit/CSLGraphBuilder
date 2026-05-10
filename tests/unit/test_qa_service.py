@@ -382,3 +382,102 @@ async def test_ask_intent_override_does_not_mutate_service_base_config(items, co
     assert svc._cfg is base
     assert base.final_top_k == 8
     assert base.cypher_top_k == 10
+
+
+# ---------------------------------------------------------------- P8 faithfulness
+
+
+async def test_ask_attaches_faithfulness_result(items, conv_repo):
+    """``ask`` runs the faithfulness checker and surfaces the result.
+
+    The fake source ``e1`` has ``chunk_preview="some text mentioning Imatinib"``
+    and label "Imatinib", so a claim "Imatinib is mentioned [1]" should
+    score above the pass threshold lexically.
+    """
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("Imatinib is mentioned [1].")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    result = await svc.ask(query="anything")
+
+    assert result.faithfulness is not None
+    assert result.faithfulness.overall_score is not None
+    assert result.faithfulness.overall_score >= 0.5
+    assert result.faithfulness.failed_claims == 0
+    # One scorable claim, method=text_match.
+    scorable = [c for c in result.faithfulness.claims if c.method == "text_match"]
+    assert len(scorable) == 1
+    assert scorable[0].cited_indices == [1]
+
+
+async def test_ask_refusal_marks_faithfulness_as_refusal(items, conv_repo):
+    """The system-prompt refusal phrase short-circuits to a perfect score."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("I cannot find this in the knowledge base.")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    result = await svc.ask(query="something out of scope")
+
+    assert result.faithfulness is not None
+    assert result.faithfulness.is_refusal is True
+    assert result.faithfulness.overall_score == 1.0
+
+
+async def test_ask_uncited_answer_yields_none_faithfulness(items, conv_repo):
+    """An LLM that produces prose without any [n] markers leaves
+    ``overall_score`` as None — the eval harness treats that as
+    "no signal", not "zero faithfulness"."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("This answer has no citation markers anywhere.")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    result = await svc.ask(query="q")
+    assert result.faithfulness is not None
+    assert result.faithfulness.overall_score is None
+
+
+async def test_ask_faithfulness_failure_bumps_metric(items, conv_repo, monkeypatch):
+    """When the lexical check rates a claim < pass_threshold the
+    QA service should bump ``qa_faithfulness_failures``."""
+    from graphbuilder.infrastructure.services import metrics
+
+    bumps: list[int] = []
+
+    class _RecordingMetrics:
+        async def record_qa_request(self, *args, **kwargs): pass
+        async def record_qa_latency(self, *args, **kwargs): pass
+        async def record_qa_context_tokens(self, *args, **kwargs): pass
+        async def record_qa_faithfulness_failure(self, *, n: int = 1):
+            bumps.append(n)
+
+    monkeypatch.setattr(metrics, "get_metrics", lambda: _RecordingMetrics())
+
+    orch = FakeOrchestrator(items, _trace())
+    # Claim has no token overlap with the source's chunk_preview ("some
+    # text mentioning Imatinib") — should fall under pass_threshold.
+    llm = FakeLLM("Diagnosis tomography ultrasound mitochondrial pathway [1].")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    await svc.ask(query="q")
+    assert sum(bumps) >= 1
+
+
+async def test_ask_faithfulness_check_failure_does_not_break_response(items, conv_repo):
+    """If the checker raises, AskResult.faithfulness drops to None
+    rather than the whole call exploding."""
+    from graphbuilder.core.retrieval.faithfulness import FaithfulnessChecker
+
+    class _BoomChecker(FaithfulnessChecker):
+        async def check(self, *, answer, sources):
+            raise RuntimeError("synthetic failure")
+
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("ok [1]")
+    svc = QAService(
+        orchestrator=orch, conversation_repo=conv_repo, llm_service=llm,
+        faithfulness=_BoomChecker(),
+    )
+
+    result = await svc.ask(query="q")
+    assert result.faithfulness is None
+    assert "ok" in result.answer  # answer still came back

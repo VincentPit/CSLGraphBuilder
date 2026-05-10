@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class Channel(str, Enum):
@@ -216,6 +216,19 @@ class RetrievalConfig:
 
     # Per-channel timeout so a slow channel can't stall the whole turn.
     channel_timeout_seconds: float = 5.0
+
+    # Entity-type blocklist: every channel drops entities whose
+    # ``entity_type`` matches any string in this tuple. The defaults
+    # are the three types the channel-quality investigation
+    # (`scripts/investigate_channels.py`) showed dominate the noise on
+    # biomedical Q&A — they're metadata about *where* a fact came from
+    # (author, paper, affiliation), not the content of the fact itself.
+    # Set to `()` to retrieve them all (rare; only useful for "find
+    # papers about X" style queries which we don't currently support).
+    # Comparison is case-sensitive against the enum's string value.
+    entity_type_blocklist: Tuple[str, ...] = (
+        "Person", "Document", "Organization",
+    )
 
     # Surface hydrated chunks as their own ``RetrievedItem(kind=chunk)``
     # entries appended after the entity / relationship items. Off-by-

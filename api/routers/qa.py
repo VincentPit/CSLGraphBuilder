@@ -196,6 +196,13 @@ def _build_ablation_override(service: QAService, ablation: Any) -> Any:
             "emit_chunk_items":      ablation.emit_chunk_items,
         }.items() if v is not None
     }
+    # Blocklist needs the empty-list-is-meaningful escape hatch (`[]`
+    # = "drop nothing, include authors/papers"). Pydantic models
+    # surface unset as None vs. set-to-empty as `[]`, so the truthy
+    # filter above would silently swallow `[]`. Treat None as unset
+    # and pass a tuple through for everything else.
+    if ablation.entity_type_blocklist is not None:
+        overrides["entity_type_blocklist"] = tuple(ablation.entity_type_blocklist)
     if not overrides:
         return None
     return replace(base, **overrides)

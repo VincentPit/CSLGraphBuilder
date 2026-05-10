@@ -250,6 +250,10 @@ _ABLATIONS: dict[str, dict] = {
     },
     "no_rerank": {"enable_cross_encoder": False},
     "no_chunks":  {"emit_chunk_items": False, "chunk_neighbour_radius": 0},
+    # Disables the default Person/Document/Organization filter so we
+    # can A/B the author/paper noise vs the cleaned baseline. Empty
+    # list (not None) is the "include everything" sentinel.
+    "with_authors": {"entity_type_blocklist": []},
 }
 
 
@@ -363,6 +367,7 @@ def _describe_ablation(name: str) -> str:
         "cypher_only":  "Cypher channel only; vector + bm25 disabled",
         "no_rerank":    "all channels enabled, cross-encoder rerank off",
         "no_chunks":    "no chunk promotion or neighbour expansion (entity-level only)",
+        "with_authors": "default Person/Document/Organization blocklist disabled",
     }.get(name, "")
 
 

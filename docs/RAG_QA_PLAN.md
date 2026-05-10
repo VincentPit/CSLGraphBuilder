@@ -684,6 +684,53 @@ chunks-as-items + ablation-overrides shipped with the eval. 0 errors.
 | no_rerank | 0.103 | 0.472 | 0.148 | 0.826 | 0.783 | 2868 |
 | no_chunks | 0.141 | 0.519 | 0.188 | 0.870 | 0.870 | 3401 |
 
+### 9.6 Channel-quality investigation + fix #1 — 2026-05-10
+
+`scripts/investigate_channels.py` instruments per-channel hit IDs and
+their gold overlap to localise where noise enters the top-8. Findings
+on the same 23-question gold set (refusal questions skipped):
+
+- **Cypher dominates final top-8 attribution at 35.6 %** but its raw
+  hit-rate in gold is only 6.03 % — it's filling slots with
+  related-but-not-gold material because it re-anchors on **BM25**
+  hits ([channels.py:274](src/graphbuilder/core/retrieval/channels.py#L274)). Two channels compounding the same mistake.
+- **Person / Document / Organization entity types** (~35 % of the
+  graph; 1569 + 371 + 347 nodes) leak into BM25 hits as authors /
+  paper titles / consortium names ("Levin B", "Friedenson B",
+  "Scottish/Northern Irish BRCA1/BRCA2 Consortium").
+- **Cypher relationship labels are bare UUIDs** like
+  `5e75dd33-… --INFLUENCES--> c540d9a-…` — the cross-encoder rerank
+  has no readable text to score against, so noise it can't demote
+  ([channels.py:366](src/graphbuilder/core/retrieval/channels.py#L366)).
+- **16 / 21 questions had at least one noise item** in the final
+  top-8 from BM25/Cypher only, not in gold.
+
+**Fix #1 — entity-type blocklist** (`RetrievalConfig.entity_type_blocklist`,
+default `("Person", "Document", "Organization")`; per-request override
+on `AskRequest.ablation`). Every channel now drops blocked types
+pre-fusion; channels over-fetch 2× when a blocklist is set so RRF
+input quality stays the same.
+
+What it changed (re-run of `investigate_channels.py`):
+
+| Channel | Hits (before → after) | In-gold rate (before → after) |
+|---|---|---|
+| BM25 | 369 → 311 (−16 %) | 5.15 % → 6.11 % |
+| Cypher | 696 → 533 (−23 %) | 6.03 % → 7.88 % |
+| vector_entity | 420 → 420 | 5.24 % → 5.48 % |
+
+Author / paper / consortium noise is **gone** from the final top-8
+on every question. Noise candidates dropped 16 → 14 questions.
+
+What it didn't change: **F1 stayed at 0.193** (`with_authors` ablation,
+which disables the blocklist, scores identically). The remaining
+noise is BRCA1-related *Concepts* (legitimate Concept entities, not
+filterable by type) and Cypher's bare-UUID relationship labels —
+fixes #2 and #3 in the channel-quality plan target those. The
+visible-but-not-yet-measurable improvement is bounded by the gold
+set: when retrieval surfaces a *valid but not-pinned* BRCA1
+neighbour, gold scores it as 0.
+
 What the numbers say (and don't):
 
 1. **Cross-encoder rerank earns its keep.** Disabling it drops F1

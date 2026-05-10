@@ -41,6 +41,37 @@ logger = logging.getLogger("graphbuilder.qa.retrieval")
 
 
 # ----------------------------------------------------------------------
+# Shared filtering
+# ----------------------------------------------------------------------
+
+def _entity_type_str(entity: Any) -> Optional[str]:
+    """Pull the ``entity_type`` value off either an enum or a raw string.
+
+    Domain models hold ``entity_type`` as an :class:`EntityType` enum;
+    Neo4j round-trips it as a string. Either form must compare cleanly
+    against the blocklist tuple.
+    """
+    et = getattr(entity, "entity_type", None)
+    if et is None:
+        return None
+    val = getattr(et, "value", None)
+    return val if isinstance(val, str) else (et if isinstance(et, str) else str(et))
+
+
+def _is_blocked(entity: Any, blocklist: Sequence[str]) -> bool:
+    """``True`` iff ``entity`` should be dropped on type grounds.
+
+    Reasoning lives in :class:`RetrievalConfig.entity_type_blocklist` —
+    Person, Document, Organization are author/paper/affiliation
+    metadata, not the biomedical content the user is asking about.
+    Empty blocklist disables filtering entirely.
+    """
+    if not blocklist:
+        return False
+    return _entity_type_str(entity) in blocklist
+
+
+# ----------------------------------------------------------------------
 # Vector channel
 # ----------------------------------------------------------------------
 
@@ -80,12 +111,23 @@ class VectorChannel:
         ent_result = ChannelResult(channel=Channel.VECTOR_ENTITY)
         t0 = time.perf_counter()
         try:
+            # Over-fetch by 2× when a blocklist is set so we still
+            # have a healthy candidate pool after filtering. Cheap on
+            # Neo4j's vector index; trims dominated by min_score, not k.
+            block = self._cfg.entity_type_blocklist
+            fetch_k = self._cfg.vector_top_k * (2 if block else 1)
             ent_hits = await self._repo.vector_search_entities(
                 query_embedding,
-                top_k=self._cfg.vector_top_k,
+                top_k=fetch_k,
                 min_score=self._cfg.vector_min_score,
             )
+            kept = 0
             for entity, score in ent_hits:
+                if _is_blocked(entity, block):
+                    continue
+                if kept >= self._cfg.vector_top_k:
+                    break
+                kept += 1
                 ent_result.hits.append(
                     RawHit(
                         kind=ItemKind.ENTITY,
@@ -189,14 +231,18 @@ class Bm25Channel:
             # The repo returns a dict {entity_id: GraphEntity}. We don't
             # get a per-entity score from the fulltext API, but iteration
             # order roughly mirrors index relevance for short term lists.
+            block = self._cfg.entity_type_blocklist
+            fetch_n = self._cfg.bm25_limit * (2 if block else 1)
             hits = await self._repo.search_entities_by_text(
-                list(terms), limit=self._cfg.bm25_limit
+                list(terms), limit=fetch_n,
             )
             # ``hits`` may be a dict or list depending on impl — handle both.
             if isinstance(hits, dict):
                 entities = list(hits.values())
             else:
                 entities = list(hits)
+            entities = [e for e in entities if not _is_blocked(e, block)]
+            entities = entities[: self._cfg.bm25_limit]
             for rank, entity in enumerate(entities, start=1):
                 # Synthesise a 0..1 score from rank for the per-component
                 # bar in the UI; the RRF stage uses rank, not this score.
@@ -271,14 +317,22 @@ class CypherChannel:
 
         t0 = time.perf_counter()
         try:
+            block = self._cfg.entity_type_blocklist
+            fetch_k = self._cfg.cypher_top_k * (2 if block else 1)
             hits_by_term = await self._repo.search_entities_by_text(
-                list(terms), limit=self._cfg.cypher_top_k
+                list(terms), limit=fetch_k,
             )
             anchors = (
                 list(hits_by_term.values())
                 if isinstance(hits_by_term, dict)
                 else list(hits_by_term)
             )
+            # Blocked-type anchors would also drag in their entire
+            # 1-hop neighbourhood (the whole point of this channel),
+            # so filter at the anchor level — that's where the leverage
+            # is, not in the per-rel emission below.
+            anchors = [a for a in anchors if not _is_blocked(a, block)]
+            anchors = anchors[: self._cfg.cypher_top_k]
             seen_ids: set[str] = set()
             for anchor_rank, anchor in enumerate(anchors, start=1):
                 # Re-emit the anchor itself as a Cypher-channel hit so

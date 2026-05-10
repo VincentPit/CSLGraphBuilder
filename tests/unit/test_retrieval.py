@@ -128,12 +128,18 @@ class FakeDocumentRepo:
         return ordered[max(0, idx - bounded) : idx + bounded + 1]
 
 
-def _make_entity(eid: str, name: str, *, chunk_ids: Optional[List[str]] = None) -> GraphEntity:
+def _make_entity(
+    eid: str,
+    name: str,
+    *,
+    chunk_ids: Optional[List[str]] = None,
+    entity_type: EntityType = EntityType.GENE,
+) -> GraphEntity:
     # GraphEntity is a @dataclass subclass of DomainEntity; the id is
     # set in DomainEntity.__init__ via __post_init__. Assign post-construct.
     e = GraphEntity(
         name=name,
-        entity_type=EntityType.GENE,
+        entity_type=entity_type,
         description=f"description of {name}",
     )
     e.id = eid
@@ -362,6 +368,72 @@ async def test_cypher_channel_empty_terms_records_error():
     channel = CypherChannel(repo, cfg)
     [result] = await channel.run("?", None, [])
     assert result.error and "no candidate terms" in result.error
+
+
+# ---------------------------------------------------------------- type blocklist
+
+
+async def test_vector_channel_drops_blocklisted_types():
+    """Person/Document/Organization entities must not survive the
+    vector channel even when they appear in the underlying index. The
+    channel-quality investigation showed these types dominate noise on
+    biomedical Q&A — the default blocklist removes them."""
+    gene = _make_entity("g1", "BRCA1", entity_type=EntityType.GENE)
+    person = _make_entity("p1", "Levin B", entity_type=EntityType.PERSON)
+    doc = _make_entity("d1", "Some paper", entity_type=EntityType.DOCUMENT)
+    repo = FakeGraphRepo(
+        vector_entity_hits=[(gene, 0.92), (person, 0.91), (doc, 0.85)],
+    )
+    channel = VectorChannel(repo, RetrievalConfig())
+    [ent_result, _] = await channel.run("BRCA1", [0.0] * 4, ["BRCA1"])
+    surviving_ids = {h.id for h in ent_result.hits}
+    assert "g1" in surviving_ids
+    assert "p1" not in surviving_ids
+    assert "d1" not in surviving_ids
+
+
+async def test_blocklist_can_be_disabled_via_empty_tuple():
+    """Empty blocklist is the documented escape hatch — every entity
+    flows through. Useful for "find papers about X" later, and the
+    contract the API's `entity_type_blocklist: []` override depends on."""
+    gene = _make_entity("g1", "BRCA1", entity_type=EntityType.GENE)
+    person = _make_entity("p1", "Levin B", entity_type=EntityType.PERSON)
+    repo = FakeGraphRepo(vector_entity_hits=[(gene, 0.92), (person, 0.91)])
+    cfg = RetrievalConfig(entity_type_blocklist=())
+    channel = VectorChannel(repo, cfg)
+    [ent_result, _] = await channel.run("BRCA1", [0.0] * 4, ["BRCA1"])
+    surviving_ids = {h.id for h in ent_result.hits}
+    assert {"g1", "p1"} <= surviving_ids
+
+
+async def test_bm25_channel_drops_blocklisted_types():
+    gene = _make_entity("g1", "BRCA1", entity_type=EntityType.GENE)
+    person = _make_entity("p1", "BRCA1 author", entity_type=EntityType.PERSON)
+    repo = FakeGraphRepo(text_search_hits=[gene, person])
+    channel = Bm25Channel(repo, RetrievalConfig())
+    [result] = await channel.run("BRCA1", None, ["BRCA1"])
+    surviving_ids = {h.id for h in result.hits}
+    assert "g1" in surviving_ids
+    assert "p1" not in surviving_ids
+
+
+async def test_cypher_channel_drops_blocklisted_anchors():
+    """Blocked anchors shouldn't enter the loop — otherwise the entire
+    1-hop neighbourhood of a Person/Document/Org would still leak in
+    through the per-rel emission path."""
+    gene = _make_entity("g1", "BRCA1", entity_type=EntityType.GENE)
+    person = _make_entity("p1", "BRCA1 reviewer", entity_type=EntityType.PERSON)
+    person_rel = _make_rel("r_person", "p1", "g1")
+    repo = FakeGraphRepo(
+        text_search_hits=[gene, person],
+        relationships_by_entity={"p1": [person_rel], "g1": []},
+    )
+    channel = CypherChannel(repo, RetrievalConfig())
+    [result] = await channel.run("BRCA1", None, ["BRCA1"])
+    ids = {h.id for h in result.hits}
+    assert "g1" in ids
+    assert "p1" not in ids
+    assert "r_person" not in ids   # the person's edge must not leak
 
 
 # ---------------------------------------------------------------- orchestrator

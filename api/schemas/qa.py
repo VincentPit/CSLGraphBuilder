@@ -29,6 +29,16 @@ class AblationOverride(BaseModel):
     enable_cross_encoder: Optional[bool] = None
     chunk_neighbour_radius: Optional[int] = Field(None, ge=0, le=5)
     emit_chunk_items: Optional[bool] = None
+    entity_type_blocklist: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Override the server's entity-type filter — pass `[]` to "
+            "include Person/Document/Organization nodes that the default "
+            "blocklist drops, or a custom list to substitute one. "
+            "Used by the channel-quality ablation (`with_authors`) to "
+            "compare author/paper-pollution-on vs -off."
+        ),
+    )
 
 
 class AskRequest(BaseModel):

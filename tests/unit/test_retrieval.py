@@ -486,6 +486,50 @@ async def test_orchestrator_keeps_uuid_label_when_resolution_fails(monkeypatch):
     assert "e1" in rel_item.label  # original label preserved
 
 
+async def test_cypher_channel_anchors_on_vector_when_embedding_given():
+    """Fix #2: with an embedding the Cypher channel anchors on
+    vector hits, not BM25 substring matches. The previous behaviour
+    inherited BM25's noise (Concept entities containing the gene
+    symbol as a substring). Vector embeddings are semantic so the
+    anchors are more aligned with what the user asked.
+    """
+    relevant = _make_entity("relevant", "BRCA1")
+    noise = _make_entity("noise", "BRCA1-associated complex")
+    rel = _make_rel("r1", "relevant", "x")
+
+    repo = FakeGraphRepo(
+        # vector ranks the canonical BRCA1 first; the substring-y
+        # noise is absent from the vector index entirely (the realistic
+        # scenario: SapBERT doesn't conflate them).
+        vector_entity_hits=[(relevant, 0.95)],
+        # BM25 surfaces both — *would* anchor on noise too on the
+        # legacy code path.
+        text_search_hits=[relevant, noise],
+        relationships_by_entity={"relevant": [rel], "noise": []},
+    )
+    channel = CypherChannel(repo, RetrievalConfig())
+    [result] = await channel.run("BRCA1", [0.1] * 4, ["BRCA1"])
+    anchor_ids = {h.id for h in result.hits if h.kind is ItemKind.ENTITY}
+    assert "relevant" in anchor_ids
+    assert "noise" not in anchor_ids
+
+
+async def test_cypher_channel_falls_back_to_bm25_without_embedding():
+    """Cold-start case (embedding model failed to load): the channel
+    must still work, falling back to BM25 anchors. Better degraded
+    anchors than no anchors."""
+    e = _make_entity("e1", "BRCA1")
+    rel = _make_rel("r1", "e1", "x")
+    repo = FakeGraphRepo(
+        text_search_hits=[e],
+        relationships_by_entity={"e1": [rel]},
+    )
+    channel = CypherChannel(repo, RetrievalConfig())
+    [result] = await channel.run("BRCA1", None, ["BRCA1"])
+    anchor_ids = {h.id for h in result.hits if h.kind is ItemKind.ENTITY}
+    assert "e1" in anchor_ids
+
+
 async def test_cypher_channel_drops_blocklisted_anchors():
     """Blocked anchors shouldn't enter the loop — otherwise the entire
     1-hop neighbourhood of a Person/Document/Org would still leak in

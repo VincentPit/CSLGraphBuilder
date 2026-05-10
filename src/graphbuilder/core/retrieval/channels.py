@@ -311,28 +311,17 @@ class CypherChannel:
         if not self._cfg.enable_cypher_channel:
             return []
         result = ChannelResult(channel=Channel.CYPHER)
-        if not terms:
-            result.error = "no candidate terms extracted from query"
+        if not query_embedding and not terms:
+            # Need *something* to anchor on. Vector path needs an
+            # embedding; BM25 fallback needs terms. Surface the
+            # missing-input case explicitly in the trace.
+            result.error = "no query embedding and no candidate terms"
             return [result]
 
         t0 = time.perf_counter()
         try:
             block = self._cfg.entity_type_blocklist
-            fetch_k = self._cfg.cypher_top_k * (2 if block else 1)
-            hits_by_term = await self._repo.search_entities_by_text(
-                list(terms), limit=fetch_k,
-            )
-            anchors = (
-                list(hits_by_term.values())
-                if isinstance(hits_by_term, dict)
-                else list(hits_by_term)
-            )
-            # Blocked-type anchors would also drag in their entire
-            # 1-hop neighbourhood (the whole point of this channel),
-            # so filter at the anchor level — that's where the leverage
-            # is, not in the per-rel emission below.
-            anchors = [a for a in anchors if not _is_blocked(a, block)]
-            anchors = anchors[: self._cfg.cypher_top_k]
+            anchors = await self._fetch_anchors(query_embedding, terms, block)
             seen_ids: set[str] = set()
             for anchor_rank, anchor in enumerate(anchors, start=1):
                 # Re-emit the anchor itself as a Cypher-channel hit so
@@ -407,13 +396,61 @@ class CypherChannel:
         result.latency_ms = int((time.perf_counter() - t0) * 1000)
         return [result]
 
+    async def _fetch_anchors(
+        self,
+        query_embedding: Optional[List[float]],
+        terms: Sequence[str],
+        block: Sequence[str],
+    ) -> List[Any]:
+        """Pick anchor entities to expand 1-hop neighbourhoods around.
+
+        Fix #2 of the channel-quality plan (§9.6 of docs/RAG_QA_PLAN.md):
+        anchor on **vector** hits when an embedding is available. The
+        previous BM25-anchor approach used the same substring matcher
+        as the BM25 channel, so any noise BM25 surfaced (e.g. Concept
+        entities containing the gene symbol as a substring,
+        ``"BRCA1-associated genome surveillance complex"``) seeded the
+        Cypher channel's neighbourhood expansion too — two channels
+        compounding the same mistake. Vector embeddings are semantic,
+        which is more aligned with what biomedical Q&A users mean.
+
+        Falls back to BM25 (the legacy behaviour) when no embedding is
+        available — typically the cold-start case when the embedding
+        model failed to load. Better degraded-anchors than no anchors.
+        """
+        fetch_k = self._cfg.cypher_top_k * (2 if block else 1)
+
+        if query_embedding:
+            ranked = await self._repo.vector_search_entities(
+                query_embedding,
+                top_k=fetch_k,
+                min_score=self._cfg.vector_min_score,
+            )
+            anchors = [entity for entity, _score in ranked]
+        else:
+            hits_by_term = await self._repo.search_entities_by_text(
+                list(terms), limit=fetch_k,
+            )
+            anchors = (
+                list(hits_by_term.values())
+                if isinstance(hits_by_term, dict)
+                else list(hits_by_term)
+            )
+
+        # Blocked-type anchors would also drag in their entire 1-hop
+        # neighbourhood (the whole point of this channel), so filter at
+        # the anchor level — that's where the leverage is, not in the
+        # per-rel emission below.
+        anchors = [a for a in anchors if not _is_blocked(a, block)]
+        return anchors[: self._cfg.cypher_top_k]
+
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
 
 def _anchor_score(rank: int) -> float:
-    """Convert an anchor's BM25 rank to a 0..1 score for the Cypher channel."""
+    """Convert an anchor's rank to a 0..1 score for the Cypher channel."""
     return round(max(0.0, 1.0 - (rank - 1) * 0.1), 4)
 
 

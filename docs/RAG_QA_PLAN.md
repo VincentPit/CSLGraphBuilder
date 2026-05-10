@@ -771,6 +771,50 @@ latency hit; the batch repo call is one round-trip).
 
 Reports: `tests/eval/_reports/v4/{rag_eval.md,rag_eval.csv}`.
 
+### 9.8 Fix #2 — Cypher anchors on vector, not BM25
+
+The investigation showed the Cypher channel re-uses **BM25 hits** as
+its anchor entities ([`channels.py`](src/graphbuilder/core/retrieval/channels.py#L322))
+and then expands their 1-hop neighbourhoods. Any noise BM25 surfaced
+(e.g. Concept entities containing the gene symbol as a substring,
+``"BRCA1-associated genome surveillance complex"``) seeded the Cypher
+expansion too — two channels compounding the same mistake.
+
+**Fix:** when an embedding is available, Cypher anchors on
+``vector_search_entities`` (semantic), not ``search_entities_by_text``
+(substring). Falls back to BM25 when the embedding model failed to
+load — better degraded anchors than no anchors.
+
+What it changed (`scripts/investigate_channels.py`, before → after):
+
+| | After #1 | After #1 + #3 + #2 |
+|---|---|---|
+| Cypher hits | 533 | 709 (+33 %) |
+| Cypher in-gold hits | 42 | **53** (+26 %) |
+| Cypher top-8 attribution | 113 | **88** (−22 %) |
+| Questions with noise | 14 / 21 | **12 / 21** |
+
+Cypher now finds **more** gold relationships (semantic spans more
+entities than substring) but contributes **less** to the final top-8
+because the rerank — now seeing readable labels (#3) — correctly
+demotes its outputs.
+
+**Headline F1 unchanged** (0.207) because the cross-encoder was
+already masking the BM25-anchor noise. The visible lift is when
+rerank is *off*:
+
+| Config | v4 (#1+#3) | v5 (#1+#3+#2) | Δ |
+|---|---|---|---|
+| `all_channels` F1 | 0.207 | 0.207 | 0.000 |
+| `no_rerank` F1 | 0.159 | **0.190** | +0.031 (+19 %) |
+
+Fix #2 is a robustness improvement: when the cross-encoder model
+fails to load (cold start, missing dep, no internet), the system now
+degrades much more gracefully because the candidate pool is
+intrinsically cleaner. Production-warm metrics don't move.
+
+Reports: `tests/eval/_reports/v5/{rag_eval.md,rag_eval.csv}`.
+
 What the numbers say (and don't):
 
 1. **Cross-encoder rerank earns its keep.** Disabling it drops F1

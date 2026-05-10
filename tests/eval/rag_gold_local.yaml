@@ -1,0 +1,281 @@
+# Auto-bootstrapped gold set against the LOCAL Neo4j graph (P13 §9.1).
+#
+# Generated AFTER the cross-type entity dedup pass (scripts/dedup_entities.py),
+# so each gold_entity_ids list contains the canonical id post-merge. Where a
+# pivot still has multiple ids (different aliases), all are accepted.
+#
+# Mix of intents:
+#  - definitional: 'What is X?' anchored on entity vector + chunks
+#  - lookup: bare symbol; guards BM25 + cross-encoder for short queries
+#  - relational: 'What is associated with X?' with neighbour gold ids
+#  - out_of_graph: refusal questions; coverage measures 'cannot find' substring
+#
+# Not SME-curated. Replace as the curation queue produces approved reviews.
+
+- id: q001_def
+  question: What is brca1?
+  intent: definitional
+  gold_entity_ids:
+  - 62a4f721-60e9-4ac8-9767-8c2821b39d51
+  gold_chunk_ids:
+  - 1b3a96fe-b392-4987-aa0e-452aa7d4805b
+  - 97249646-4890-4de6-be04-d850ba709930
+  gold_answer_substrings:
+  - brca1
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q002_rel
+  question: What is associated with brca1?
+  intent: relational
+  gold_entity_ids:
+  - 05794e86-f936-42d1-bf75-1713e13d0df0
+  - 62a4f721-60e9-4ac8-9767-8c2821b39d51
+  - c9e90780-a7ad-4aa3-a071-2c3202af1a31
+  - 1b1de118-1672-4492-86fc-8550623c1f56
+  - 3db0d735-b0c6-4699-a183-5d8964308b72
+  gold_relationship_ids:
+  - 78d217aa-f9e3-4e63-911c-955fa1e6198d
+  - c91b8284-932c-4982-8075-f7f0c0445676
+  - 0f9aade5-3e55-468f-ab2c-a1d74c1aa3fa
+  - e11fe38c-a082-4fcc-bf52-7670889ddfb6
+  gold_answer_substrings:
+  - brca1
+  - Chromosome 17
+  notes: Relational anchored on 'brca1' with 4 neighbour(s).
+- id: q003_def
+  question: What is brca2?
+  intent: definitional
+  gold_entity_ids:
+  - a190d655-4742-41f2-bd9c-2fd52a6e3311
+  gold_chunk_ids:
+  - d2e802f3-59af-4db3-aae8-aeaa4bafe1e6
+  - 93793f1e-3632-4ef4-a3a4-fc851522bb3e
+  gold_answer_substrings:
+  - brca2
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q004_rel
+  question: What is associated with brca2?
+  intent: relational
+  gold_entity_ids:
+  - 30f3637c-caab-4eb3-a986-35e920466073
+  - 2638d3d8-45ad-426d-bf13-41de2d66409c
+  - 62a4f721-60e9-4ac8-9767-8c2821b39d51
+  - a190d655-4742-41f2-bd9c-2fd52a6e3311
+  gold_relationship_ids:
+  - be59d564-1aa4-444a-a485-50f2f319926f
+  - b1b8a85e-7fad-4414-8049-6f2d974960a9
+  - 92a57310-4ec1-4978-ad7e-5e0e3fd078dc
+  - 6426f695-1445-4699-8f0d-c45fef79026e
+  gold_answer_substrings:
+  - brca2
+  - Genetic Testing
+  notes: Relational anchored on 'brca2' with 4 neighbour(s).
+- id: q005_def
+  question: What is atrial fibrillation?
+  intent: definitional
+  gold_entity_ids:
+  - 83dedcdf-b33c-4533-9265-839dfbaf764a
+  gold_answer_substrings:
+  - atrial fibrillation
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q006_rel
+  question: What is associated with atrial fibrillation?
+  intent: relational
+  gold_entity_ids:
+  - 83dedcdf-b33c-4533-9265-839dfbaf764a
+  - fdd315ab-5cca-4c11-83df-97fff158af6f
+  - e4ad75d1-ec49-428e-8c0c-26573b0601c5
+  - 1a8b432e-dc5c-48d7-851c-9a0a4379e9eb
+  - fb985162-0940-4e0b-935b-da2c6b3e469f
+  gold_relationship_ids:
+  - 214fc4c0-ea42-46eb-8a87-528fcdfff152
+  - 9313fd42-cd01-414c-9e1f-9187d0ba94f0
+  - e70aebdb-8522-4c99-806b-1b821ffb2eb0
+  - d9904915-39fb-43e4-921a-7546defafe58
+  gold_answer_substrings:
+  - atrial fibrillation
+  - CLOPIDOGREL
+  notes: Relational anchored on 'atrial fibrillation' with 4 neighbour(s).
+- id: q007_def
+  question: What is pancreatitis?
+  intent: definitional
+  gold_entity_ids:
+  - 9236fa6a-894b-4df5-9e43-e8d49f9ab04d
+  gold_answer_substrings:
+  - pancreatitis
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q008_rel
+  question: What is associated with pancreatitis?
+  intent: relational
+  gold_entity_ids:
+  - f4f64263-d78a-43bb-a250-98b080d92baa
+  - 1ded4ec0-a072-4e7f-b600-aa26eedb03da
+  - 9236fa6a-894b-4df5-9e43-e8d49f9ab04d
+  - 9a645274-5c6b-43ba-b3d3-9591e65a3e95
+  - 097dc536-062d-49be-9c58-4cc59f535618
+  gold_relationship_ids:
+  - 75ffd1fc-5add-4161-b094-024e98f744ea
+  - 63940f49-595f-46c7-b708-c2b8ad0518ed
+  - ed5ba7cf-8e4f-43bb-9986-99298f0e2d2c
+  - 5d091bad-11d8-4448-8711-2c984a7dc515
+  gold_answer_substrings:
+  - pancreatitis
+  - SSTR3
+  notes: Relational anchored on 'pancreatitis' with 4 neighbour(s).
+- id: q009_def
+  question: What is diabetes mellitus biomarker?
+  intent: definitional
+  gold_entity_ids:
+  - 5b11707e-d1a6-45bf-985d-db876f7c46e8
+  gold_answer_substrings:
+  - diabetes mellitus biomarker
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q010_rel
+  question: What is associated with diabetes mellitus biomarker?
+  intent: relational
+  gold_entity_ids:
+  - 5b11707e-d1a6-45bf-985d-db876f7c46e8
+  - bb80ef04-06ee-4486-be37-bcf95160c5c9
+  - bda95dd4-848e-4698-8726-d19fc230123e
+  - 7dd7ab7c-f5d3-4c13-b27f-46aedcfdb24f
+  - 731e8b5c-320b-48ae-9bea-12b099b3af66
+  gold_relationship_ids:
+  - ec37e41d-59d6-4ecd-82b0-051c6be16c69
+  - 2ae1f0f9-7dbe-41fa-be66-83f415d31f13
+  - 78c578ce-8abb-4f73-bfbf-426b720ca48d
+  - 960f869d-5404-4602-9bdc-db596766471b
+  gold_answer_substrings:
+  - diabetes mellitus biomarker
+  - KSR2
+  notes: Relational anchored on 'diabetes mellitus biomarker' with 4 neighbour(s).
+- id: q011_def
+  question: What is chronic obstructive pulmonary disease?
+  intent: definitional
+  gold_entity_ids:
+  - c540d9a1-185a-4dab-835c-888f743da6a8
+  gold_answer_substrings:
+  - chronic obstructive pulmonary disease
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q012_rel
+  question: What is associated with chronic obstructive pulmonary disease?
+  intent: relational
+  gold_entity_ids:
+  - f9ec4aaa-73a9-4b02-8381-037047b82737
+  - 5a7ae073-185a-4a95-8fd3-9d9ab8e5c1ef
+  - f11d54c6-2ee7-476e-a5ed-290c3b28839e
+  - c540d9a1-185a-4dab-835c-888f743da6a8
+  - f1234b33-ded2-4706-968c-ede2d2f52650
+  gold_relationship_ids:
+  - 1508e770-4a19-4830-9064-2bb5248ac327
+  - d0563e9b-1233-44b4-9699-7b0aa2fff22a
+  - 0dd8faa2-41bd-4daf-ab0f-5de95274b0f4
+  - 4e49e19b-20aa-422e-a460-86156759490f
+  gold_answer_substrings:
+  - chronic obstructive pulmonary disease
+  - PF-00489791
+  notes: Relational anchored on 'chronic obstructive pulmonary disease' with 4 neighbour(s).
+- id: q013_def
+  question: What is ovarian cancer?
+  intent: definitional
+  gold_entity_ids:
+  - f8386608-57c5-4a8c-a774-a5a5211beada
+  gold_chunk_ids:
+  - 55f70a98-92cb-492c-af1d-c07635c01188
+  - 4479fbf0-c3be-4bb3-b94d-4ab1996ce784
+  gold_answer_substrings:
+  - ovarian cancer
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q014_rel
+  question: What is associated with ovarian cancer?
+  intent: relational
+  gold_entity_ids:
+  - 62a4f721-60e9-4ac8-9767-8c2821b39d51
+  - f8386608-57c5-4a8c-a774-a5a5211beada
+  gold_relationship_ids:
+  - e3972b5a-b327-4ed3-b025-439b5e4e1be5
+  - 402a659d-c4d3-48d9-b78c-db31c0707091
+  - 62d1c5ba-6030-4049-b693-5d58bc3acb0b
+  - f41fdb8e-9f29-4d1f-a376-c7811d92b693
+  gold_answer_substrings:
+  - ovarian cancer
+  - BRCA1
+  notes: Relational anchored on 'ovarian cancer' with 4 neighbour(s).
+- id: q015_def
+  question: What is breast cancer?
+  intent: definitional
+  gold_entity_ids:
+  - f9667a73-4a4b-46e4-8c8b-0dc06d3f8021
+  gold_chunk_ids:
+  - 621d30a4-1c00-4e36-8d4e-702d2e121564
+  - 92cb6b92-0cee-4cbb-9b22-681d4cb9e393
+  gold_answer_substrings:
+  - breast cancer
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q016_rel
+  question: What is associated with breast cancer?
+  intent: relational
+  gold_entity_ids:
+  - 62a4f721-60e9-4ac8-9767-8c2821b39d51
+  - f9667a73-4a4b-46e4-8c8b-0dc06d3f8021
+  - a190d655-4742-41f2-bd9c-2fd52a6e3311
+  - c1842f90-27db-49f0-8bfc-62bc27906e22
+  gold_relationship_ids:
+  - 79abd7c7-acce-4543-87af-d31def7a296b
+  - 1e9897d1-8567-4f0c-b6f0-367d6036fbc5
+  - 6bbfb3e1-c9c1-4fc3-8f63-6ead804dbb30
+  - d2d231f2-18ae-4054-9058-a83f2cb683f3
+  gold_answer_substrings:
+  - breast cancer
+  - BRCA2
+  notes: Relational anchored on 'breast cancer' with 4 neighbour(s).
+- id: q017_loo
+  question: olaparib
+  intent: lookup
+  gold_entity_ids:
+  - 1b1de118-1672-4492-86fc-8550623c1f56
+  gold_answer_substrings:
+  - olaparib
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q018_loo
+  question: PARP inhibitors
+  intent: lookup
+  gold_entity_ids:
+  - deba4232-a21e-4b73-b5b0-d9d46d8abbba
+  gold_answer_substrings:
+  - PARP inhibitors
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q019_def
+  question: What is homologous recombination?
+  intent: definitional
+  gold_entity_ids:
+  - 45bf1d33-0cc5-45e2-a7eb-69d3f4922ac1
+  gold_answer_substrings:
+  - homologous recombination
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q020_loo
+  question: BRCA1
+  intent: lookup
+  gold_entity_ids:
+  - 62a4f721-60e9-4ac8-9767-8c2821b39d51
+  gold_answer_substrings:
+  - BRCA1
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q021_loo
+  question: BRCA2
+  intent: lookup
+  gold_entity_ids:
+  - a190d655-4742-41f2-bd9c-2fd52a6e3311
+  gold_answer_substrings:
+  - BRCA2
+  notes: Bootstrapped post-dedup (1 synonym id(s)).
+- id: q900_refusal
+  question: What is the capital of France?
+  intent: out_of_graph
+  gold_answer_substrings:
+  - cannot find
+  notes: Out-of-graph; expected refusal.
+- id: q901_refusal
+  question: Who won the 2024 Olympic 100m sprint?
+  intent: out_of_graph
+  gold_answer_substrings:
+  - cannot find
+  notes: Out-of-graph; expected refusal.

@@ -413,19 +413,36 @@ Exposed to the LLM via OpenAI-style function calling. Each tool has a JSON schem
 
 Hard delete is intentionally absent — `REJECT` + audit retention beats irreversible removal. If a power user needs hard delete we add it later behind a separate role check.
 
-### 7.3 Confirmation policy (the "two-key" rule)
+### 7.3 Confirmation policy — queue into `/curation`
 
-Every **mutating** tool call requires explicit user confirmation before execution. The LLM proposes; the user clicks confirm. This is the single most important safety rule and is enforced server-side, not just in the UI:
+Per the §14.6 resolution (2026-05-10), every **mutating** tool call lands in the existing curation review queue rather than going straight to the database. The chatbot is a *proposal generator*; only a human curator can promote a proposal to a real mutation.
 
 ```
-LLM emits tool_call → server validates schema
-                    → server stores PendingMutation { id, tool, args, ttl=15min }
-                    → frontend renders "Apply this change?" card with diff preview
-                    → on user confirm: POST /qa/mutations/{id}/apply  → executes
-                    → on reject:        POST /qa/mutations/{id}/reject → records reason
+LLM emits mutating tool_call
+  → server validates Pydantic schema
+  → CurationUseCase.create_review(
+        proposer="chatbot",
+        proposer_user_id=<X-User-Id>,
+        target_kind="entity"|"relationship",
+        target_id=<existing id or "new">,
+        proposed_change={tool, args, diff},
+        request_id=<correlation id>,
+    )
+  → returns review_id
+  → chat bubble renders "Proposed for curator review (#<review_id>)"
+  → curator opens /curation, sees the row with a "from chatbot" badge,
+    Accept → runs the same save_*/merge_*/etc. paths human proposals do
+    Reject → records reason, no mutation
 ```
 
-The LLM *cannot* call mutating tools auto-approved, even in agentic loops. Read-only tools (`search_graph`, `get_entity`, `verify_claim`) bypass confirmation.
+Read-only tools (`search_graph`, `get_entity`, `verify_claim`) bypass the queue and execute inline — they never write to the graph.
+
+Two things this loses vs. the original "two-key" sketch:
+
+- **Real-time mutation preview in chat.** The subgraph preview from §7.4 is rendered post-acceptance by the existing `/curation` UI, not inline in the chat bubble. The chat bubble shows the proposed diff only.
+- **In-chat undo.** Undo is the curator's `Reject` button or a follow-up review; chat doesn't expose a `/qa/mutations/{id}/undo` endpoint in v1.
+
+Both are recoverable once real auth + roles land — the tool surface itself doesn't have to change, only the executor's destination.
 
 ### 7.4 Result rendering — focused subgraph preview
 
@@ -1126,8 +1143,8 @@ Implementations: `Neo4jConversationRepository` (prod) + `InMemoryConversationRep
 | **+ Cross-type entity dedup** | One-shot CLI (`scripts/dedup_entities.py`) that collapses same-name entities across types via direction-preserving MERGE. Local graph went 7504 → 6610 entities, 4222 rels preserved exactly. | ✅ shipped | `520d3d6` |
 | **P8** | Faithfulness check — per-claim lexical scoring (optional LLM escalation) on cited sources; `answer_faithfulness` now reported by `QAService` + `EvalSummary` + the hermetic CI gate; refusals short-circuit to 1.0 | ✅ shipped | — |
 | **P11** | SSE streaming endpoint — `POST /qa/ask/stream` emits `phase` → `retrieval` → `delta` → `done` events; LLM uses `stream=True` when available; same retrieval/memory/faithfulness wiring as `/qa/ask`; graceful fallback to a single delta when the provider lacks streaming | ✅ shipped | — |
-| **P9** | Tool-use surface (read-only) — `search_graph`, `get_entity`, `verify_claim` exposed to LLM | pending; gated on §14.6 | — |
-| **P10** | Tool-use surface (mutating) — propose/update/merge/soft-delete with PendingMutation + confirmation flow + audit rows | pending; gated on §14.6 | — |
+| **P9** | Tool-use surface (read-only) — `search_graph`, `get_entity`, `verify_claim` exposed to LLM via OpenAI-style function calling | pending (unblocked by §14.6) | — |
+| **P10** | Tool-use surface (mutating) — `propose_*` / `update_*` / `merge_*` / `soft_delete_*` queue into `/curation` review (per §14.6 resolution); curator acceptance triggers the actual graph write | pending (architecture revised vs. §7.3 sketch) | — |
 | **P14** | Cross-session semantic memory + user persona summary | pending | — |
 | **+ MutationCard / DebugPane in `/chat`** | UI for §7 + §8 (was bundled into P12 originally; now blocked on P10) | deferred | — |
 
@@ -1164,7 +1181,16 @@ A few small details drifted from the §3–§7 sketches during build; recording 
 3. **Cross-encoder model** — fine to start with `cross-encoder/ms-marco-MiniLM-L-6-v2` (general) and swap to a biomedical cross-encoder later, or want biomedical from day one?
 4. ~~**Conversation persistence**~~ — **resolved (implicit, 2026-05-09)**. Shipped on Neo4j per the plan: `:ConversationSession` and `:ConversationTurn` nodes with a `turn_query_vector` cosine index for episodic recall. Keeps everything in one store; no Postgres/Redis dependency added. Re-evaluate when we need horizontal scaling or the audit log grows past disk budget.
 5. **Gold set sourcing** — happy to pull seed questions from the existing `curation` review queue, or have a domain SME author from scratch?
-6. **Mutation authority** — should *every* user be allowed to confirm graph mutations, or gate `propose_*` / `merge_entities` / `soft_delete_*` behind a curator role? (Affects auth on `/qa/mutations/*/apply`.)
+6. ~~**Mutation authority**~~ — **resolved 2026-05-10**. Hybrid: chatbot mutations queue into the existing `/curation` review queue, never auto-apply.
+
+   The chatbot's tool surface still exposes `propose_entity` / `propose_relationship` / `update_entity` / `merge_entities` / `soft_delete_*` as documented in §7.2, but a mutating call no longer follows the in-memory `PendingMutation` → `POST /qa/mutations/{id}/apply` flow sketched in §7.3. Instead the executor records a `CurationReview` row through the same `CurationUseCase` ([curation.py:36](src/graphbuilder/application/use_cases/curation.py#L36)) that human-proposed edits already use, and the chat bubble surfaces a "Proposed for curator review — track at `/curation`" card with the review id. Reasons:
+
+   - Reuses existing curator UI + audit pipeline; no new role system invented.
+   - Auth is currently lightweight browser identity (any `X-User-Id` can be claimed), so a "two-key" auto-apply would be a single-key flow in practice — not safe.
+   - Soft-delete and undo from §7.4/§7.5 still apply *post-approval*: the curator's accept-action runs the same `save_entity` / `merge_entities` / etc. paths the original design called for.
+   - Read-only tools (`search_graph`, `get_entity`, `verify_claim`) bypass the queue and execute inline; they never write.
+
+   Implications for P9/P10: P9 (read-only tools) is unblocked and ships first. P10 (mutating tools) becomes a "queue-into-curation" surface rather than the §7.3 in-memory store. Revisit if/when real auth + roles land.
 7. **Hard delete** — confirm we ship soft-delete only in v1 (my recommendation), or is there a workflow that needs irreversible removal?
 8. **Audit retention** — chatbot audit rows persist forever same as human curator rows, or do we want a retention policy (e.g. 1y) for chat-originated rows?
 

@@ -820,7 +820,11 @@ Implementations: `Neo4jConversationRepository` (prod) + `InMemoryConversationRep
 | **P7** | Episodic recall via `turn_query_vector` index | ✅ shipped | `1f0e989` |
 | **P12** | Frontend `/chat` page with per-source confidence + retrieval trace + sidebar | ✅ shipped | `69524d6` |
 | **+ Identity** | Lightweight browser identity (`X-User-Id`, `/users` router, ownership rules) — out-of-plan addition resolving §14.1 | ✅ shipped | `331cdf4` |
-| **P13** | Eval harness + gold set + CI gate (`src/graphbuilder/core/eval/`, `tests/eval/`, hermetic smoke + live CLI) | ✅ shipped | `<pending-commit>` |
+| **P13** | Eval harness + gold set + CI gate (`src/graphbuilder/core/eval/`, `tests/eval/`, hermetic smoke + live CLI) | ✅ shipped | `644633c` |
+| **+ Re-parse guard** | Stage-0 `source_url` check skips already-ingested documents; `force=True` re-ingests. Stops the duplicate-entity blowups the eval surfaced (BRCA1 Concept + Brca1 Gene from re-parses). | ✅ shipped | `2de92f6` |
+| **+ Chunk promotion** | Hydrated chunks emitted as `RetrievedItem(kind=chunk)` so `gold_chunk_ids` can match and the frontend source list exposes chunk rows. | ✅ shipped | `5808540` |
+| **+ Ablation overrides** | Per-request `RetrievalConfig` override on `/qa/ask`; eval CLI `--ablations` matrix. | ✅ shipped | `5808540` |
+| **+ Cross-type entity dedup** | One-shot CLI (`scripts/dedup_entities.py`) that collapses same-name entities across types via direction-preserving MERGE. Local graph went 7504 → 6610 entities, 4222 rels preserved exactly. | ✅ shipped | `520d3d6` |
 | **P8** | Faithfulness check (`CascadingVerifier` on extracted claims) — harness slot reserved (`answer_faithfulness` returns null until wired) | pending | — |
 | **P11** | SSE streaming endpoint | pending | — |
 | **P9** | Tool-use surface (read-only) — `search_graph`, `get_entity`, `verify_claim` exposed to LLM | pending; gated on §14.6 | — |

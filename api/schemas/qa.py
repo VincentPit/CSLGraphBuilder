@@ -68,6 +68,15 @@ class AskRequest(BaseModel):
             "P13 ablation matrix runner; null in production traffic."
         ),
     )
+    enable_tools: bool = Field(
+        False,
+        description=(
+            "Opt-in to the read-only tool-use loop (P9). When true, the "
+            "LLM may call search_graph / get_entity / verify_claim before "
+            "answering; tool calls are recorded on the response's "
+            "tool_calls field. Default false keeps single-shot generation."
+        ),
+    )
 
 
 class SourceModel(BaseModel):
@@ -150,6 +159,17 @@ class FaithfulnessModel(BaseModel):
     claims: List[ClaimVerificationModel] = Field(default_factory=list)
 
 
+class ToolCallModel(BaseModel):
+    """One tool call the LLM made during the agentic loop (P9)."""
+
+    tool: str
+    args: dict = Field(default_factory=dict)
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    latency_ms: int = 0
+    tool_call_id: Optional[str] = None
+
+
 class AskResponse(BaseModel):
     session_id: str
     turn_id: str
@@ -165,6 +185,14 @@ class AskResponse(BaseModel):
     retrieval_trace: RetrievalTraceModel
     memory_trace: Optional[MemoryTraceModel] = None
     faithfulness: Optional[FaithfulnessModel] = None
+    tool_calls: List[ToolCallModel] = Field(
+        default_factory=list,
+        description=(
+            "Read-only tool calls the LLM made during this turn (P9). "
+            "Empty when enable_tools=false or the model didn't reach for "
+            "a tool."
+        ),
+    )
     request_id: Optional[str] = None
     latency_ms: int
 

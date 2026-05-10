@@ -336,3 +336,99 @@ def test_post_ask_stream_unknown_session_yields_error_event(client):
     events = _parse_sse(resp.text)
     assert events[-1]["event"] == "error"
     assert events[-1]["data"]["kind"] == "session_not_found"
+
+
+# ---------------------------------------------------------------- P9 tool-use
+
+
+class _ToolingFakeLLM:
+    """LLM that requests one tool call then produces a final answer.
+
+    Drives the agentic loop end-to-end through the router so the
+    test exercises Pydantic translation of ToolCallModel as well.
+    """
+
+    def __init__(self):
+        self._step = 0
+
+    async def generate_text(self, **kwargs):
+        return "non-streaming fallback [1]"
+
+    async def generate_with_tools(self, *, messages, tools, temperature=0.0,
+                                  max_tokens=1024):
+        self._step += 1
+        if self._step == 1:
+            return {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_a",
+                    "name": "search_graph",
+                    "arguments": {"query": "Imatinib", "top_k": 3},
+                }],
+                "finish_reason": "tool_calls",
+            }
+        return {
+            "content": "Imatinib targets BCR-ABL [1].",
+            "tool_calls": [],
+            "finish_reason": "stop",
+        }
+
+
+def test_post_ask_with_enable_tools_records_tool_calls(client):
+    """Router-level: enable_tools=true should run the agentic loop and
+    surface tool_calls on the response."""
+    from graphbuilder.core.retrieval.tools import ToolCallRecord
+
+    # The router fixture builds the singleton without a dispatcher (see
+    # the @pytest.fixture above). Inject a dispatcher fake here so the
+    # agentic loop actually runs — calling the real ToolDispatcher
+    # would hit the orchestrator + graph_repo, both of which are fakes
+    # in the fixture, and we want to assert the wiring not the contents.
+    class _RouterDispatcher:
+        def __init__(self):
+            self.dispatched: list[tuple[str, dict]] = []
+
+        def openai_tool_schemas(self):
+            return [{
+                "type": "function",
+                "function": {"name": "search_graph",
+                             "parameters": {"type": "object"}},
+            }]
+
+        async def execute(self, name, args, *, tool_call_id=None):
+            self.dispatched.append((name, args))
+            return ToolCallRecord(
+                tool=name, args=args,
+                result={"items": [{"id": "e1", "label": "Imatinib"}]},
+                latency_ms=2, tool_call_id=tool_call_id,
+            )
+
+    qa_router._qa_service_singleton._llm = _ToolingFakeLLM()
+    qa_router._qa_service_singleton._tools = _RouterDispatcher()
+    # Also point faithfulness's LLM at the tooling fake — it doesn't
+    # use streaming/tools but the FaithfulnessChecker's ``_llm`` slot
+    # holds a reference.
+    qa_router._qa_service_singleton._faithfulness._llm = _ToolingFakeLLM()
+
+    resp = client.post(
+        "/qa/ask",
+        json={"query": "tell me about Imatinib", "enable_tools": True},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["answer"] == "Imatinib targets BCR-ABL [1]."
+    assert len(body["tool_calls"]) == 1
+    tc = body["tool_calls"][0]
+    assert tc["tool"] == "search_graph"
+    assert tc["args"] == {"query": "Imatinib", "top_k": 3}
+    assert tc["error"] is None
+
+
+def test_post_ask_default_enable_tools_false_no_tool_calls(client):
+    """Default request body must NOT trigger the agentic loop — tool_calls
+    arrives empty."""
+    resp = client.post("/qa/ask", json={"query": "q"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tool_calls"] == []

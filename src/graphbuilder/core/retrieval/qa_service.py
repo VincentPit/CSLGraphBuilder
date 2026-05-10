@@ -31,6 +31,7 @@ Each call:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -47,6 +48,7 @@ from .intent import INTENT_PROFILES, apply_profile, classify_intent
 from .memory import MemoryConfig, MemoryContext, MemoryService
 from .models import RetrievalConfig, RetrievalTrace, RetrievedItem
 from .orchestrator import RetrievalOrchestrator
+from .tools import ToolCallRecord, ToolDispatcher
 
 
 logger = logging.getLogger("graphbuilder.qa.api")
@@ -71,6 +73,21 @@ Rules:
 - Be concise. Prefer 2-5 sentences for short questions, 1 short paragraph
   for "tell me about" requests.
 - When the user asks for a list, return a bulleted list. Otherwise prose.
+"""
+
+_TOOLS_PROMPT_SUFFIX = """
+
+TOOLS
+You may call the listed tools to gather more information before answering:
+- search_graph: free-text search over the knowledge graph.
+- get_entity: fetch one entity (by id) + its 1-hop neighbourhood.
+- verify_claim: score how well a context supports a claim.
+
+Never invent entity ids — first call search_graph or get_entity to confirm a
+target exists. Call tools sparingly; the SOURCES block is usually enough.
+When you have what you need, produce the final answer in the usual format
+(no further tool calls). If the tools return nothing useful, reply with the
+configured refusal phrase rather than guessing.
 """
 
 
@@ -159,6 +176,11 @@ class AskResult:
     # ``answer_faithfulness``; ``None`` means the answer had no
     # scorable cited claims (e.g. an LLM that didn't cite anything).
     faithfulness: Optional[FaithfulnessResult] = None
+    # Read-only tool calls the LLM made during this turn (P9). Empty
+    # list when tool-use is disabled or the LLM didn't reach for a
+    # tool. Each record has the tool name, args, result/error, and
+    # latency — see ToolCallRecord.
+    tool_calls: List[ToolCallRecord] = field(default_factory=list)
 
 
 # ----------------------------------------------------------------------
@@ -179,6 +201,8 @@ class QAService:
         memory_config: Optional[MemoryConfig] = None,
         faithfulness: Optional[FaithfulnessChecker] = None,
         faithfulness_config: Optional[FaithfulnessConfig] = None,
+        tool_dispatcher: Optional[ToolDispatcher] = None,
+        max_tool_calls_per_turn: int = 5,
     ):
         self._orch = orchestrator
         self._conv = conversation_repo
@@ -197,6 +221,13 @@ class QAService:
             config=faithfulness_config or FaithfulnessConfig(),
             llm_service=llm_service,
         )
+        # P9 — tool-use is opt-in per request. When the caller passes a
+        # dispatcher we can run the agentic loop; without one, ``ask``
+        # falls back to the single-call generate path. The cap mirrors
+        # §7.7's ``RAGToolConfig.max_tool_calls_per_turn`` so a
+        # runaway loop can't fan out forever.
+        self._tools = tool_dispatcher
+        self._max_tool_calls = max(0, int(max_tool_calls_per_turn))
 
     async def ask(
         self,
@@ -206,6 +237,7 @@ class QAService:
         user_id: Optional[str] = ANONYMOUS_USER_ID,
         top_k: Optional[int] = None,
         retrieval_override: Optional[RetrievalConfig] = None,
+        enable_tools: bool = False,
     ) -> AskResult:
         wall_start = time.perf_counter()
         if not (query or "").strip():
@@ -255,7 +287,14 @@ class QAService:
         if intent_label is not None:
             trace.intent = intent_label
 
-        answer = await self._generate_answer(query, items, memory_ctx)
+        tool_calls: List[ToolCallRecord] = []
+        if enable_tools and self._tools is not None and self._llm is not None:
+            answer, tool_calls = await self._generate_answer_agentic(
+                query, items, memory_ctx,
+            )
+        else:
+            answer = await self._generate_answer(query, items, memory_ctx)
+
         cited_indices = [
             i for i in _extract_cited_indices(answer)
             if 1 <= i <= len(items)
@@ -321,6 +360,7 @@ class QAService:
             request_id=request_id,
             latency_ms=latency_ms,
             faithfulness=faithfulness_result,
+            tool_calls=tool_calls,
         )
 
     # ------------------------------------------------------------------
@@ -529,6 +569,123 @@ class QAService:
             if chunk:
                 yield chunk
 
+    # ------------------------------------------------------------------
+    # P9 — agentic generation (read-only tools)
+    # ------------------------------------------------------------------
+
+    async def _generate_answer_agentic(
+        self,
+        query: str,
+        items: List[RetrievedItem],
+        memory_ctx: MemoryContext,
+    ) -> tuple[str, List[ToolCallRecord]]:
+        """Run the tool-using loop and return ``(answer, tool_calls)``.
+
+        Falls back to the single-call ``_generate_answer`` path when:
+        - the LLM service doesn't expose ``generate_with_tools`` (e.g.
+          provider stub in a test), or
+        - the model hits the per-turn tool-call cap without producing
+          an answer (we then ask for a final answer with no tools).
+
+        Either fallback still records every tool call that DID fire so
+        the trace stays honest.
+        """
+        if self._tools is None or self._llm is None:
+            return await self._generate_answer(query, items, memory_ctx), []
+
+        tools_fn = getattr(self._llm, "generate_with_tools", None)
+        if tools_fn is None:
+            # Provider can't function-call — degrade silently so the
+            # eval harness and tests with a non-streaming fake LLM
+            # don't break.
+            return await self._generate_answer(query, items, memory_ctx), []
+
+        user_prompt = _render_user_prompt(query, items, memory_ctx.rendered_block)
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _SYSTEM_PROMPT + _TOOLS_PROMPT_SUFFIX},
+            {"role": "user", "content": user_prompt},
+        ]
+        tools_schema = self._tools.openai_tool_schemas()
+        records: List[ToolCallRecord] = []
+
+        for _ in range(self._max_tool_calls + 1):
+            response = await tools_fn(
+                messages=messages,
+                tools=tools_schema,
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            tool_calls = response.get("tool_calls") or []
+            content = response.get("content")
+
+            if not tool_calls:
+                # Model stopped calling tools → this is the final answer.
+                if content:
+                    return content, records
+                # Empty answer + no tool call — log and fall back to a
+                # non-tool generate so the turn still produces text.
+                logger.warning(
+                    "agentic loop: empty content + no tool calls; falling back",
+                )
+                return await self._generate_answer(query, items, memory_ctx), records
+
+            # Append the model's tool_call turn to the conversation
+            # before executing — OpenAI's protocol requires the
+            # assistant message with tool_calls to precede the tool
+            # messages that respond to it.
+            messages.append({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["arguments"]),
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            # Hit the cap? Strip tools from the next call so the model
+            # has to produce a plain answer — preserves the existing
+            # tool-call records on the way out.
+            if len(records) + len(tool_calls) > self._max_tool_calls:
+                logger.info(
+                    "agentic loop: hit max_tool_calls_per_turn=%d, "
+                    "forcing final answer", self._max_tool_calls,
+                )
+                final = await tools_fn(
+                    messages=messages + [{
+                        "role": "user",
+                        "content": "Answer now from what you have; no more tool calls.",
+                    }],
+                    tools=[],
+                    temperature=0.1,
+                    max_tokens=1024,
+                )
+                return final.get("content") or "(no answer generated)", records
+
+            for tc in tool_calls:
+                record = await self._tools.execute(
+                    tc["name"], tc["arguments"], tool_call_id=tc["id"],
+                )
+                records.append(record)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps(record.to_dict()["result"] or {
+                        "error": record.error,
+                    }),
+                })
+
+        # Loop exit without an answer — shouldn't happen given the cap
+        # check above, but stay defensive.
+        logger.warning("agentic loop fell through without an answer")
+        return await self._generate_answer(query, items, memory_ctx), records
+
     @staticmethod
     def _collect_cited_ids(
         items: List[RetrievedItem],
@@ -726,4 +883,6 @@ __all__ = [
     "MemoryContext",
     "MemoryService",
     "QAService",
+    "ToolCallRecord",
+    "ToolDispatcher",
 ]

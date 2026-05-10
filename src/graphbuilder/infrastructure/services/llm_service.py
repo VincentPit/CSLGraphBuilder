@@ -1008,6 +1008,94 @@ RESPOND WITH VALID JSON:
             except Exception:  # metrics never break the call path
                 pass
 
+    async def generate_with_tools(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        prompt_type: PromptType = PromptType.VERIFICATION,
+    ) -> Dict[str, Any]:
+        """OpenAI-style function-calling round-trip (P9 of docs/RAG_QA_PLAN.md).
+
+        Sends a full ``messages`` list (not a single prompt) plus a
+        ``tools`` schema, and returns the model's response in a
+        provider-neutral shape::
+
+            {
+              "content": Optional[str],        # may be None when only tool_calls
+              "tool_calls": [
+                  {"id": str, "name": str, "arguments": dict}
+              ],
+              "finish_reason": str,
+            }
+
+        Designed for an *agentic loop* — the caller checks
+        ``tool_calls``; if non-empty it executes them, appends
+        ``role=tool`` messages, and calls back in. The QAService loop
+        caps at ``RAGToolConfig.max_tool_calls_per_turn`` so a runaway
+        model can't fan out forever.
+
+        Returned ``arguments`` is already JSON-parsed; if the provider
+        sends back invalid JSON we surface the raw string in
+        ``arguments={"_raw": "..."}`` so the dispatcher can decide
+        whether to retry vs. fail soft.
+        """
+        async def _do_call():
+            return await self.client.chat.completions.create(
+                model=self.config.llm.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                tool_choice="auto",
+            )
+
+        start = datetime.now(timezone.utc)
+        response = await _retryable_llm_call(_do_call, self.logger)
+        processing_time = (datetime.now(timezone.utc) - start).total_seconds()
+
+        choice = response.choices[0]
+        msg = choice.message
+        raw_tool_calls = getattr(msg, "tool_calls", None) or []
+        parsed_calls: List[Dict[str, Any]] = []
+        for tc in raw_tool_calls:
+            fn = getattr(tc, "function", None)
+            if fn is None:
+                continue
+            name = getattr(fn, "name", "")
+            raw_args = getattr(fn, "arguments", "") or "{}"
+            try:
+                args = json.loads(raw_args)
+                if not isinstance(args, dict):
+                    args = {"_raw": raw_args}
+            except (json.JSONDecodeError, ValueError):
+                args = {"_raw": raw_args}
+            parsed_calls.append({
+                "id": getattr(tc, "id", "") or "",
+                "name": name,
+                "arguments": args,
+            })
+
+        try:
+            await get_metrics().record_llm_call(
+                prompt_type=prompt_type.value,
+                prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+                completion_tokens=(
+                    response.usage.completion_tokens if response.usage else 0
+                ),
+                latency_seconds=processing_time,
+            )
+        except Exception:  # metrics never break the call path
+            pass
+
+        return {
+            "content": getattr(msg, "content", None),
+            "tool_calls": parsed_calls,
+            "finish_reason": getattr(choice, "finish_reason", None),
+        }
+
     async def _parse_json_response(self, content: str) -> Dict[str, Any]:
         """Parse and validate JSON response from LLM."""
         

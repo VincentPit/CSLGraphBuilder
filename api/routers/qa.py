@@ -40,6 +40,7 @@ from ..schemas.qa import (
     MemoryTraceModel,
     RetrievalTraceModel,
     SourceModel,
+    ToolCallModel,
 )
 
 
@@ -51,6 +52,7 @@ from graphbuilder.core.retrieval import (  # noqa: E402
     RetrievalOrchestrator,
 )
 from graphbuilder.core.retrieval.qa_service import QAService  # noqa: E402
+from graphbuilder.core.retrieval.tools import ToolDispatcher  # noqa: E402
 
 
 logger = logging.getLogger("graphbuilder.qa.api")
@@ -120,11 +122,22 @@ def _get_qa_service(
             document_repo=document_repo,
             config=retrieval_cfg,
         )
+        # P9 — wire the read-only tool dispatcher. The dispatcher
+        # reuses the same orchestrator + graph repo + LLM the QA
+        # service already has, so there's no new external dependency.
+        # Tool-use is opt-in per request via AskRequest.enable_tools,
+        # so spinning this up has zero cost when callers don't ask.
+        dispatcher = ToolDispatcher(
+            orchestrator=orchestrator,
+            graph_repo=graph_repo,
+            llm_service=llm_service,
+        )
         _qa_service_singleton = QAService(
             orchestrator=orchestrator,
             conversation_repo=conversation_repo,
             llm_service=llm_service,
             config=retrieval_cfg,
+            tool_dispatcher=dispatcher,
         )
         logger.info("QAService initialised (single-process singleton)")
     return _qa_service_singleton
@@ -175,6 +188,7 @@ async def ask(
             user_id=effective_user_id,
             top_k=body.top_k,
             retrieval_override=retrieval_override,
+            enable_tools=body.enable_tools,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -396,6 +410,10 @@ def _to_ask_response(result) -> AskResponse:
         retrieval_trace=_to_trace_model(result.retrieval_trace),
         memory_trace=_to_memory_trace_model(result.memory_trace),
         faithfulness=_to_faithfulness_model(getattr(result, "faithfulness", None)),
+        tool_calls=[
+            ToolCallModel(**tc.to_dict())
+            for tc in getattr(result, "tool_calls", []) or []
+        ],
         request_id=result.request_id,
         latency_ms=result.latency_ms,
     )

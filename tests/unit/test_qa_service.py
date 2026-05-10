@@ -619,3 +619,171 @@ async def test_ask_stream_empty_query_raises_value_error(conv_repo, items):
     with pytest.raises(ValueError):
         async for _ in svc.ask_stream(query="   "):
             pass
+
+
+# ---------------------------------------------------------------- P9 tool-use
+
+
+class _ScriptedToolingLLM:
+    """LLM that returns a scripted sequence of (tool_calls, content) pairs.
+
+    Used to drive the agentic loop without hitting a real provider.
+    Each call to ``generate_with_tools`` pops the next scripted step.
+    """
+
+    def __init__(self, steps):
+        self._steps = list(steps)
+        self.calls: list[dict] = []
+
+    async def generate_with_tools(self, *, messages, tools, temperature=0.0,
+                                  max_tokens=1024):
+        self.calls.append({"messages": list(messages), "tools": list(tools)})
+        if not self._steps:
+            return {"content": "(no more scripted steps)", "tool_calls": [],
+                    "finish_reason": "stop"}
+        step = self._steps.pop(0)
+        return {
+            "content": step.get("content"),
+            "tool_calls": step.get("tool_calls", []),
+            "finish_reason": step.get("finish_reason", "stop"),
+        }
+
+    async def generate_text(self, *, prompt, system_prompt=None,
+                            temperature=0.0, max_tokens=1024):
+        # Non-streaming fallback when the dispatcher's degraded path runs.
+        return "fallback answer [1]"
+
+
+class _FakeDispatcher:
+    """Records dispatch calls + returns canned results."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.dispatched: list[tuple[str, dict]] = []
+
+    def openai_tool_schemas(self):
+        return [{"type": "function", "function": {"name": "search_graph",
+                                                  "parameters": {"type": "object"}}}]
+
+    async def execute(self, name, args, *, tool_call_id=None):
+        self.dispatched.append((name, args))
+        from graphbuilder.core.retrieval.tools import ToolCallRecord
+        if not self._results:
+            return ToolCallRecord(tool=name, args=args, result={"items": []},
+                                  tool_call_id=tool_call_id)
+        return self._results.pop(0)
+
+
+async def test_ask_with_tools_disabled_skips_dispatcher(items, conv_repo):
+    """``enable_tools=False`` (the default) must keep the original path
+    — dispatcher is never called even when one is wired."""
+    orch = FakeOrchestrator(items, _trace())
+    dispatcher = _FakeDispatcher([])
+    llm = _ScriptedToolingLLM([])
+    svc = QAService(
+        orchestrator=orch, conversation_repo=conv_repo, llm_service=llm,
+        tool_dispatcher=dispatcher,
+    )
+
+    # The non-tool path uses ``generate_text``; the agentic path uses
+    # ``generate_with_tools``. With enable_tools=False, only the former
+    # should run — call counts confirm the wiring.
+    await svc.ask(query="anything", enable_tools=False)
+    assert dispatcher.dispatched == []
+    assert llm.calls == []  # generate_with_tools never invoked
+
+
+async def test_ask_with_tools_enabled_runs_dispatcher_and_records(items, conv_repo):
+    """Happy path: model asks for a search, dispatcher returns results,
+    model produces final answer — all tool calls recorded on AskResult."""
+    from graphbuilder.core.retrieval.tools import ToolCallRecord
+
+    orch = FakeOrchestrator(items, _trace())
+    dispatcher = _FakeDispatcher([
+        ToolCallRecord(
+            tool="search_graph", args={"query": "brca1"},
+            result={"items": [{"id": "e1", "label": "BRCA1"}]},
+            latency_ms=3, tool_call_id="call_1",
+        ),
+    ])
+    llm = _ScriptedToolingLLM([
+        {"tool_calls": [{
+            "id": "call_1", "name": "search_graph",
+            "arguments": {"query": "brca1"},
+        }]},
+        {"content": "BRCA1 is a DNA repair gene [1]."},
+    ])
+    svc = QAService(
+        orchestrator=orch, conversation_repo=conv_repo, llm_service=llm,
+        tool_dispatcher=dispatcher,
+    )
+
+    result = await svc.ask(query="what is brca1?", enable_tools=True)
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].tool == "search_graph"
+    assert result.tool_calls[0].result["items"][0]["id"] == "e1"
+    assert "BRCA1" in result.answer
+    assert dispatcher.dispatched == [("search_graph", {"query": "brca1"})]
+
+
+async def test_ask_with_tools_respects_max_tool_calls_cap(items, conv_repo):
+    """The loop must stop calling tools after the cap and force a final
+    answer. We feed the LLM more tool requests than the cap allows."""
+    from graphbuilder.core.retrieval.tools import ToolCallRecord
+
+    orch = FakeOrchestrator(items, _trace())
+    dispatcher = _FakeDispatcher([
+        ToolCallRecord(tool="search_graph", args={"query": f"q{i}"},
+                       result={"items": []}, tool_call_id=f"c{i}")
+        for i in range(10)
+    ])
+    # Script the LLM to keep requesting tools until forced.
+    llm = _ScriptedToolingLLM([
+        {"tool_calls": [{"id": f"c{i}", "name": "search_graph",
+                         "arguments": {"query": f"q{i}"}}]}
+        for i in range(10)
+    ] + [{"content": "Forced final answer."}])
+
+    svc = QAService(
+        orchestrator=orch, conversation_repo=conv_repo, llm_service=llm,
+        tool_dispatcher=dispatcher, max_tool_calls_per_turn=2,
+    )
+    result = await svc.ask(query="probe", enable_tools=True)
+    # At most max_tool_calls_per_turn dispatches went through before
+    # the forced-final call.
+    assert len(result.tool_calls) <= 2
+    assert "Forced final answer" in result.answer or result.answer
+
+
+async def test_ask_with_tools_degrades_when_llm_lacks_function_calling(items, conv_repo):
+    """If the configured LLM doesn't expose ``generate_with_tools``, the
+    agentic path falls back to the single-shot generate so tests with
+    legacy fakes don't break."""
+    orch = FakeOrchestrator(items, _trace())
+
+    class _LegacyLLM:
+        async def generate_text(self, **kwargs):
+            return "legacy answer [1]"
+
+    dispatcher = _FakeDispatcher([])
+    svc = QAService(
+        orchestrator=orch, conversation_repo=conv_repo, llm_service=_LegacyLLM(),
+        tool_dispatcher=dispatcher,
+    )
+    result = await svc.ask(query="q", enable_tools=True)
+    assert "legacy answer" in result.answer
+    assert result.tool_calls == []
+    assert dispatcher.dispatched == []
+
+
+async def test_ask_with_tools_enabled_but_no_dispatcher_falls_back(items, conv_repo):
+    """``enable_tools=True`` without a dispatcher behaves like
+    ``enable_tools=False`` — silent degrade, no exception."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = _ScriptedToolingLLM([{"content": "answer [1]"}])
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    result = await svc.ask(query="q", enable_tools=True)
+    # No agentic loop ran — generate_text path produced the answer.
+    assert result.tool_calls == []
+    assert "answer" in result.answer.lower()

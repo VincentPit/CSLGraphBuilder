@@ -150,6 +150,11 @@ class RetrievalTrace:
     final_top_k: int = 0
     hydrated_chunks: int = 0
     total_latency_ms: int = 0
+    # Intent label that drove the per-intent profile, when intent-aware
+    # routing ran. ``None`` means routing was bypassed — either no
+    # classifier ran (orchestrator called directly) or the QA service
+    # was given an explicit ``retrieval_override`` (the ablation hook).
+    intent: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -168,6 +173,7 @@ class RetrievalTrace:
             "final_top_k": self.final_top_k,
             "hydrated_chunks": self.hydrated_chunks,
             "total_latency_ms": self.total_latency_ms,
+            "intent": self.intent,
         }
 
 
@@ -185,9 +191,20 @@ class RetrievalConfig:
 
     enable_cypher_channel: bool = True
     enable_vector_channel: bool = True
+    # Sub-toggle for the relationship vector index — when False, the
+    # VectorChannel still runs entity search but skips the relationship
+    # index call entirely. The channel-quality investigation
+    # (`scripts/investigate_channels.py`) showed vec_rel claims ~28% of
+    # the top-K but only contributes 3% gold-recall, so per-intent
+    # profiles (e.g. lookup) want it off without losing entity hits.
+    enable_vector_relationship: bool = True
     enable_bm25_channel: bool = True
 
     vector_top_k: int = 20
+    # Optional override for the relationship index top-k. ``None`` falls
+    # back to ``vector_top_k`` so existing callers see no behaviour
+    # change; intent profiles set a smaller value to cap vec_rel noise.
+    vector_relationship_top_k: Optional[int] = None
     vector_min_score: float = 0.5
 
     bm25_limit: int = 20

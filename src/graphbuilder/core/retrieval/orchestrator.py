@@ -248,21 +248,27 @@ class RetrievalOrchestrator:
                 logger.warning("%s channel raised: %s", label, exc)
                 return []
 
+        # Pass ``cfg`` into each channel so the override (intent
+        # profile, P13 ablation) reaches the channel-level knobs —
+        # vector_top_k, enable_vector_relationship, bm25_limit,
+        # cypher_top_k, entity_type_blocklist. Without this the channel
+        # objects would read their construction-time ``self._cfg`` and
+        # only top-level toggles would respond to overrides.
         coros = []
         if cfg.enable_vector_channel:
             coros.append(_bounded(
                 "channel:vector_entity",
-                self._vector_channel.run(query, query_embedding, terms),
+                self._vector_channel.run(query, query_embedding, terms, cfg=cfg),
             ))
         if cfg.enable_bm25_channel:
             coros.append(_bounded(
                 "channel:bm25",
-                self._bm25_channel.run(query, query_embedding, terms),
+                self._bm25_channel.run(query, query_embedding, terms, cfg=cfg),
             ))
         if cfg.enable_cypher_channel:
             coros.append(_bounded(
                 "channel:cypher",
-                self._cypher_channel.run(query, query_embedding, terms),
+                self._cypher_channel.run(query, query_embedding, terms, cfg=cfg),
             ))
 
         if not coros:

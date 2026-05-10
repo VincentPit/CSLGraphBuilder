@@ -49,6 +49,10 @@ class FakeOrchestrator:
         self._items = items
         self._trace = trace
         self.calls: list[tuple[str, Optional[int]]] = []
+        # Spy for the per-call ``config_override`` value, in arrival
+        # order. Kept separate from ``calls`` so existing assertions
+        # against the (query, top_k) tuple shape stay valid.
+        self.config_overrides: list[Optional[Any]] = []
 
     async def retrieve(
         self,
@@ -59,6 +63,7 @@ class FakeOrchestrator:
         config_override: Optional[Any] = None,           # P13 ablation hook
     ):
         self.calls.append((query, top_k))
+        self.config_overrides.append(config_override)
         return list(self._items), self._trace
 
 
@@ -290,3 +295,90 @@ async def test_ask_propagates_request_id_onto_turn(items, conv_repo, monkeypatch
     assert result.request_id == "req_test_abc"
     turns = await conv_repo.get_turns_by_session(result.session_id)
     assert turns[0].request_id == "req_test_abc"
+
+
+# ---------------------------------------------------------------- intent routing
+
+
+async def test_ask_classifies_query_and_applies_intent_profile(items, conv_repo):
+    """A "What is associated with X?" query is relational. The
+    orchestrator must receive a ``config_override`` whose values match
+    the relational profile (final_top_k=16, cypher_top_k=20)."""
+    from graphbuilder.core.retrieval.intent import INTENT_PROFILES
+
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("ok [1]")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    await svc.ask(query="What is associated with brca1?")
+    [override] = orch.config_overrides
+    assert override is not None
+    relational = INTENT_PROFILES["relational"]
+    assert override.final_top_k == relational.final_top_k
+    assert override.cypher_top_k == relational.cypher_top_k
+
+
+async def test_ask_lookup_query_disables_vector_relationship(items, conv_repo):
+    """Bare-term lookups must produce a config_override with
+    ``enable_vector_relationship=False`` — the latency win for this
+    intent depends on it."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("ok [1]")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    await svc.ask(query="olaparib")
+    [override] = orch.config_overrides
+    assert override is not None
+    assert override.enable_vector_relationship is False
+
+
+async def test_ask_records_intent_on_trace(items, conv_repo):
+    """``RetrievalTrace.intent`` must reflect the chosen intent so the
+    eval harness and debug pane can see which profile drove the turn."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("ok [1]")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    result = await svc.ask(query="What is brca1?")
+    assert result.retrieval_trace is not None
+    assert result.retrieval_trace.intent == "definitional"
+
+
+async def test_ask_explicit_retrieval_override_bypasses_routing(items, conv_repo):
+    """The P13 ablation hook must stay honest: passing
+    ``retrieval_override`` skips classification entirely. The
+    orchestrator receives the caller's exact config and the trace's
+    intent stays None so the eval doesn't pretend a profile ran."""
+    custom = RetrievalConfig(final_top_k=4, cypher_top_k=3)
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("ok [1]")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    result = await svc.ask(
+        query="What is associated with brca1?",  # would otherwise route to relational
+        retrieval_override=custom,
+    )
+    [override] = orch.config_overrides
+    assert override is custom  # passed straight through
+    assert result.retrieval_trace.intent is None
+
+
+async def test_ask_intent_override_does_not_mutate_service_base_config(items, conv_repo):
+    """``apply_profile`` is pure; running multiple turns must not
+    accumulate profile changes onto ``self._cfg``. Otherwise the
+    second turn would see the first turn's profile baked in."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("ok [1]")
+    base = RetrievalConfig(final_top_k=8, cypher_top_k=10)
+    svc = QAService(
+        orchestrator=orch, conversation_repo=conv_repo,
+        llm_service=llm, config=base,
+    )
+
+    await svc.ask(query="What is associated with brca1?")  # relational profile
+    await svc.ask(query="olaparib")                         # lookup profile
+
+    # Service's stored base config must be unchanged.
+    assert svc._cfg is base
+    assert base.final_top_k == 8
+    assert base.cypher_top_k == 10

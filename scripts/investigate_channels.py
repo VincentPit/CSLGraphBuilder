@@ -126,6 +126,8 @@ def _ckey(kind: str, item_id: str) -> str:
 async def _diagnose_one(
     orch: RetrievalOrchestrator,
     question: GoldQuestion,
+    *,
+    use_intent_routing: bool = False,
 ) -> Dict[str, Any]:
     """Run one question, return the per-channel + final picture.
 
@@ -133,19 +135,35 @@ async def _diagnose_one(
     ids before fusion, then call ``retrieve()`` separately to get the
     final top-K after RRF + rerank. Two extra Neo4j round-trips per
     question on top of the normal pipeline; trivial for ~25 questions.
+
+    ``use_intent_routing`` mirrors the production ``QAService`` path —
+    classify the query, apply the matching profile over the
+    orchestrator's base config, and pass the merged config to both
+    ``_run_channels`` and ``retrieve``. Off by default so the same
+    script can produce a baseline report against the old behaviour.
     """
     gold_ids = question.all_gold_source_ids()
     terms = extract_terms(question.question)
 
+    intent_label: Optional[str] = None
+    cfg_override: Optional[RetrievalConfig] = None
+    if use_intent_routing:
+        from graphbuilder.core.retrieval.intent import (
+            INTENT_PROFILES, apply_profile, classify_intent,
+        )
+        intent_label = classify_intent(question.question)
+        cfg_override = apply_profile(orch._cfg, INTENT_PROFILES[intent_label])  # noqa: SLF001
+
     # Capture raw per-channel hits.
     embedding = await orch._embed_query(question.question)  # noqa: SLF001
     channel_results: List[ChannelResult] = await orch._run_channels(  # noqa: SLF001
-        question.question, embedding, terms,
+        question.question, embedding, terms, cfg=cfg_override,
     )
 
     # Run retrieve normally to get final items + trace.
     items, trace = await orch.retrieve(
         question.question, query_embedding=embedding,
+        config_override=cfg_override,
     )
 
     # Per-channel breakdown.
@@ -197,6 +215,7 @@ async def _diagnose_one(
     return {
         "question_id": question.id,
         "intent": question.intent,
+        "predicted_intent": intent_label,
         "extracted_terms": terms,
         "n_gold": len(gold_ids),
         "per_channel": per_channel,
@@ -253,7 +272,12 @@ def _write_per_question_csv(records: Sequence[Dict[str, Any]], path: Path) -> No
             w.writerow(row)
 
 
-def _write_markdown(records: Sequence[Dict[str, Any]], path: Path) -> None:
+def _write_markdown(
+    records: Sequence[Dict[str, Any]],
+    path: Path,
+    *,
+    use_intent_routing: bool = False,
+) -> None:
     """Headline narrative — answers the questions the eval surfaced."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -272,7 +296,16 @@ def _write_markdown(records: Sequence[Dict[str, Any]], path: Path) -> None:
     questions_with_noise = sum(1 for r in records if r["noise_candidates"])
 
     lines = []
-    lines.append("# Channel-quality investigation\n")
+    title_suffix = " (intent-routed)" if use_intent_routing else " (baseline)"
+    lines.append(f"# Channel-quality investigation{title_suffix}\n")
+    if use_intent_routing:
+        lines.append(
+            "Run **with** intent-aware routing: each query is classified into "
+            "lookup / definitional / relational and the matching profile is "
+            "applied over the base config (see "
+            "`src/graphbuilder/core/retrieval/intent.py`). Compare against the "
+            "baseline report committed under the same path's git history.\n"
+        )
     lines.append(
         "Diagnostic of where retrieval noise comes from — why "
         "`vector_only` narrowly beats `all_channels` on the live eval "
@@ -348,6 +381,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--out", default=str(ROOT / "tests" / "eval" / "_reports" / "channels"),
         help="Output directory",
     )
+    p.add_argument(
+        "--use-intent",
+        action="store_true",
+        help="Apply per-intent retrieval profiles (mirrors QAService.ask). "
+             "Off by default so the script can also produce a baseline.",
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     return p
 
@@ -377,11 +416,13 @@ async def _amain(args: argparse.Namespace) -> int:
                 logger.info("[%d/%d] skipping %s (no gold ids — refusal question)",
                             i, len(gold), q.id)
                 continue
-            r = await _diagnose_one(orch, q)
+            r = await _diagnose_one(orch, q, use_intent_routing=args.use_intent)
             records.append(r)
             logger.info(
-                "[%d/%d] %s  gold=%d  top8∩gold=%d  noise=%d  attribution=%s",
-                i, len(gold), q.id, r["n_gold"],
+                "[%d/%d] %s  intent=%s  gold=%d  top∩gold=%d  noise=%d  attribution=%s",
+                i, len(gold), q.id,
+                r.get("predicted_intent") or "-",
+                r["n_gold"],
                 len(r["final_in_gold"]), len(r["noise_candidates"]),
                 r["final_attribution"],
             )
@@ -392,7 +433,11 @@ async def _amain(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_per_hit_csv(records, out_dir / "per_hit.csv")
     _write_per_question_csv(records, out_dir / "per_question.csv")
-    _write_markdown(records, out_dir / "channel_investigation.md")
+    _write_markdown(
+        records,
+        out_dir / "channel_investigation.md",
+        use_intent_routing=args.use_intent,
+    )
     logger.info("wrote %s", out_dir / "per_hit.csv")
     logger.info("wrote %s", out_dir / "per_question.csv")
     logger.info("wrote %s", out_dir / "channel_investigation.md")

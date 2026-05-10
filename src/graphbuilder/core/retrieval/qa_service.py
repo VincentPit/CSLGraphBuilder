@@ -32,6 +32,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from .intent import INTENT_PROFILES, apply_profile, classify_intent
 from .memory import MemoryConfig, MemoryContext, MemoryService
 from .models import RetrievalConfig, RetrievalTrace, RetrievedItem
 from .orchestrator import RetrievalOrchestrator
@@ -195,12 +196,22 @@ class QAService:
         # don't pay the model cost twice on a single turn.
         query_embedding = await self._embed_query(query)
 
+        # Pick the per-intent retrieval config. An explicit
+        # ``retrieval_override`` wins so the eval harness's ablation
+        # hook stays honest — when a caller asks for a specific config,
+        # we don't fuzz it through the classifier. Otherwise classify
+        # the query and apply the matching profile over the base cfg.
+        if retrieval_override is not None:
+            intent_label: Optional[str] = None
+            cfg_for_turn: Optional[RetrievalConfig] = retrieval_override
+        else:
+            intent_label = classify_intent(query)
+            cfg_for_turn = apply_profile(self._cfg, INTENT_PROFILES[intent_label])
+
         # Retrieval and memory build are independent — gather them.
-        # ``retrieval_override`` is the P13 ablation hook; the orchestrator
-        # treats ``None`` as "use my construction-time config".
         items_trace_task = self._orch.retrieve(
             query, top_k=top_k, query_embedding=query_embedding,
-            config_override=retrieval_override,
+            config_override=cfg_for_turn,
         )
         memory_task = self._memory.build(
             session_id=session.id,
@@ -210,6 +221,13 @@ class QAService:
         (items, trace), memory_ctx = await asyncio.gather(
             items_trace_task, memory_task,
         )
+
+        # Stamp the chosen intent on the trace so the eval harness, the
+        # debug pane, and structured logs can all see which profile
+        # actually drove this turn. ``None`` when override bypassed
+        # routing — keeps the field honest.
+        if intent_label is not None:
+            trace.intent = intent_label
 
         answer = await self._generate_answer(query, items, memory_ctx)
         cited_indices = [
@@ -242,15 +260,19 @@ class QAService:
 
         latency_ms = int((time.perf_counter() - wall_start) * 1000)
 
-        # qa_request metric — (intent="any", status="ok") as v1 baseline.
-        await self._record_request_metric(status="ok")
+        # qa_request metric: now labeled by chosen intent (or "any" when
+        # routing was bypassed via retrieval_override). Cardinality is
+        # bounded — the classifier returns one of three values plus the
+        # "any" fallback.
+        await self._record_request_metric(status="ok", intent=intent_label or "any")
         await self._record_total_latency(latency_ms)
         await self._record_memory_tokens(memory_ctx)
 
         logger.info(
-            "ask done session=%s turn=%s query=%r sources=%d cited=%d "
+            "ask done session=%s turn=%s intent=%s query=%r sources=%d cited=%d "
             "memory(working=%d summary=%d episodic=%s) latency_ms=%d",
-            session.id, turn.id, query[:100], len(items), len(cited_indices),
+            session.id, turn.id, intent_label or "override", query[:100],
+            len(items), len(cited_indices),
             len(memory_ctx.working_turns), memory_ctx.summary_chars,
             (memory_ctx.episodic_hit[0].id if memory_ctx.episodic_hit else None),
             latency_ms,
@@ -373,12 +395,12 @@ class QAService:
     # Metrics
     # ------------------------------------------------------------------
 
-    async def _record_request_metric(self, *, status: str) -> None:
+    async def _record_request_metric(self, *, status: str, intent: str = "any") -> None:
         try:
             from ...infrastructure.services.metrics import get_metrics
         except Exception:
             return
-        await get_metrics().record_qa_request(intent="any", status=status)
+        await get_metrics().record_qa_request(intent=intent, status=status)
 
     async def _record_total_latency(self, latency_ms: int) -> None:
         try:

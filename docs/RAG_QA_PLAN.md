@@ -6,13 +6,15 @@ Last updated: 2026-05-10
 
 ## Status
 
-**Shipped (14 commits on `feature/chatbot`, 334 unit tests passing):**
-P0 plan · P1 conversation persistence · P2 observability spine · P3 retrieval orchestrator (Cypher + vector + BM25 + RRF + chunk hydration) · P4 cross-encoder rerank + chunk neighbour expansion · P5 minimal `/qa/ask` endpoint · P6 working memory + rolling summary · P7 episodic recall · P12 `/chat` frontend with per-source confidence + retrieval trace · P13 eval harness (gold loader + metrics + ablation runner + CSV/markdown reports + hermetic CI gate + live `run_rag_eval.py` CLI) · plus an unplanned **lightweight browser identity** (X-User-Id, chat-only, see §14.1) and four eval-driven follow-ups: **re-parse guard**, **chunks-as-first-class-items**, **per-request ablation overrides**, **cross-type entity dedup CLI** (see §13).
+**Shipped (14 commits on `feature/chatbot`, 349 unit tests passing):**
+P0 plan · P1 conversation persistence · P2 observability spine · P3 retrieval orchestrator (Cypher + vector + BM25 + RRF + chunk hydration) · P4 cross-encoder rerank + chunk neighbour expansion · P5 minimal `/qa/ask` endpoint · P6 working memory + rolling summary · P7 episodic recall · P12 `/chat` frontend with per-source confidence + retrieval trace · P13 eval harness (gold loader + metrics + ablation runner + CSV/markdown reports + hermetic CI gate + live `run_rag_eval.py` CLI) · **§9.9 intent-aware retrieval routing** (rule-based classifier + per-intent profiles + override-threading regression test; relational recall 24% → 36%) · plus an unplanned **lightweight browser identity** (X-User-Id, chat-only, see §14.1) and four eval-driven follow-ups: **re-parse guard**, **chunks-as-first-class-items**, **per-request ablation overrides**, **cross-type entity dedup CLI** (see §13).
 
 **Open / next:**
 P8 faithfulness check (now unblocked — eval harness has a slot waiting for it) · P11 SSE streaming · P9/P10 tool-use surface (gated on §14.6 — mutation authority) · P14 cross-session semantic memory.
 
 **First live eval results (23-question grounded gold set, 2026-05-10):** baseline P=0.141, R=0.519, F1=0.188, ctx=0.870, cov=0.870, p95=3.5 s warm. Cross-encoder rerank earns its keep (-21 % F1 without it). Vector-only narrowly beats all-channels on F1 → BM25 + Cypher are bringing in noise the rerank can't fully clean up; templates + term extraction are the next thing to look at. See §9 and `tests/eval/_reports/v2/rag_eval.md`.
+
+**Post-routing live eval (same gold set, 2026-05-10):** P=0.136, R=**0.582**, F1=**0.205**, ctx=**0.913**, cov=**0.957**, p95=**5.4 s**. Recall +6 pp absolute / +11.5 % relative — the intent-routing change in §9.9 shipped the predicted gain (relational `final_top_k=16` + Cypher boost + vec_rel cap on lookup). Reports: `tests/eval/_reports/intent_routed_v1/`.
 
 See §13 for the full phase table with commit refs.
 
@@ -835,6 +837,134 @@ What the numbers say (and don't):
 
 Reports: `tests/eval/_reports/v2/{rag_eval.md,rag_eval.csv}`
 (gitignored — regenerate via the CLI in §9.3).
+
+### 9.9 Intent-aware retrieval routing — 2026-05-10
+
+The post-fix-#2 investigation report (now archived as
+`tests/eval/_reports/channels/channel_investigation_baseline.md`)
+exposed three findings that pointed at one root cause: **the
+orchestrator runs the same channel mix for every query**, regardless
+of intent. Per the report's per-intent breakdown:
+
+* **Lookup**: vec_rel found 0/4 gold but took 28% of top-K seats.
+* **Definitional**: vec_rel found 0/9 gold here too.
+* **Relational**: gold averages 8.4 items/q but `final_top_k=8` was
+  clipping. Cypher found 5/8.4 gold/q — the strongest channel for
+  this intent — but only 3.25 landed in top-K because vec_rel crowded
+  it out.
+
+**Fix:** classify each query into `lookup` / `definitional` /
+`relational` and apply a per-intent profile over the base
+`RetrievalConfig`. Three new files:
+
+* `src/graphbuilder/core/retrieval/intent.py` — rule-based classifier
+  (verb-form regex over biomedical action verbs, decision order
+  relational > short-bare-term > definitional default), `IntentProfile`
+  dataclass, `INTENT_PROFILES` mapping, and `apply_profile()`.
+* `RetrievalConfig.enable_vector_relationship` + `vector_relationship_top_k`
+  — split sub-toggle for the rel index so profiles can disable it
+  without losing entity hits.
+* `QAService.ask` — classifies, applies profile, passes via the
+  existing `config_override` hook. Explicit `retrieval_override` still
+  wins so the eval ablation harness stays honest. The chosen intent is
+  stamped on `RetrievalTrace.intent` and the `qa_request` metric label.
+
+The classifier is rule-based on purpose: deterministic, latency-free,
+trivially debuggable. 100% match against the 21 in-domain gold-set
+labels (validated as a unit test in `tests/unit/test_intent.py`).
+
+**Subtle bug caught by re-running the investigation script:** the
+channel objects (`VectorChannel`, `Bm25Channel`, `CypherChannel`) were
+reading their construction-time `self._cfg`, so `config_override`
+reached only the orchestrator-level toggles
+(`enable_*_channel`, `final_top_k`, `rrf_*`, `enable_cross_encoder`,
+`hydrate_chunks`, `chunk_neighbour_radius`). Channel-level knobs
+(`vector_top_k`, `enable_vector_relationship`,
+`vector_relationship_top_k`, `bm25_limit`, `cypher_top_k`,
+`entity_type_blocklist`) silently ignored overrides — the first run
+showed `vector_relationship: 20` hits on lookup queries despite the
+profile setting `enable_vector_relationship=False`. Fix: thread `cfg`
+through each channel's `run()` method, falling back to `self._cfg` when
+no override is passed. Pinned by
+`test_orchestrator_threads_config_override_to_vector_channel`.
+
+#### Profile values (cited by the data)
+
+| Knob | Default | Lookup | Definitional | Relational |
+|---|---|---|---|---|
+| `final_top_k` | 8 | 8 | 8 | **16** (gold avg 8.4 was clipping) |
+| `vector_top_k` | 20 | 10 | 20 | 15 |
+| `enable_vector_relationship` | True | **False** (0/4 gold) | True | True |
+| `vector_relationship_top_k` | None→20 | n/a (off) | 10 | 10 (caps 28%-share noise) |
+| `bm25_limit` | 20 | 10 | 20 | 15 |
+| `cypher_top_k` | 10 | 5 | 8 | **20** (Cypher carries it: 5/8.4 gold) |
+
+#### Channel-investigation comparison (post-fixes-#1+#2+#3)
+
+| Metric | Baseline (no routing) | Intent-routed | Δ |
+|---|---|---|---|
+| Lookup recall | 100% (1.0/1.0) | 100% (1.0/1.0) | unchanged |
+| Definitional recall | 53% (1.00/1.89) | 53% (1.00/1.89) | unchanged |
+| **Relational recall** | **24% (2.00/8.38)** | **36% (3.00/8.38)** | **+12 pp (~+50% rel.)** |
+| vec_ent hit-rate | 5.48% | 6.47% | +1.0 pp |
+| vec_rel hit-rate | 3.10% | 4.71% | +1.6 pp |
+| bm25 hit-rate | 6.11% | 7.54% | +1.4 pp |
+| cypher hit-rate | 7.48% | 6.63% | −0.9 pp |
+
+Reports:
+`tests/eval/_reports/channels/channel_investigation.md` (post-routing,
+intent-routed) vs.
+`tests/eval/_reports/channels/channel_investigation_baseline.md`
+(snapshot of the pre-routing report under the same path).
+
+What the numbers say (and don't):
+
+1. **Relational recall lifted 50% relative.** The biggest single jump
+   on this branch — from `final_top_k=16` (so the gold avg of 8.4
+   stops being clipped) plus `cypher_top_k=20` (so more of Cypher's
+   gold lands in RRF). Per-question recall improved on 6/8 relational
+   questions (q004, q006, q008, q010, q012, q016).
+2. **Lookup unchanged at 100%** — the latency win (one fewer round-trip
+   to the rel index) is the bonus, not the recall.
+3. **Per-channel hit-rates rose for vec_ent / vec_rel / bm25** because
+   the profiles cap their pool sizes — smaller pools mean what stays
+   is denser with gold. cypher's hit-rate is slightly down because its
+   pool grew (gold density per-hit fell, but absolute gold per-q rose).
+4. **Noise count went up** — partly arithmetic for relational
+   (`final_top_k` 8→16 means more seats so more non-gold rows fit),
+   partly real for lookup (smaller candidate pool means the rerank
+   discriminates over a less informative pool, so noise can float up
+   into seats 4–8). With recall preserved at the top, this matters
+   more for the source list density than for answer correctness.
+5. **Headline RAG eval (live `/qa/ask`, same 23-q gold set):**
+
+   | Metric | v5 (no routing) | intent-routed | Δ |
+   |---|---|---|---|
+   | Precision @ k | 0.147 | 0.136 | −0.011 |
+   | **Recall @ k** | **0.522** | **0.582** | **+0.060 (+11.5%)** |
+   | F1 @ k | 0.194 | **0.205** | +0.011 (+5.7%) |
+   | Context recall | 0.826 | **0.913** | +0.087 |
+   | Answer coverage | 0.870 | **0.957** | +0.087 |
+   | Latency p95 | 6254 ms | **5415 ms** | −839 ms |
+
+   The recall lift carries through end-to-end: more gold context lands
+   in the LLM's prompt, answer-coverage rises with it. Precision dips
+   slightly (relational `final_top_k=16` adds non-gold rows). Latency
+   improves on lookup (vec_rel disabled = one fewer round-trip).
+   Reports: `tests/eval/_reports/intent_routed_v1/{rag_eval.md,rag_eval.csv}`.
+
+#### What changed structurally
+
+* Per-intent retrieval is now a first-class concept of the QA service,
+  reachable by the eval harness (`use_intent_routing` flag in
+  `scripts/investigate_channels.py`), and observable via
+  `RetrievalTrace.intent` + the `qa_request` metric label.
+* The `config_override` hook (originally for P13 ablations) now also
+  threads through to channel-level knobs, so any future per-request
+  config swap (e.g. agent / tool-use loop in P9) inherits this.
+* `IntentProfile` is deliberately narrow — only the knobs that actually
+  vary by intent. Adding a knob without a backing profile change is
+  called out in the docstring as a smell.
 
 ---
 

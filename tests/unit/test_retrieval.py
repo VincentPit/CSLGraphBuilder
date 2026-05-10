@@ -85,14 +85,23 @@ class FakeGraphRepo:
         self._vector_rel_hits = vector_rel_hits or []
         self._text_search_hits = text_search_hits or []
         self._rels_by_entity = relationships_by_entity or {}
+        # Spy state for tests that assert on call shape.
+        self.vector_entity_calls = 0
+        self.vector_rel_calls = 0
+        self.vector_entity_top_k_seen: Optional[int] = None
+        self.vector_rel_top_k_seen: Optional[int] = None
 
     async def vector_search_entities(self, embedding, top_k=10, min_score=0.5):
+        self.vector_entity_calls += 1
+        self.vector_entity_top_k_seen = top_k
         return [
             (e, s) for (e, s) in self._vector_entity_hits[:top_k]
             if s >= min_score
         ]
 
     async def vector_search_relationships(self, embedding, top_k=10, min_score=0.5):
+        self.vector_rel_calls += 1
+        self.vector_rel_top_k_seen = top_k
         return [
             (r, s) for (r, s) in self._vector_rel_hits[:top_k]
             if s >= min_score
@@ -331,6 +340,100 @@ async def test_vector_channel_disabled_short_circuits():
     cfg = RetrievalConfig(enable_vector_channel=False)
     channel = VectorChannel(repo, cfg)
     assert await channel.run("q", [0.1], []) == []
+
+
+async def test_vector_channel_relationship_subtoggle_skips_rel_index():
+    """``enable_vector_relationship=False`` returns only the entity
+    result and does not call the relationship index. Profiles that turn
+    vec_rel off (e.g. lookup intent) rely on this contract."""
+    e1 = _make_entity("e1", "Imatinib")
+    r1 = _make_rel("r1", "e1", "e2")
+    repo = FakeGraphRepo(
+        vector_entity_hits=[(e1, 0.9)],
+        vector_rel_hits=[(r1, 0.85)],
+    )
+    cfg = RetrievalConfig(enable_vector_relationship=False)
+    channel = VectorChannel(repo, cfg)
+    results = await channel.run("imatinib", [0.1] * 4, [])
+    assert [r.channel for r in results] == [Channel.VECTOR_ENTITY]
+    assert results[0].hit_count == 1
+    assert repo.vector_rel_calls == 0
+
+
+async def test_vector_channel_relationship_top_k_override():
+    """``vector_relationship_top_k`` overrides ``vector_top_k`` for the
+    relationship index call only — entity-index top_k is unchanged.
+    Blocklist disabled so the fix-#1 over-fetch doesn't muddy the assertion."""
+    e1 = _make_entity("e1", "Imatinib")
+    r1 = _make_rel("r1", "e1", "e2")
+    repo = FakeGraphRepo(
+        vector_entity_hits=[(e1, 0.9)],
+        vector_rel_hits=[(r1, 0.85)],
+    )
+    cfg = RetrievalConfig(
+        vector_top_k=20,
+        vector_relationship_top_k=5,
+        entity_type_blocklist=(),
+    )
+    channel = VectorChannel(repo, cfg)
+    await channel.run("q", [0.1] * 4, [])
+    assert repo.vector_entity_top_k_seen == 20  # unchanged
+    assert repo.vector_rel_top_k_seen == 5      # overridden
+
+
+async def test_orchestrator_threads_config_override_to_vector_channel():
+    """Regression: a ``config_override`` passed to ``retrieve()`` must
+    actually reach the channel objects' run() — otherwise channel-level
+    knobs (vector_top_k, enable_vector_relationship, bm25_limit,
+    cypher_top_k, entity_type_blocklist) silently ignore overrides and
+    only top-level toggles respond. This was caught by the channel-
+    quality investigation: with ``intent=lookup`` (which sets
+    enable_vector_relationship=False), the rel index was still being
+    queried because channels read their construction-time self._cfg."""
+    from graphbuilder.core.retrieval.orchestrator import RetrievalOrchestrator
+
+    e1 = _make_entity("e1", "BRCA1")
+    r1 = _make_rel("r1", "e1", "e2")
+    repo = FakeGraphRepo(
+        vector_entity_hits=[(e1, 0.9)],
+        vector_rel_hits=[(r1, 0.85)],
+    )
+    # Construction-time config has vec_rel ON.
+    base_cfg = RetrievalConfig(
+        enable_vector_relationship=True,
+        enable_cross_encoder=False,
+        hydrate_chunks=False,
+        emit_chunk_items=False,
+    )
+    orch = RetrievalOrchestrator(graph_repo=repo, config=base_cfg)
+
+    # Override turns vec_rel off — the channel must honour the override,
+    # not its stale construction-time copy.
+    override = RetrievalConfig(
+        enable_vector_relationship=False,
+        enable_cross_encoder=False,
+        hydrate_chunks=False,
+        emit_chunk_items=False,
+        entity_type_blocklist=(),
+    )
+    await orch.retrieve("BRCA1", config_override=override)
+    # Zero rel-index calls means the override propagated.
+    assert repo.vector_rel_calls == 0
+
+
+async def test_vector_channel_relationship_top_k_falls_back_to_default():
+    """``vector_relationship_top_k=None`` (default) keeps legacy
+    behaviour: rel index uses ``vector_top_k``."""
+    e1 = _make_entity("e1", "Imatinib")
+    r1 = _make_rel("r1", "e1", "e2")
+    repo = FakeGraphRepo(
+        vector_entity_hits=[(e1, 0.9)],
+        vector_rel_hits=[(r1, 0.85)],
+    )
+    cfg = RetrievalConfig(vector_top_k=12, entity_type_blocklist=())
+    channel = VectorChannel(repo, cfg)
+    await channel.run("q", [0.1] * 4, [])
+    assert repo.vector_rel_top_k_seen == 12
 
 
 async def test_bm25_channel_uses_terms_and_returns_synthetic_score():

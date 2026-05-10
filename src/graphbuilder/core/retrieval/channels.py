@@ -92,20 +92,33 @@ class VectorChannel:
         query: str,
         query_embedding: Optional[List[float]],
         terms: Sequence[str],
+        *,
+        cfg: Optional[RetrievalConfig] = None,
     ) -> List[ChannelResult]:
-        if not self._cfg.enable_vector_channel:
+        # Per-call ``cfg`` lets the orchestrator's ``config_override``
+        # (intent profiles, P13 ablations) reach the channel-level
+        # knobs — without this, channels would always read their
+        # construction-time ``self._cfg`` and overrides would silently
+        # apply to top-level toggles only.
+        cfg = cfg or self._cfg
+        if not cfg.enable_vector_channel:
             return []
+        run_rel = cfg.enable_vector_relationship
         if not query_embedding:
-            return [
+            results: List[ChannelResult] = [
                 ChannelResult(
                     channel=Channel.VECTOR_ENTITY,
                     error="no query embedding (embedding model unavailable)",
                 ),
-                ChannelResult(
-                    channel=Channel.VECTOR_RELATIONSHIP,
-                    error="no query embedding (embedding model unavailable)",
-                ),
             ]
+            if run_rel:
+                results.append(
+                    ChannelResult(
+                        channel=Channel.VECTOR_RELATIONSHIP,
+                        error="no query embedding (embedding model unavailable)",
+                    )
+                )
+            return results
 
         # Entities.
         ent_result = ChannelResult(channel=Channel.VECTOR_ENTITY)
@@ -114,18 +127,18 @@ class VectorChannel:
             # Over-fetch by 2× when a blocklist is set so we still
             # have a healthy candidate pool after filtering. Cheap on
             # Neo4j's vector index; trims dominated by min_score, not k.
-            block = self._cfg.entity_type_blocklist
-            fetch_k = self._cfg.vector_top_k * (2 if block else 1)
+            block = cfg.entity_type_blocklist
+            fetch_k = cfg.vector_top_k * (2 if block else 1)
             ent_hits = await self._repo.vector_search_entities(
                 query_embedding,
                 top_k=fetch_k,
-                min_score=self._cfg.vector_min_score,
+                min_score=cfg.vector_min_score,
             )
             kept = 0
             for entity, score in ent_hits:
                 if _is_blocked(entity, block):
                     continue
-                if kept >= self._cfg.vector_top_k:
+                if kept >= cfg.vector_top_k:
                     break
                 kept += 1
                 ent_result.hits.append(
@@ -154,14 +167,19 @@ class VectorChannel:
             ent_result.error = str(exc)
         ent_result.latency_ms = int((time.perf_counter() - t0) * 1000)
 
-        # Relationships.
+        # Relationships. Skipped entirely when the rel sub-toggle is
+        # off — caller gets only the entity result, no error stub.
+        if not run_rel:
+            return [ent_result]
+
         rel_result = ChannelResult(channel=Channel.VECTOR_RELATIONSHIP)
+        rel_top_k = cfg.vector_relationship_top_k or cfg.vector_top_k
         t0 = time.perf_counter()
         try:
             rel_hits = await self._repo.vector_search_relationships(
                 query_embedding,
-                top_k=self._cfg.vector_top_k,
-                min_score=self._cfg.vector_min_score,
+                top_k=rel_top_k,
+                min_score=cfg.vector_min_score,
             )
             for rel, score in rel_hits:
                 rel_result.hits.append(
@@ -218,8 +236,11 @@ class Bm25Channel:
         query: str,
         query_embedding: Optional[List[float]],
         terms: Sequence[str],
+        *,
+        cfg: Optional[RetrievalConfig] = None,
     ) -> List[ChannelResult]:
-        if not self._cfg.enable_bm25_channel:
+        cfg = cfg or self._cfg
+        if not cfg.enable_bm25_channel:
             return []
         result = ChannelResult(channel=Channel.BM25)
         if not terms:
@@ -231,8 +252,8 @@ class Bm25Channel:
             # The repo returns a dict {entity_id: GraphEntity}. We don't
             # get a per-entity score from the fulltext API, but iteration
             # order roughly mirrors index relevance for short term lists.
-            block = self._cfg.entity_type_blocklist
-            fetch_n = self._cfg.bm25_limit * (2 if block else 1)
+            block = cfg.entity_type_blocklist
+            fetch_n = cfg.bm25_limit * (2 if block else 1)
             hits = await self._repo.search_entities_by_text(
                 list(terms), limit=fetch_n,
             )
@@ -242,7 +263,7 @@ class Bm25Channel:
             else:
                 entities = list(hits)
             entities = [e for e in entities if not _is_blocked(e, block)]
-            entities = entities[: self._cfg.bm25_limit]
+            entities = entities[: cfg.bm25_limit]
             for rank, entity in enumerate(entities, start=1):
                 # Synthesise a 0..1 score from rank for the per-component
                 # bar in the UI; the RRF stage uses rank, not this score.
@@ -307,8 +328,11 @@ class CypherChannel:
         query: str,
         query_embedding: Optional[List[float]],
         terms: Sequence[str],
+        *,
+        cfg: Optional[RetrievalConfig] = None,
     ) -> List[ChannelResult]:
-        if not self._cfg.enable_cypher_channel:
+        cfg = cfg or self._cfg
+        if not cfg.enable_cypher_channel:
             return []
         result = ChannelResult(channel=Channel.CYPHER)
         if not query_embedding and not terms:
@@ -320,8 +344,8 @@ class CypherChannel:
 
         t0 = time.perf_counter()
         try:
-            block = self._cfg.entity_type_blocklist
-            anchors = await self._fetch_anchors(query_embedding, terms, block)
+            block = cfg.entity_type_blocklist
+            anchors = await self._fetch_anchors(query_embedding, terms, block, cfg)
             seen_ids: set[str] = set()
             for anchor_rank, anchor in enumerate(anchors, start=1):
                 # Re-emit the anchor itself as a Cypher-channel hit so
@@ -361,7 +385,7 @@ class CypherChannel:
                         anchor.id, exc,
                     )
                     continue
-                for rel in rels[: self._cfg.cypher_top_k]:
+                for rel in rels[: cfg.cypher_top_k]:
                     if rel.id in seen_ids:
                         continue
                     seen_ids.add(rel.id)
@@ -401,6 +425,7 @@ class CypherChannel:
         query_embedding: Optional[List[float]],
         terms: Sequence[str],
         block: Sequence[str],
+        cfg: RetrievalConfig,
     ) -> List[Any]:
         """Pick anchor entities to expand 1-hop neighbourhoods around.
 
@@ -418,13 +443,13 @@ class CypherChannel:
         available — typically the cold-start case when the embedding
         model failed to load. Better degraded-anchors than no anchors.
         """
-        fetch_k = self._cfg.cypher_top_k * (2 if block else 1)
+        fetch_k = cfg.cypher_top_k * (2 if block else 1)
 
         if query_embedding:
             ranked = await self._repo.vector_search_entities(
                 query_embedding,
                 top_k=fetch_k,
-                min_score=self._cfg.vector_min_score,
+                min_score=cfg.vector_min_score,
             )
             anchors = [entity for entity, _score in ranked]
         else:
@@ -442,7 +467,7 @@ class CypherChannel:
         # the anchor level — that's where the leverage is, not in the
         # per-rel emission below.
         anchors = [a for a in anchors if not _is_blocked(a, block)]
-        return anchors[: self._cfg.cypher_top_k]
+        return anchors[: cfg.cypher_top_k]
 
 
 # ----------------------------------------------------------------------

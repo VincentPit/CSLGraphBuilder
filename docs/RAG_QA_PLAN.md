@@ -731,6 +731,46 @@ visible-but-not-yet-measurable improvement is bounded by the gold
 set: when retrieval surfaces a *valid but not-pinned* BRCA1
 neighbour, gold scores it as 0.
 
+### 9.7 Fix #3 — relationship label resolution
+
+The investigation also flagged Cypher (and to a lesser extent the
+relationship vector channel) emitting hits with bare-UUID labels like
+`5e75dd33-… --INFLUENCES--> c540d9a-…` because
+[`_relationship_label`](src/graphbuilder/core/retrieval/channels.py#L366-L370)
+uses entity ids, not names. The cross-encoder rerank has nothing
+readable to score against, so it can't tell the difference between a
+genuinely-relevant relationship and a noise one.
+
+**Fix:** the orchestrator does a single batch ``id -> name`` lookup
+across every relationship hit's source/target ids
+([`get_entity_names_by_ids`](src/graphbuilder/infrastructure/repositories/graph_repository.py#L120))
+*before* fusion, then [`_build_item`](src/graphbuilder/core/retrieval/orchestrator.py#L276-L300)
+rewrites relationship labels as `"<src_name> --REL--> <tgt_name>"`.
+Falls back to the channel's UUID label when neither end resolves
+(an entity was deleted between channel emission and resolution) so
+nothing crashes the turn — labels are quality, not correctness.
+
+**v3 (fix #1 only) → v4 (fix #1 + #3) deltas, same 23-question gold:**
+
+| Metric | v3 | v4 | Δ |
+|---|---|---|---|
+| F1 @ k | 0.193 | **0.207** | +0.014 (+7 %) |
+| P @ k | 0.147 | 0.158 | +0.011 |
+| R @ k | 0.524 | 0.541 | +0.017 |
+| Context recall | 0.870 | **0.913** | +0.043 |
+| Answer coverage | 0.870 | **0.957** | +0.087 |
+
+The biggest jump is **answer coverage 87 % → 96 %** — the LLM is
+producing answers that mention the gold substring on 22 / 23
+questions instead of 20 / 23. Mechanism: with readable relationship
+labels in the prompt's SOURCES block, the LLM grounds its answer
+against actual src/tgt names instead of UUIDs and can faithfully
+quote them back. Re-rank quality also improves because the
+cross-encoder now has real text to score (no measurable rerank-
+latency hit; the batch repo call is one round-trip).
+
+Reports: `tests/eval/_reports/v4/{rag_eval.md,rag_eval.csv}`.
+
 What the numbers say (and don't):
 
 1. **Cross-encoder rerank earns its keep.** Disabling it drops F1

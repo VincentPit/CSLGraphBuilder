@@ -129,6 +129,10 @@ class _FakeGraphRepo:
     async def get_entity_relationships(self, entity_id):
         return [r for r in self._rels.values() if r.source_entity_id == entity_id]
 
+    async def get_entity_names_by_ids(self, ids):
+        wanted = set(ids)
+        return {eid: e.name for eid, e in self._entities.items() if eid in wanted and e.name}
+
 
 class _FakeDocumentRepo:
     def __init__(self, chunks: List[_Chunk]):

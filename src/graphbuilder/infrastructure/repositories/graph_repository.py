@@ -113,7 +113,35 @@ class GraphRepositoryInterface(ABC):
     async def get_entity_relationships(self, entity_id: str) -> List[GraphRelationship]:
         """Get all relationships for an entity."""
         pass
-    
+
+    async def get_entity_names_by_ids(self, ids: List[str]) -> Dict[str, str]:
+        """Batch-resolve entity ids to ``e.name``.
+
+        Used by the retrieval orchestrator to rewrite Cypher's bare-UUID
+        relationship labels (``"<src_id> --REL--> <tgt_id>"``) to the
+        human-readable form (``"<src_name> --REL--> <tgt_name>"``)
+        before the cross-encoder rerank scores them — see fix #3 of the
+        channel-quality plan in §9.6 of docs/RAG_QA_PLAN.md.
+
+        Default implementation is repo-agnostic via
+        ``get_all_entities`` so existing implementations (in particular
+        ``InMemoryGraphRepository``) inherit a working version. Neo4j
+        overrides with a single ``MATCH ... WHERE id IN $ids``.
+
+        Missing ids are silently dropped from the result so callers can
+        fall back to the original UUID label when an entity has been
+        deleted between channel emission and resolution.
+        """
+        if not ids:
+            return {}
+        all_entities = await self.get_all_entities()
+        wanted = set(ids)
+        return {
+            eid: ent.name
+            for eid, ent in all_entities.items()
+            if eid in wanted and getattr(ent, "name", None)
+        }
+
     @abstractmethod
     async def execute_cypher_query(self, query: str, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Execute custom Cypher query."""
@@ -1064,17 +1092,38 @@ class Neo4jGraphRepository(GraphRepositoryInterface):
             
             return similar_entities
     
+    async def get_entity_names_by_ids(self, ids: List[str]) -> Dict[str, str]:
+        """Single-roundtrip ``id -> name`` lookup for the orchestrator's
+        Cypher-label resolution pass (fix #3, §9.6 of docs/RAG_QA_PLAN.md).
+
+        Uses the existing ``entity_id_unique`` constraint as the index;
+        a 100-id lookup is sub-millisecond on a modestly sized graph.
+        """
+        if not ids:
+            return {}
+        async with self.driver.session() as session:
+            result = await session.run(
+                "MATCH (e:Entity) WHERE e.id IN $ids RETURN e.id AS id, e.name AS name",
+                {"ids": list(set(ids))},
+            )
+            out: Dict[str, str] = {}
+            async for record in result:
+                name = record["name"]
+                if name:
+                    out[record["id"]] = name
+            return out
+
     async def get_entity_relationships(self, entity_id: str) -> List[GraphRelationship]:
         """Get all relationships for an entity."""
-        
+
         async with self.driver.session() as session:
             query = """
             MATCH (e:Entity {id: $entity_id})
             MATCH (e)-[r:RELATES]-(other:Entity)
-            RETURN r, 
-                   CASE WHEN startNode(r).id = $entity_id 
-                        THEN endNode(r).id 
-                        ELSE startNode(r).id 
+            RETURN r,
+                   CASE WHEN startNode(r).id = $entity_id
+                        THEN endNode(r).id
+                        ELSE startNode(r).id
                    END as other_entity_id,
                    startNode(r).id as source_id,
                    endNode(r).id as target_id

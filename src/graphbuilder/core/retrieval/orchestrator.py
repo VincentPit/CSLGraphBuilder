@@ -104,6 +104,13 @@ class RetrievalOrchestrator:
 
         channel_results = await self._run_channels(query, query_embedding, terms, cfg=cfg)
 
+        # Resolve rel-hit source/target ids → names so the cross-encoder
+        # rerank scores readable text instead of bare UUIDs (fix #3 of
+        # the channel-quality plan, §9.6 of docs/RAG_QA_PLAN.md). Single
+        # batch repo call; missing ids fall back to the original UUID
+        # label inside ``_build_item``.
+        name_map = await self._resolve_relationship_names(channel_results)
+
         # Build hit index: composite_id -> list of RawHit (across channels)
         hit_index: Dict[str, List[RawHit]] = {}
         for cr in channel_results:
@@ -134,7 +141,9 @@ class RetrievalOrchestrator:
             hits = hit_index.get(composite_id, [])
             if not hits:
                 continue
-            candidates.append(self._build_item(composite_id, hits, rrf_score))
+            candidates.append(
+                self._build_item(composite_id, hits, rrf_score, name_map=name_map)
+            )
 
         if cfg.enable_cross_encoder and candidates:
             t_rerank = time.perf_counter()
@@ -265,7 +274,12 @@ class RetrievalOrchestrator:
         return flat
 
     def _build_item(
-        self, composite_id: str, hits: List[RawHit], rrf_score: float
+        self,
+        composite_id: str,
+        hits: List[RawHit],
+        rrf_score: float,
+        *,
+        name_map: Optional[Dict[str, str]] = None,
     ) -> RetrievedItem:
         kind_str, item_id = composite_id.split(":", 1)
         kind = ItemKind(kind_str)
@@ -277,6 +291,16 @@ class RetrievalOrchestrator:
             default=hits[0].label,
             key=len,
         )
+
+        # For relationship items, rewrite the label using resolved
+        # source/target entity names so the cross-encoder rerank scores
+        # readable text. Without this, Cypher emits ``"<src_uuid>
+        # --INFLUENCES--> <tgt_uuid>"`` which the rerank can't tell
+        # apart from any other UUID-only string.
+        if kind is ItemKind.RELATIONSHIP and name_map:
+            resolved = _resolve_rel_label(hits, name_map)
+            if resolved is not None:
+                label = resolved
 
         score_vector: Optional[float] = None
         score_bm25: Optional[float] = None
@@ -421,6 +445,36 @@ class RetrievalOrchestrator:
             hydrated += 1
         return hydrated
 
+    async def _resolve_relationship_names(
+        self, channel_results: List[ChannelResult]
+    ) -> Dict[str, str]:
+        """Batch ``id -> name`` lookup for every distinct source/target
+        of a relationship hit across the channels.
+
+        Single repo round-trip (Neo4j: ``MATCH WHERE id IN $ids``).
+        Returns an empty map on any repo failure so the orchestrator
+        falls through to the original UUID label rather than crashing
+        the turn — labels are quality, not correctness.
+        """
+        ids: set[str] = set()
+        for cr in channel_results:
+            for hit in cr.hits:
+                if hit.kind is not ItemKind.RELATIONSHIP:
+                    continue
+                src = hit.metadata.get("source_entity_id")
+                tgt = hit.metadata.get("target_entity_id")
+                if src:
+                    ids.add(src)
+                if tgt:
+                    ids.add(tgt)
+        if not ids:
+            return {}
+        try:
+            return await self._graph_repo.get_entity_names_by_ids(list(ids))
+        except Exception as exc:  # noqa: BLE001 — quality, not correctness
+            logger.debug("relationship-name resolution failed: %s", exc)
+            return {}
+
     def _emit_chunk_items(
         self,
         items: List[RetrievedItem],
@@ -511,6 +565,41 @@ class RetrievalOrchestrator:
 # ----------------------------------------------------------------------
 # Confidence + reasoning helpers
 # ----------------------------------------------------------------------
+
+def _resolve_rel_label(
+    hits: List[RawHit], name_map: Dict[str, str]
+) -> Optional[str]:
+    """Rebuild a relationship label as ``"<src_name> --REL--> <tgt_name>"``.
+
+    Pulls source_entity_id / target_entity_id / relationship_type from
+    the first hit's metadata that has them. Returns ``None`` when
+    neither end resolves to a name — the caller keeps the original
+    UUID-based label rather than emit a half-resolved one (which would
+    be even more confusing for the rerank).
+    """
+    src_id: Optional[str] = None
+    tgt_id: Optional[str] = None
+    rel_type: Optional[str] = None
+    for h in hits:
+        meta = h.metadata or {}
+        src_id = src_id or meta.get("source_entity_id")
+        tgt_id = tgt_id or meta.get("target_entity_id")
+        rel_type = rel_type or meta.get("relationship_type")
+        if src_id and tgt_id and rel_type:
+            break
+    if not src_id and not tgt_id:
+        return None
+    src_name = name_map.get(src_id or "")
+    tgt_name = name_map.get(tgt_id or "")
+    # Only rewrite when at least one end resolved — partial resolution
+    # ("BRCA1 --INHIBITS--> 5e75dd33") is still useful to the rerank.
+    if not src_name and not tgt_name:
+        return None
+    src_label = src_name or (src_id[:8] if src_id else "?")
+    tgt_label = tgt_name or (tgt_id[:8] if tgt_id else "?")
+    rel_label = rel_type or "RELATES"
+    return f"{src_label} --{rel_label}--> {tgt_label}"
+
 
 def _compute_final_confidence(item: RetrievedItem) -> float:
     """Blend per-channel + rerank scores into a single 0..1 confidence.

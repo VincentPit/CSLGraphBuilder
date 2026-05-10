@@ -105,6 +105,18 @@ class FakeGraphRepo:
     async def get_entity_relationships(self, entity_id):
         return list(self._rels_by_entity.get(entity_id, []))
 
+    async def get_entity_names_by_ids(self, ids):
+        # Look across both the explicit `entities` map and any anchor
+        # entity that only appeared in vector/text-search hit lists, so
+        # the fix-#3 label-resolution path has data to work with.
+        all_seen = dict(self._entities)
+        for e, _ in self._vector_entity_hits:
+            all_seen.setdefault(e.id, e)
+        for e in self._text_search_hits:
+            all_seen.setdefault(e.id, e)
+        wanted = set(ids)
+        return {eid: e.name for eid, e in all_seen.items() if eid in wanted and e.name}
+
 
 class FakeDocumentRepo:
     def __init__(self, chunks: Optional[List[FakeChunk]] = None):
@@ -415,6 +427,63 @@ async def test_bm25_channel_drops_blocklisted_types():
     surviving_ids = {h.id for h in result.hits}
     assert "g1" in surviving_ids
     assert "p1" not in surviving_ids
+
+
+async def test_orchestrator_resolves_relationship_labels_to_entity_names(monkeypatch):
+    """Cypher emits relationships with bare-UUID labels (``"<src_id> --REL--> <tgt_id>"``)
+    because the channel doesn't have the entity-name lookup. Fix #3 makes the
+    orchestrator batch-resolve those names after channels return so the
+    cross-encoder rerank scores readable text instead of UUIDs.
+    """
+    imatinib = _make_entity("e1", "Imatinib")
+    bcr_abl = _make_entity("e2", "BCR-ABL")
+    rel = _make_rel("r1", "e1", "e2")
+
+    repo = FakeGraphRepo(
+        entities=[imatinib, bcr_abl],
+        relationships=[rel],
+        vector_rel_hits=[(rel, 0.92)],
+        # Anchor the BM25/Cypher channels through text search so all
+        # three channels surface the rel.
+        text_search_hits=[imatinib],
+        relationships_by_entity={"e1": [rel]},
+    )
+
+    from graphbuilder.infrastructure.services import embedding_factory
+    monkeypatch.setattr(
+        embedding_factory, "embed_async", lambda *_: _async_const([0.1] * 4),
+    )
+
+    orch = RetrievalOrchestrator(graph_repo=repo)
+    items, _ = await orch.retrieve("Imatinib targets BCR-ABL")
+    rel_item = next((i for i in items if i.kind is ItemKind.RELATIONSHIP), None)
+    assert rel_item is not None
+    # Label should now be human-readable, not a UUID-looking string.
+    assert "Imatinib" in rel_item.label
+    assert "BCR-ABL" in rel_item.label
+    assert "e1" not in rel_item.label and "e2" not in rel_item.label
+
+
+async def test_orchestrator_keeps_uuid_label_when_resolution_fails(monkeypatch):
+    """When the repo's name lookup returns nothing, the orchestrator must
+    keep the channel-emitted label rather than emit a half-resolved one
+    (``"None --REL--> None"`` would be even more confusing for rerank)."""
+    rel = _make_rel("r1", "e1", "e2")
+    # Repo has the rel in vector hits but no entities → name_map is empty.
+    repo = FakeGraphRepo(vector_rel_hits=[(rel, 0.9)])
+
+    from graphbuilder.infrastructure.services import embedding_factory
+    monkeypatch.setattr(
+        embedding_factory, "embed_async", lambda *_: _async_const([0.1] * 4),
+    )
+
+    orch = RetrievalOrchestrator(graph_repo=repo)
+    items, _ = await orch.retrieve("anything")
+    rel_item = next((i for i in items if i.kind is ItemKind.RELATIONSHIP), None)
+    assert rel_item is not None
+    # Falls back to the channel's UUID-style label — no "None" leakage.
+    assert "None" not in rel_item.label
+    assert "e1" in rel_item.label  # original label preserved
 
 
 async def test_cypher_channel_drops_blocklisted_anchors():

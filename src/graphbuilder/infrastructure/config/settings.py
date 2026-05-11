@@ -82,6 +82,13 @@ class LLMConfiguration:
     # enum directly instead of stringly-typed values.
     provider: Any = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "azure_openai"))
     model_name: str = field(default_factory=lambda: os.getenv("LLM_MODEL_NAME", "gpt-4o"))
+    # Per §14 Q2 resolution (2026-05-10): the QA flow (answer generation +
+    # faithfulness escalation + persona summarisation) defaults to a
+    # cheaper model than ingestion. Set ``QA_LLM_MODEL_NAME`` to override
+    # globally; per-request override lives on ``AskRequest.model``.
+    # ``None`` (or the literal env value "default") falls back to
+    # ``model_name`` so single-model deployments keep working.
+    qa_model_name: str = field(default_factory=lambda: os.getenv("QA_LLM_MODEL_NAME", "gpt-4o-mini"))
     api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
     api_endpoint: Optional[str] = field(default_factory=lambda: os.getenv("LLM_API_ENDPOINT"))
     api_version: Optional[str] = field(default_factory=lambda: os.getenv("LLM_API_VERSION", "2024-02-01"))

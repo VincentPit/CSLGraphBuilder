@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import List, Optional
 
@@ -148,7 +149,7 @@ async def test_summary_regenerated_when_older_turns_exist(repo):
     llm = _FakeLLM(response="They asked about a, b, c.")
     svc = MemoryService(
         conversation_repo=repo, llm_service=llm,
-        config=MemoryConfig(working_memory_turns=2),
+        config=MemoryConfig(working_memory_turns=2, background_summary_refresh=False),
     )
     ctx = await svc.build(session_id=s.id, query="f", query_embedding=None)
     assert ctx.summary_regenerated is True
@@ -168,7 +169,7 @@ async def test_summary_cached_when_older_turn_count_unchanged(repo):
     llm = _FakeLLM(response="cached")
     svc = MemoryService(
         conversation_repo=repo, llm_service=llm,
-        config=MemoryConfig(working_memory_turns=2),
+        config=MemoryConfig(working_memory_turns=2, background_summary_refresh=False),
     )
     # First call: regenerates.
     ctx1 = await svc.build(session_id=s.id, query="x", query_embedding=None)
@@ -190,7 +191,7 @@ async def test_summary_regenerated_when_more_turns_added(repo):
     llm = _FakeLLM(response="v1")
     svc = MemoryService(
         conversation_repo=repo, llm_service=llm,
-        config=MemoryConfig(working_memory_turns=2),
+        config=MemoryConfig(working_memory_turns=2, background_summary_refresh=False),
     )
     await svc.build(session_id=s.id, query="x", query_embedding=None)
     # New turn added → older window grows from 2 to 3 turns.
@@ -208,7 +209,7 @@ async def test_summary_uses_deterministic_fallback_without_llm(repo):
 
     svc = MemoryService(
         conversation_repo=repo, llm_service=None,
-        config=MemoryConfig(working_memory_turns=2),
+        config=MemoryConfig(working_memory_turns=2, background_summary_refresh=False),
     )
     ctx = await svc.build(session_id=s.id, query="next", query_embedding=None)
     # Fallback concatenates Q/A pairs — older turns end up in the summary.
@@ -241,12 +242,142 @@ async def test_summary_falls_back_when_llm_raises(repo):
 
     svc = MemoryService(
         conversation_repo=repo, llm_service=_BoomLLM(),
-        config=MemoryConfig(working_memory_turns=2),
+        config=MemoryConfig(working_memory_turns=2, background_summary_refresh=False),
     )
     ctx = await svc.build(session_id=s.id, query="next", query_embedding=None)
     # Fallback path produced a Q/A summary, didn't raise.
     assert ctx.summary_regenerated is True
     assert "Q: q0" in ctx.rolling_summary
+
+
+# --------------------------------------------- background rolling-summary refresh
+
+
+async def _drain_tasks(rounds: int = 20) -> None:
+    """Let detached asyncio tasks (a backgrounded summary regen) run to
+    completion. Each ``sleep(0)`` advances ready callbacks one round; the
+    regen's awaits all resolve immediately in these hermetic stubs, so
+    one round suffices — the extras are cheap insurance."""
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+async def test_summary_backgrounded_serves_stopgap_then_refreshes(repo):
+    s = await repo.create_session(ConversationSession())
+    for i, q in enumerate(["a", "b", "c", "d", "e"]):
+        await repo.append_turn(_turn(s.id, i, q, f"ans-{q}"))
+
+    llm = _FakeLLM(response="LLM summary of a/b/c.")
+    svc = MemoryService(
+        conversation_repo=repo, llm_service=llm,
+        config=MemoryConfig(working_memory_turns=2),  # background is the default
+    )
+
+    ctx = await svc.build(session_id=s.id, query="f", query_embedding=None)
+    # This turn gets a deterministic stopgap, not the LLM summary, and the
+    # trace says we didn't pay the regen cost on the answer's path.
+    assert ctx.summary_regenerated is False
+    assert "[summary covers 3 turns]" in ctx.rolling_summary
+    assert "Q: a" in ctx.rolling_summary
+    assert llm.calls == []  # summariser hasn't been touched yet
+
+    await _drain_tasks()
+    # The detached task has now produced + persisted the real summary.
+    assert len(llm.calls) == 1
+    persisted = await repo.get_session(s.id)
+    assert persisted.summary.startswith("[summary covers 3 turns]")
+    assert "LLM summary of a/b/c." in persisted.summary
+
+    # Next turn (no new turns added) reuses the cached LLM summary; still
+    # no synchronous regen, no extra LLM call.
+    ctx2 = await svc.build(session_id=s.id, query="g", query_embedding=None)
+    assert ctx2.summary_regenerated is False
+    assert ctx2.rolling_summary == persisted.summary
+    assert len(llm.calls) == 1
+
+
+async def test_summary_backgrounded_serves_stale_cache_while_refreshing(repo):
+    s = await repo.create_session(ConversationSession())
+    for i, q in enumerate(["a", "b", "c", "d", "e"]):
+        await repo.append_turn(_turn(s.id, i, q, f"ans-{q}"))
+
+    llm = _FakeLLM(response="v1")
+    svc = MemoryService(
+        conversation_repo=repo, llm_service=llm,
+        config=MemoryConfig(working_memory_turns=2),
+    )
+    # Seed: first build schedules the regen; drain so the cache holds v1.
+    await svc.build(session_id=s.id, query="x", query_embedding=None)
+    await _drain_tasks()
+    seeded = (await repo.get_session(s.id)).summary
+    assert "v1" in seeded and seeded.startswith("[summary covers 3 turns]")
+
+    # A new turn → older window grows 3→4, so the cached marker is stale.
+    await repo.append_turn(_turn(s.id, 5, "f", "ans-f"))
+    llm._response = "v2"
+    ctx = await svc.build(session_id=s.id, query="y", query_embedding=None)
+    # Served the *stale* v1 summary — not v2, and not synchronously.
+    assert ctx.summary_regenerated is False
+    assert ctx.rolling_summary == seeded
+    assert "[summary covers 3 turns]" in ctx.rolling_summary
+
+    await _drain_tasks()
+    refreshed = (await repo.get_session(s.id)).summary
+    assert refreshed.startswith("[summary covers 4 turns]")
+    assert "v2" in refreshed
+
+
+async def test_summary_falls_back_to_sync_when_no_event_loop(repo, monkeypatch):
+    """When ``asyncio.create_task`` can't schedule (no running loop), the
+    regen runs inline so the turn still gets a fresh summary."""
+    s = await repo.create_session(ConversationSession())
+    for i in range(4):
+        await repo.append_turn(_turn(s.id, i, f"q{i}", f"a{i}"))
+
+    def _no_loop(*_a, **_k):
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(asyncio, "create_task", _no_loop)
+
+    llm = _FakeLLM(response="sync summary")
+    svc = MemoryService(
+        conversation_repo=repo, llm_service=llm,
+        config=MemoryConfig(working_memory_turns=2),  # background on, but can't schedule
+    )
+    ctx = await svc.build(session_id=s.id, query="next", query_embedding=None)
+    assert ctx.summary_regenerated is True
+    assert "sync summary" in ctx.rolling_summary
+    assert len(llm.calls) == 1
+
+
+async def test_qa_ask_backgrounds_rolling_summary(repo, monkeypatch):
+    """QAService uses the default MemoryConfig → a stale rolling summary
+    is regenerated off the answer's critical path."""
+    from graphbuilder.infrastructure.services import embedding_factory
+
+    async def fake_embed_async(text):
+        return [1.0, 0.0]
+
+    monkeypatch.setattr(embedding_factory, "embed_async", fake_embed_async)
+
+    llm = _RecordingLLM()
+    svc = QAService(
+        orchestrator=_FakeOrchestrator(), conversation_repo=repo, llm_service=llm,
+    )
+
+    sid = None
+    last = None
+    for i in range(5):
+        last = await svc.ask(query=f"q{i}", session_id=sid)
+        sid = last.session_id
+    # 5th turn: working window = 3 (default) → 4 prior turns → older = 1.
+    assert last.memory_trace["summary_regenerated"] is False  # backgrounded
+    assert last.memory_trace["summary_chars"] > 0             # stopgap rendered in
+
+    await _drain_tasks()
+    assert len(llm.summary_prompts) >= 1                      # summariser ran, after the answer
+    persisted = await repo.get_session(sid)
+    assert persisted.summary.startswith("[summary covers 1 turn]")
 
 
 # ---------------------------------------------------------------- episodic recall
@@ -274,6 +405,30 @@ async def test_episodic_recall_finds_relevant_older_turn(repo):
     assert score > 0.5
     assert _HEADER_EPISODIC in ctx.rendered_block
     assert "Imatinib" in ctx.rendered_block
+
+
+async def test_episodic_recall_accepts_awaitable_embedding(repo):
+    """``build`` may be handed an in-flight embed task instead of a
+    vector — episodic recall resolves it lazily and finds the same hit."""
+    s = await repo.create_session(ConversationSession())
+    await repo.append_turn(_turn(s.id, 0, "what does Imatinib target?", "BCR-ABL", embedding=[1.0, 0.0]))
+    await repo.append_turn(_turn(s.id, 1, "tell me about p53", "tumour suppressor", embedding=[0.0, 1.0]))
+
+    svc = MemoryService(
+        conversation_repo=repo, llm_service=None,
+        config=MemoryConfig(working_memory_turns=0, episodic_min_score=0.5),
+    )
+
+    async def _embed():
+        return [0.95, 0.05]
+
+    ctx = await svc.build(
+        session_id=s.id,
+        query="what about its side effects?",
+        query_embedding=asyncio.create_task(_embed()),
+    )
+    assert ctx.episodic_hit is not None
+    assert ctx.episodic_hit[0].user_query == "what does Imatinib target?"
 
 
 async def test_episodic_recall_excludes_working_memory_turns(repo):

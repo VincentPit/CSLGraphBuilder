@@ -8,6 +8,7 @@ test is the orchestrator's logic, not the persistence layer.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -333,6 +334,56 @@ async def test_vector_channel_handles_missing_embedding():
     results = await channel.run("anything", None, [])
     assert all(r.error == "no query embedding (embedding model unavailable)" for r in results)
     assert all(r.hit_count == 0 for r in results)
+
+
+# -------------------------------------------------- awaitable query embedding
+
+
+async def test_resolve_embedding_passthrough_and_awaitable():
+    from graphbuilder.core.retrieval.models import resolve_embedding
+
+    # Plain values pass straight through.
+    assert await resolve_embedding(None) is None
+    vec = [0.1, 0.2, 0.3]
+    assert await resolve_embedding(vec) is vec
+
+    # A coroutine is awaited…
+    async def _embed():
+        return [0.4, 0.5]
+    assert await resolve_embedding(_embed()) == [0.4, 0.5]
+
+    # …and so is a Task (which, unlike a bare coroutine, can be handed to
+    # several consumers that each await it).
+    task = asyncio.create_task(_embed())
+    assert await resolve_embedding(task) == [0.4, 0.5]
+
+
+async def test_vector_channel_accepts_awaitable_embedding():
+    e1 = _make_entity("e1", "Imatinib")
+    repo = FakeGraphRepo(vector_entity_hits=[(e1, 0.9)])
+    channel = VectorChannel(repo, RetrievalConfig())
+
+    async def _embed():
+        return [0.1] * 4
+
+    results = await channel.run("imatinib", _embed(), [])
+    assert results[0].hit_count == 1
+    assert results[0].hits[0].label == "Imatinib"
+
+
+async def test_bm25_channel_ignores_awaitable_embedding():
+    """BM25 is purely lexical — it takes the ``query_embedding`` slot for
+    signature uniformity but must never touch it (so a pending embed task
+    sitting in that slot is harmless and never awaited)."""
+    e1 = _make_entity("e1", "Imatinib")
+    repo = FakeGraphRepo(text_search_hits=[e1])
+    channel = Bm25Channel(repo, RetrievalConfig())
+
+    never_awaited = asyncio.get_running_loop().create_future()  # never resolved
+    results = await channel.run("imatinib", never_awaited, ["imatinib"])
+    assert results[0].hit_count == 1
+    assert not never_awaited.done()  # proves the channel didn't await it
+    never_awaited.cancel()
 
 
 async def test_vector_channel_disabled_short_circuits():
@@ -709,6 +760,27 @@ async def test_orchestrator_runs_all_channels_and_fuses(orchestrator_setup, monk
     # Multi-channel agreement should produce a bonus over the raw max channel score.
     base = max(s for s in (e1.score_vector, e1.score_bm25, e1.score_cypher) if s)
     assert e1.final_confidence >= base
+
+
+async def test_orchestrator_accepts_awaitable_query_embedding(orchestrator_setup):
+    """Handing ``retrieve`` an in-flight embed *task* yields the same
+    items as handing it the already-resolved vector — the vector / Cypher
+    channels await the task lazily, BM25 ignores it."""
+    repo, docs = orchestrator_setup
+    vec = [0.1] * 4
+
+    orch = RetrievalOrchestrator(graph_repo=repo, document_repo=docs)
+    items_plain, _ = await orch.retrieve("does Imatinib inhibit BCR-ABL?", query_embedding=vec)
+
+    async def _embed():
+        return list(vec)
+
+    items_task, _ = await orch.retrieve(
+        "does Imatinib inhibit BCR-ABL?",
+        query_embedding=asyncio.create_task(_embed()),
+    )
+    assert [i.id for i in items_plain] == [i.id for i in items_task]
+    assert items_plain  # sanity: the fixture actually produces hits
 
 
 async def test_orchestrator_hydrates_chunk_preview(orchestrator_setup, monkeypatch):

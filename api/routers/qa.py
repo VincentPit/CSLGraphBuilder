@@ -67,6 +67,9 @@ from graphbuilder.core.retrieval.mutation_tools import (  # noqa: E402
     MutationToolDispatcher,
 )
 from graphbuilder.core.retrieval.qa_service import QAService  # noqa: E402
+from graphbuilder.core.retrieval.semantic_memory import (  # noqa: E402
+    SemanticMemoryService,
+)
 from graphbuilder.core.retrieval.tools import ToolDispatcher  # noqa: E402
 
 
@@ -128,10 +131,16 @@ def _get_qa_service(
     document_repo: Any,
     conversation_repo: Any,
     llm_service: Any,
+    user_repo: Any = None,
 ) -> QAService:
     global _qa_service_singleton
     if _qa_service_singleton is None:
         retrieval_cfg = RetrievalConfig()
+        # §14 Q2 — QA flow defaults to the cheaper qa_model_name.
+        # ``getattr`` keeps backwards-compat with configs that predate
+        # the field (single-model deployments will fall through to
+        # ``config.llm.model_name`` via the LLM service).
+        qa_model = getattr(config.llm, "qa_model_name", None) if config else None
         orchestrator = RetrievalOrchestrator(
             graph_repo=graph_repo,
             document_repo=document_repo,
@@ -153,6 +162,7 @@ def _get_qa_service(
             llm_service=llm_service,
             config=retrieval_cfg,
             tool_dispatcher=dispatcher,
+            default_qa_model=qa_model,
         )
         # P10 — wire the mutating dispatcher. The api/ proposed-mutation
         # store is injected via the enqueue_fn so core/retrieval stays
@@ -161,6 +171,18 @@ def _get_qa_service(
         _qa_service_singleton.set_mutation_dispatcher(
             MutationToolDispatcher(enqueue_fn=add_proposal),
         )
+        # P14 — cross-session persona. Only wires when the caller passed
+        # a user_repo; the in-process singleton then loads the cached
+        # summary on every ask() and kicks off background refreshes
+        # whenever a new session is created.
+        if user_repo is not None:
+            _qa_service_singleton.set_semantic_memory(
+                SemanticMemoryService(
+                    user_repo=user_repo,
+                    conversation_repo=conversation_repo,
+                    llm_service=llm_service,
+                ),
+            )
         logger.info("QAService initialised (single-process singleton)")
     return _qa_service_singleton
 
@@ -178,6 +200,7 @@ async def ask(
     document_repo=Depends(get_document_repo),
     conversation_repo=Depends(get_conversation_repo),
     llm_service=Depends(get_llm),
+    user_repo=Depends(get_user_repo),
     chat_user_id: Optional[str] = Depends(get_chat_user_id),
     _=Depends(require_api_key),
 ) -> AskResponse:
@@ -190,6 +213,7 @@ async def ask(
         document_repo=document_repo,
         conversation_repo=conversation_repo,
         llm_service=llm_service,
+        user_repo=user_repo,
     )
 
     # Header takes precedence over the deprecated body field — the
@@ -212,6 +236,7 @@ async def ask(
             retrieval_override=retrieval_override,
             enable_tools=body.enable_tools,
             enable_mutations=body.enable_mutations,
+            model=body.model,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -230,6 +255,7 @@ async def ask_stream(
     document_repo=Depends(get_document_repo),
     conversation_repo=Depends(get_conversation_repo),
     llm_service=Depends(get_llm),
+    user_repo=Depends(get_user_repo),
     chat_user_id: Optional[str] = Depends(get_chat_user_id),
     _=Depends(require_api_key),
 ) -> EventSourceResponse:
@@ -256,6 +282,7 @@ async def ask_stream(
         document_repo=document_repo,
         conversation_repo=conversation_repo,
         llm_service=llm_service,
+        user_repo=user_repo,
     )
 
     effective_user_id = chat_user_id if chat_user_id is not None else body.user_id
@@ -269,11 +296,16 @@ async def ask_stream(
                 user_id=effective_user_id,
                 top_k=body.top_k,
                 retrieval_override=retrieval_override,
+                model=body.model,
+                enable_tools=body.enable_tools,
+                enable_mutations=body.enable_mutations,
             ):
-                # P10 note: ask_stream doesn't run the agentic loop in
-                # v1 — streaming + tool-use is a follow-up. enable_tools
-                # / enable_mutations are silently ignored on this path
-                # for now; clients that need both should use /qa/ask.
+                # Tool-use + streaming combo (FOLLOWUPS §3, Option A):
+                # the agentic loop runs to completion FIRST and the
+                # final answer streams as a single ``delta``. Tool
+                # activity is emitted as ``tool_call`` events between
+                # phase("tools") and phase("generating") so the frontend
+                # can render the activity log.
                 # Each event is a {"event": <name>, "data": <dict>} pair.
                 # ``sse_starlette`` accepts that shape directly when we
                 # JSON-encode the data field — keeps the SSE frame's
@@ -390,7 +422,12 @@ async def list_sessions(
 )
 async def delete_session(
     session_id: str,
+    config=Depends(get_app_config),
+    graph_repo=Depends(get_graph_repo),
+    document_repo=Depends(get_document_repo),
     conversation_repo=Depends(get_conversation_repo),
+    llm_service=Depends(get_llm),
+    user_repo=Depends(get_user_repo),
     chat_user_id: Optional[str] = Depends(get_chat_user_id),
     _=Depends(require_api_key),
 ):
@@ -402,6 +439,33 @@ async def delete_session(
         raise HTTPException(status_code=404, detail="session not found")
     if existing.user_id is not None and existing.user_id != chat_user_id:
         raise HTTPException(status_code=404, detail="session not found")
+
+    # P14 — explicit "session ended" trigger. Roll this session's
+    # content into the user's persona BEFORE we drop the turns. Failures
+    # here never block the delete; the next /qa/ask will pick up the
+    # background refresh path instead.
+    if existing.user_id is not None:
+        service = _get_qa_service(
+            config=config,
+            graph_repo=graph_repo,
+            document_repo=document_repo,
+            conversation_repo=conversation_repo,
+            llm_service=llm_service,
+            user_repo=user_repo,
+        )
+        semantic = service.semantic_memory
+        if semantic is not None:
+            try:
+                await semantic.refresh_persona(
+                    existing.user_id,
+                    force=True,
+                    include_session_ids=[session_id],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "persona refresh on session delete failed: %s", exc,
+                )
+
     deleted = await conversation_repo.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="session not found")
@@ -604,6 +668,7 @@ def _to_source_model(item) -> SourceModel:
         source_chunk_id=item.source_chunk_id,
         source_chunk_ids=list(item.source_chunk_ids),
         chunk_preview=item.chunk_preview,
+        description=(item.metadata or {}).get("description"),
         contributing_channels=[c.value for c in item.contributing_channels],
         reasoning=item.reasoning,
     )

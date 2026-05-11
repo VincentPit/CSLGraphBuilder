@@ -26,6 +26,7 @@ from .channels import Bm25Channel, CypherChannel, VectorChannel
 from .models import (
     Channel,
     ChannelResult,
+    EmbeddingOrAwaitable,
     ItemKind,
     RawHit,
     RetrievalConfig,
@@ -76,7 +77,7 @@ class RetrievalOrchestrator:
         query: str,
         *,
         top_k: Optional[int] = None,
-        query_embedding: Optional[List[float]] = None,
+        query_embedding: EmbeddingOrAwaitable = None,
         config_override: Optional[RetrievalConfig] = None,
     ) -> Tuple[List[RetrievedItem], RetrievalTrace]:
         """Retrieve and fuse for one query.
@@ -84,6 +85,10 @@ class RetrievalOrchestrator:
         ``query_embedding`` lets a caller (e.g. ``QAService``) pass in
         an embedding it already has so we don't re-embed for retrieval +
         memory recall on the same turn. ``None`` means "embed for me".
+        It may also be an *awaitable* (an in-flight embed task): the
+        BM25 channel ignores it outright and the vector / Cypher channels
+        await it only when they need it, so term extraction + the BM25
+        round-trip overlap the embedder instead of queuing behind it.
 
         ``config_override`` is the P13 ablation hook: callers (the eval
         runner) can pass a per-request ``RetrievalConfig`` to flip
@@ -220,7 +225,7 @@ class RetrievalOrchestrator:
     async def _run_channels(
         self,
         query: str,
-        query_embedding: Optional[List[float]],
+        query_embedding: EmbeddingOrAwaitable,
         terms: List[str],
         *,
         cfg: Optional[RetrievalConfig] = None,

@@ -148,14 +148,24 @@ export default function SourceCard({ index, source, cited }: Props) {
         <ConfidenceBar label="cypher" value={source.score_cypher} />
       </div>
 
-      {source.chunk_preview && (
+      {source.chunk_preview ? (
         <p
           className="text-xs italic line-clamp-3"
           style={{ color: 'var(--text-secondary)' }}
         >
           “{source.chunk_preview}”
         </p>
-      )}
+      ) : source.description ? (
+        // Fallback for entities with no hydrated chunk (e.g. Open
+        // Targets imports) — show the node's own description, which is
+        // the prose the LLM grounded its answer on.
+        <p
+          className="text-xs line-clamp-3"
+          style={{ color: 'var(--text-secondary)' }}
+        >
+          {source.description}
+        </p>
+      ) : null}
 
       <div
         className="flex items-center gap-2 flex-wrap text-[10px]"

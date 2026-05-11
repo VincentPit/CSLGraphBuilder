@@ -8,9 +8,28 @@ docs/RAG_QA_PLAN.md).
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
+
+
+# A query embedding, or an awaitable producing one. Callers that kick off
+# the embed as a task up front can pass the task here and let the consumers
+# (vector channel, Cypher anchor fetch, episodic recall) await it only at
+# the point they actually need it — so the non-vector work (BM25, working
+# memory, term extraction) overlaps the embedder instead of queuing behind
+# it. See ``RetrievalOrchestrator.retrieve`` / ``MemoryService.build``.
+EmbeddingOrAwaitable = Union[Optional[List[float]], Awaitable[Optional[List[float]]]]
+
+
+async def resolve_embedding(value: "EmbeddingOrAwaitable") -> Optional[List[float]]:
+    """Return the concrete embedding — awaiting ``value`` if it's an
+    awaitable (an in-flight embed task), or passing it through unchanged
+    when it's already a vector / ``None``."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 class Channel(str, Enum):

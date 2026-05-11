@@ -135,6 +135,9 @@ class LLMRequest:
     # Skip OpenAI's response_format=json_object guard (the verifier wants
     # raw text and parses JSON itself, after stripping code fences).
     json_response: bool = True
+    # Per-call model override (§14 Q2). ``None`` → use ``config.llm.model_name``
+    # (ingestion default); set to "gpt-4o-mini" or similar for the QA flow.
+    model: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -861,9 +864,11 @@ RESPOND WITH VALID JSON:
             # network errors with exponential-backoff + jitter; application
             # bugs (4xx other than 429) bubble up unchanged so we don't mask
             # configuration mistakes behind retries.
+            effective_model = request.model or self.config.llm.model_name
+
             async def _do_call():
                 return await self.client.chat.completions.create(
-                    model=self.config.llm.model_name,
+                    model=effective_model,
                     messages=messages,
                     temperature=request.temperature,
                     max_tokens=request.max_tokens,
@@ -911,6 +916,7 @@ RESPOND WITH VALID JSON:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         prompt_type: PromptType = PromptType.VERIFICATION,
+        model: Optional[str] = None,
     ) -> str:
         """Free-form text completion that funnels through ``_execute_llm_call``.
 
@@ -919,6 +925,9 @@ RESPOND WITH VALID JSON:
         is now driven from async code). Going through ``_execute_llm_call``
         means metrics + retries are recorded the same way as every other LLM
         call in the pipeline.
+
+        ``model`` (§14 Q2) — optional per-call override. ``None`` falls back
+        to ``config.llm.model_name`` so legacy callers stay unchanged.
         """
         request = LLMRequest(
             prompt=prompt,
@@ -930,6 +939,7 @@ RESPOND WITH VALID JSON:
             # The verifier strips its own code fences; don't force JSON mode
             # because some providers reject it without a JSON-shaped prompt.
             json_response=False,
+            model=model,
         )
         response = await self._execute_llm_call(request)
         return response.content
@@ -942,6 +952,7 @@ RESPOND WITH VALID JSON:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         prompt_type: PromptType = PromptType.VERIFICATION,
+        model: Optional[str] = None,
     ):
         """Streaming variant of ``generate_text`` (P11 of docs/RAG_QA_PLAN.md).
 
@@ -966,9 +977,11 @@ RESPOND WITH VALID JSON:
             {"role": "user", "content": prompt},
         ]
 
+        effective_model = model or self.config.llm.model_name
+
         async def _open_stream():
             return await self.client.chat.completions.create(
-                model=self.config.llm.model_name,
+                model=effective_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -1016,6 +1029,7 @@ RESPOND WITH VALID JSON:
         temperature: float = 0.0,
         max_tokens: int = 1024,
         prompt_type: PromptType = PromptType.VERIFICATION,
+        model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """OpenAI-style function-calling round-trip (P9 of docs/RAG_QA_PLAN.md).
 
@@ -1042,9 +1056,11 @@ RESPOND WITH VALID JSON:
         ``arguments={"_raw": "..."}`` so the dispatcher can decide
         whether to retry vs. fail soft.
         """
+        effective_model = model or self.config.llm.model_name
+
         async def _do_call():
             return await self.client.chat.completions.create(
-                model=self.config.llm.model_name,
+                model=effective_model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,

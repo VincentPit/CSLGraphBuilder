@@ -787,3 +787,188 @@ async def test_ask_with_tools_enabled_but_no_dispatcher_falls_back(items, conv_r
     # No agentic loop ran — generate_text path produced the answer.
     assert result.tool_calls == []
     assert "answer" in result.answer.lower()
+
+
+# ---------------------------------------------------------------- Q2 model override
+
+
+class _ModelAwareLLM:
+    """LLM fake that records the ``model`` kwarg from generate_text.
+
+    Distinct from ``FakeLLM`` so the pre-existing tests stay hermetic
+    against extra kwargs.
+    """
+
+    def __init__(self, response: str = "ok [1]"):
+        self._response = response
+        self.calls: list[dict] = []
+
+    async def generate_text(
+        self,
+        *,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        model: Optional[str] = None,
+    ) -> str:
+        self.calls.append({"model": model})
+        return self._response
+
+
+async def test_ask_uses_default_qa_model_when_no_override(items, conv_repo):
+    llm = _ModelAwareLLM()
+    svc = QAService(
+        orchestrator=FakeOrchestrator(items, _trace()),
+        conversation_repo=conv_repo, llm_service=llm,
+        default_qa_model="gpt-4o-mini",
+    )
+    await svc.ask(query="q")
+    assert llm.calls[-1]["model"] == "gpt-4o-mini"
+
+
+async def test_ask_per_request_model_overrides_default(items, conv_repo):
+    llm = _ModelAwareLLM()
+    svc = QAService(
+        orchestrator=FakeOrchestrator(items, _trace()),
+        conversation_repo=conv_repo, llm_service=llm,
+        default_qa_model="gpt-4o-mini",
+    )
+    await svc.ask(query="q", model="gpt-4o")
+    assert llm.calls[-1]["model"] == "gpt-4o"
+
+
+async def test_ask_blank_model_falls_back_to_default(items, conv_repo):
+    """Empty-string override (frontend default) should NOT pin a meaningless model id."""
+    llm = _ModelAwareLLM()
+    svc = QAService(
+        orchestrator=FakeOrchestrator(items, _trace()),
+        conversation_repo=conv_repo, llm_service=llm,
+        default_qa_model="gpt-4o-mini",
+    )
+    await svc.ask(query="q", model="   ")
+    assert llm.calls[-1]["model"] == "gpt-4o-mini"
+
+
+async def test_ask_no_default_no_override_means_no_model_kwarg(items, conv_repo):
+    """Single-model deployments: neither default nor override is set, so the
+    LLM service falls back to ``config.llm.model_name``. We surface that as
+    ``model=None`` on the call (the qa_service strips the kwarg entirely)."""
+    llm = _ModelAwareLLM()
+    svc = QAService(
+        orchestrator=FakeOrchestrator(items, _trace()),
+        conversation_repo=conv_repo, llm_service=llm,
+    )
+    await svc.ask(query="q")
+    # When no model is resolved, qa_service omits the kwarg → fake's
+    # default value (None) is what gets recorded.
+    assert llm.calls[-1]["model"] is None
+
+
+# ---------------------------------------------------------------- Step 3: streaming × tool-use (FOLLOWUPS §3 Option A)
+
+
+async def test_ask_stream_with_tools_emits_tool_call_events(items, conv_repo):
+    """Streaming + tool-use combo: the agentic loop runs to completion,
+    tool activity surfaces as ``tool_call`` events, and the final answer
+    arrives as a single ``delta`` between ``phase("generating")`` and
+    ``done``."""
+    from graphbuilder.core.retrieval.tools import ToolCallRecord
+
+    dispatcher = _FakeDispatcher([
+        ToolCallRecord(
+            tool="search_graph", args={"query": "brca1"},
+            result={"items": [{"id": "e1", "label": "BRCA1"}]},
+            latency_ms=2, tool_call_id="call_1",
+        ),
+    ])
+    llm = _ScriptedToolingLLM([
+        {"tool_calls": [{
+            "id": "call_1", "name": "search_graph",
+            "arguments": {"query": "brca1"},
+        }]},
+        {"content": "BRCA1 is a DNA repair gene [1]."},
+    ])
+    svc = QAService(
+        orchestrator=FakeOrchestrator(items, _trace()),
+        conversation_repo=conv_repo, llm_service=llm,
+        tool_dispatcher=dispatcher,
+    )
+
+    events = await _drain(svc.ask_stream(query="what is BRCA1?", enable_tools=True))
+    phases = [e for e in events if e["event"] == "phase"]
+    tool_events = [e for e in events if e["event"] == "tool_call"]
+    deltas = [e for e in events if e["event"] == "delta"]
+    done = [e for e in events if e["event"] == "done"]
+
+    # phase sequence: retrieving → tools → generating
+    assert [p["data"]["phase"] for p in phases] == ["retrieving", "tools", "generating"]
+    # tool_call event surfaces the search_graph dispatch
+    assert len(tool_events) == 1
+    assert tool_events[0]["data"]["tool"] == "search_graph"
+    # Final answer arrives as a single delta (Option A: agentic loop
+    # completes before streaming).
+    assert len(deltas) == 1
+    assert "BRCA1" in deltas[0]["data"]["text"]
+    # done event carries the tool_calls payload
+    assert len(done) == 1
+    assert len(done[0]["data"]["tool_calls"]) == 1
+
+
+async def test_ask_stream_without_tools_takes_pure_streaming_path(items, conv_repo):
+    """When ``enable_tools=False`` (default), the stream goes straight
+    from retrieval → token streaming with no ``tool_call`` events and no
+    ``phase("tools")``."""
+    llm = StreamingFakeLLM(chunks=["BRCA1 ", "is a ", "gene [1]."])
+    svc = QAService(
+        orchestrator=FakeOrchestrator(items, _trace()),
+        conversation_repo=conv_repo, llm_service=llm,
+    )
+    events = await _drain(svc.ask_stream(query="what is BRCA1?"))
+    phases = [e["data"]["phase"] for e in events if e["event"] == "phase"]
+    assert "tools" not in phases
+    assert [e for e in events if e["event"] == "tool_call"] == []
+    deltas = [e for e in events if e["event"] == "delta"]
+    assert len(deltas) == 3  # three streaming chunks
+
+
+# ---------------------------------------------------------------- retrieval snapshot on persisted turns
+
+
+async def test_ask_persists_retrieval_snapshot_on_turn(items, conv_repo):
+    """The turn saved by ask() carries a compact source snapshot in its
+    metadata so a reopened session can re-render the same source cards +
+    trace as a live ask."""
+    orch = FakeOrchestrator(items, _trace())
+    llm = FakeLLM("Imatinib targets BCR-ABL [1].")
+    svc = QAService(orchestrator=orch, conversation_repo=conv_repo, llm_service=llm)
+
+    result = await svc.ask(query="does Imatinib target anything?")
+    persisted = await conv_repo.get_turn(result.turn_id)
+    snap = persisted.metadata.get("retrieval_snapshot")
+    assert snap is not None
+    assert len(snap["sources"]) == len(items)
+    assert snap["sources"][0]["label"] == "Imatinib"
+    # The snapshot's source dicts drop the nested metadata sub-dict.
+    assert "metadata" not in snap["sources"][0]
+    assert snap["cited_source_indices"] == [1]
+    assert snap["retrieval_trace"]["final_top_k"] == _trace().final_top_k
+    # latency_ms is now stamped on the turn (was always 0 before).
+    assert persisted.latency_ms >= 0
+
+
+async def test_snapshot_truncates_long_chunk_previews(conv_repo):
+    from graphbuilder.core.retrieval.qa_service import (
+        _SNAPSHOT_MAX_PREVIEW_CHARS,
+        _snapshot_sources,
+    )
+    big = RetrievedItem(
+        kind=ItemKind.ENTITY, id="e1", label="X",
+        score_rrf=0.1, chunk_preview="z" * (_SNAPSHOT_MAX_PREVIEW_CHARS + 500),
+        contributing_channels=[Channel.BM25],
+    )
+    snap = _snapshot_sources([big], None, [])
+    preview = snap["sources"][0]["chunk_preview"]
+    assert len(preview) <= _SNAPSHOT_MAX_PREVIEW_CHARS + 1  # +1 for the ellipsis
+    assert preview.endswith("…")
+    assert "retrieval_trace" not in snap  # None trace → key omitted

@@ -89,6 +89,15 @@ class AskRequest(BaseModel):
             "both to give the LLM full read+write access."
         ),
     )
+    model: Optional[str] = Field(
+        None,
+        description=(
+            "Per-request LLM model override (§14 Q2 resolution). Null "
+            "uses the QA-flow default (``QA_LLM_MODEL_NAME``, gpt-4o-mini). "
+            "Set to e.g. 'gpt-4o' to opt into the high-quality model for "
+            "a single ask — useful for A/B against the eval gold set."
+        ),
+    )
 
 
 class SourceModel(BaseModel):
@@ -106,6 +115,12 @@ class SourceModel(BaseModel):
     source_chunk_id: Optional[str] = None
     source_chunk_ids: List[str] = Field(default_factory=list)
     chunk_preview: Optional[str] = None
+    # The entity/relationship's own description (from the graph node).
+    # For Open-Targets-ingested entities this is often the only prose
+    # available — the SourceCard shows it as a fallback when there's no
+    # hydrated chunk preview, and the LLM grounds answers on it via the
+    # SOURCES block's "Description:" line.
+    description: Optional[str] = None
     contributing_channels: List[str] = Field(default_factory=list)
     reasoning: str = ""
 

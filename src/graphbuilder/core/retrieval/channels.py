@@ -31,9 +31,11 @@ from typing import Any, List, Optional, Sequence
 from .models import (
     Channel,
     ChannelResult,
+    EmbeddingOrAwaitable,
     ItemKind,
     RawHit,
     RetrievalConfig,
+    resolve_embedding,
 )
 
 
@@ -90,7 +92,7 @@ class VectorChannel:
     async def run(
         self,
         query: str,
-        query_embedding: Optional[List[float]],
+        query_embedding: EmbeddingOrAwaitable,
         terms: Sequence[str],
         *,
         cfg: Optional[RetrievalConfig] = None,
@@ -104,6 +106,9 @@ class VectorChannel:
         if not cfg.enable_vector_channel:
             return []
         run_rel = cfg.enable_vector_relationship
+        # Block on the embedding only now — by the time we get here it's
+        # usually already done (it was kicked off before the channels ran).
+        query_embedding = await resolve_embedding(query_embedding)
         if not query_embedding:
             results: List[ChannelResult] = [
                 ChannelResult(
@@ -234,7 +239,7 @@ class Bm25Channel:
     async def run(
         self,
         query: str,
-        query_embedding: Optional[List[float]],
+        query_embedding: EmbeddingOrAwaitable,  # unused — BM25 is purely lexical
         terms: Sequence[str],
         *,
         cfg: Optional[RetrievalConfig] = None,
@@ -326,7 +331,7 @@ class CypherChannel:
     async def run(
         self,
         query: str,
-        query_embedding: Optional[List[float]],
+        query_embedding: EmbeddingOrAwaitable,
         terms: Sequence[str],
         *,
         cfg: Optional[RetrievalConfig] = None,
@@ -335,6 +340,10 @@ class CypherChannel:
         if not cfg.enable_cypher_channel:
             return []
         result = ChannelResult(channel=Channel.CYPHER)
+        # Resolve the embedding before deciding the anchor strategy —
+        # ``_fetch_anchors`` prefers vector anchors when one is available
+        # and falls back to term anchors only if it resolved to ``None``.
+        query_embedding = await resolve_embedding(query_embedding)
         if not query_embedding and not terms:
             # Need *something* to anchor on. Vector path needs an
             # embedding; BM25 fallback needs terms. Surface the

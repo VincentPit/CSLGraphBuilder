@@ -13,18 +13,27 @@ chatbot stays coherent across long conversations:
 
 Cross-session semantic memory (§5.4) lands in P14 and isn't here.
 
-The :class:`MemoryService` is stateless — every call reads from the
-conversation repo and (when summarising) writes the new summary back via
-``update_session_summary`` so the cost is amortised across turns.
+The :class:`MemoryService` keeps no per-session state — every call reads
+from the conversation repo and writes the new summary back via
+``update_session_summary`` so the cost is amortised across turns. When
+``MemoryConfig.background_summary_refresh`` is on (the default), a stale
+summary's regeneration is dispatched as a *detached* asyncio task so the
+answer's critical path never pays the summariser-LLM cost; the current
+turn is served the previous (cached) summary, which at most omits the
+single most-recent turn — and that turn is already in working memory
+verbatim. So the service holds a transient handle to those tasks only
+for the duration of the regen.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 
 from ...domain.models.conversation_models import ConversationTurn
+from .models import EmbeddingOrAwaitable, resolve_embedding
 
 
 logger = logging.getLogger("graphbuilder.qa.memory")
@@ -48,6 +57,16 @@ class MemoryConfig:
 
     # Rolling summary.
     enable_summary: bool = True
+
+    background_summary_refresh: bool = True
+    """When True (default), a stale rolling summary is regenerated in a
+    detached ``asyncio`` task and *this* turn is served the previous
+    (cached) summary — keeping the summariser LLM off the answer's
+    critical path. A one-turn-stale summary is harmless: the only turn it
+    omits is already rendered verbatim in working memory. Set False for
+    deterministic, synchronous behaviour (eval harness, unit tests). Also
+    falls back to synchronous regen when no event loop is running."""
+
     max_summary_chars: int = 2000
     """Cap on the rolling summary block (≈ 500 tokens at 4 chars/token)."""
 
@@ -140,16 +159,18 @@ class MemoryService:
         *,
         session_id: Optional[str],
         query: str,
-        query_embedding: Optional[List[float]],
+        query_embedding: EmbeddingOrAwaitable,
     ) -> MemoryContext:
         """Build the memory context for the upcoming /ask turn.
 
         Pre-conditions:
         - ``session_id`` may be ``None`` for a brand-new session — we
           short-circuit and return an empty context (nothing to recall).
-        - ``query_embedding`` may be ``None`` if the embedding model
-          isn't available — we skip episodic recall in that case but
-          still render working memory + summary.
+        - ``query_embedding`` may be ``None`` (embedding model
+          unavailable → skip episodic recall, still render working memory
+          + summary), a vector, or an *awaitable* producing one. Only
+          episodic recall consumes it, so passing an in-flight embed task
+          lets the turn-loading + summary work overlap the embedder.
         """
         if not session_id:
             return MemoryContext()
@@ -177,15 +198,16 @@ class MemoryService:
             )
 
         episodic_hit: Optional[Tuple[ConversationTurn, float]] = None
-        if (
-            self._cfg.enable_episodic_recall
-            and query_embedding is not None
-        ):
-            episodic_hit = await self._episodic_recall(
-                session_id=session_id,
-                query_embedding=query_embedding,
-                exclude_turn_ids={t.id for t in working},
-            )
+        if self._cfg.enable_episodic_recall:
+            # Resolve the embedding only here — nothing above needed it,
+            # so it overlapped the (caller-kicked-off) embed task.
+            resolved_embedding = await resolve_embedding(query_embedding)
+            if resolved_embedding is not None:
+                episodic_hit = await self._episodic_recall(
+                    session_id=session_id,
+                    query_embedding=resolved_embedding,
+                    exclude_turn_ids={t.id for t in working},
+                )
 
         rendered_block, stats = self._render(
             rolling_summary=rolling_summary,
@@ -214,43 +236,108 @@ class MemoryService:
         session_id: str,
         older_turns: List[ConversationTurn],
     ) -> Tuple[str, bool]:
-        """Return ``(summary, was_regenerated)``.
+        """Return ``(summary_for_this_turn, regenerated_synchronously)``.
 
-        The cached summary lives on ``session.summary``. We regenerate
-        whenever the *number* of older turns has changed since the last
-        summarise — that's the cheapest reliable freshness signal that
-        doesn't need a separate marker on the session schema.
+        The cached summary lives on ``session.summary``, prefixed with a
+        ``[summary covers N turn(s)]`` marker so staleness is a string
+        compare — no extra schema field. We "regenerate" whenever the
+        number of older turns changed since the last summarise.
+
+        On a stale (or missing) marker the behaviour forks on
+        ``MemoryConfig.background_summary_refresh``:
+
+        * **Background (default)** — dispatch the regen as a detached
+          task and serve what we already have: the stale cached summary,
+          or — for a never-summarised session — a deterministic
+          ``_fallback_summary`` stopgap the task will overwrite shortly.
+          The summariser LLM never touches this turn's critical path.
+        * **Synchronous** — block on the regen (LLM, or deterministic
+          fallback when no LLM / on LLM error) and persist it before
+          returning. Used when the flag is off, or when there's no event
+          loop to attach a task to.
+
+        ``regenerated_synchronously`` is True only for the synchronous
+        path; a backgrounded regen leaves it False because *this* turn
+        was served the cached/stopgap text.
         """
         session = await self._conv.get_session(session_id)
         cached = (session.summary if session else "") or ""
 
-        # The summary text we cache starts with a marker line of the
-        # form "[summary covers N turn(s)]" so we can detect staleness
-        # on the next call without re-running the LLM.
         marker_for = self._summary_marker(len(older_turns))
         if cached.startswith(marker_for):
             return cached, False
 
-        if self._llm is None:
-            # No LLM → fall back to a deterministic concatenation. Less
-            # informative than an LLM summary, but better than nothing
-            # for the prompt and keeps tests hermetic.
-            fallback = self._fallback_summary(older_turns)
-            new_summary = f"{marker_for}\n{fallback}"
-            await self._conv.update_session_summary(session_id, new_summary)
-            return new_summary, True
+        # Stale or missing marker → a regen is due.
+        if self._cfg.background_summary_refresh and self._schedule_summary_refresh(
+            session_id, older_turns, marker_for,
+        ):
+            if cached:
+                return cached, False
+            # Never summarised before — there's nothing cached to serve,
+            # so hand back a cheap deterministic stopgap (capped to the
+            # block budget); the background task replaces it next turn.
+            stopgap = f"{marker_for}\n{self._fallback_summary(older_turns)}"
+            return self._truncate(stopgap, self._cfg.max_summary_chars), False
 
-        try:
-            llm_text = await self._summarise_via_llm(older_turns)
-        except Exception as exc:
-            logger.warning("summary LLM call failed: %s — using fallback", exc)
-            llm_text = self._fallback_summary(older_turns)
-
-        new_summary = f"{marker_for}\n{llm_text}"
-        if len(new_summary) > self._cfg.max_summary_chars:
-            new_summary = new_summary[: self._cfg.max_summary_chars].rstrip() + "…"
+        # Synchronous path: flag off, or no running loop to background on.
+        new_summary = await self._build_summary_text(older_turns, marker_for)
         await self._conv.update_session_summary(session_id, new_summary)
         return new_summary, True
+
+    def _schedule_summary_refresh(
+        self,
+        session_id: str,
+        older_turns: List[ConversationTurn],
+        marker_for: str,
+    ) -> bool:
+        """Fire-and-forget a rolling-summary regen. Returns False when
+        there's no running event loop (caller then regenerates inline).
+
+        Overlapping turns on the same session can each spawn a task —
+        harmless: ``update_session_summary`` writes are last-wins and the
+        marker makes a redundant regen a cheap skip on the next turn. Not
+        worth a per-session lock for the single-instance v1 API."""
+        coro = self._regenerate_and_persist(session_id, older_turns, marker_for)
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            coro.close()  # never scheduled — close it so it's not "never awaited"
+            return False
+        task.add_done_callback(self._on_summary_refresh_done)
+        return True
+
+    @staticmethod
+    def _on_summary_refresh_done(task: "asyncio.Task[Any]") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("background rolling-summary refresh failed: %s", exc)
+
+    async def _regenerate_and_persist(
+        self,
+        session_id: str,
+        older_turns: List[ConversationTurn],
+        marker_for: str,
+    ) -> None:
+        new_summary = await self._build_summary_text(older_turns, marker_for)
+        await self._conv.update_session_summary(session_id, new_summary)
+
+    async def _build_summary_text(
+        self, older_turns: List[ConversationTurn], marker_for: str,
+    ) -> str:
+        """Produce the marker-prefixed summary — LLM when available, a
+        deterministic Q/A concat otherwise. Never raises: an LLM failure
+        degrades to the concat. Output is capped to the block budget."""
+        if self._llm is None:
+            text = self._fallback_summary(older_turns)
+        else:
+            try:
+                text = await self._summarise_via_llm(older_turns)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("summary LLM call failed: %s — using fallback", exc)
+                text = self._fallback_summary(older_turns)
+        return self._truncate(f"{marker_for}\n{text}", self._cfg.max_summary_chars)
 
     @staticmethod
     def _summary_marker(n_turns: int) -> str:

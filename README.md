@@ -1,31 +1,43 @@
 # CSLGraphBuilder
 
-An enterprise knowledge graph construction pipeline for CSL Behring. Ingests documents (URLs, PDFs, JSON, plain text), extracts biomedical entities and relationships via LLM, and persists them into a Neo4j graph database with LLM-powered deduplication, cascading verification, conflict detection, and provenance tracking. Ships with a FastAPI backend, a Next.js 14 frontend, and Docker Compose for one-command deployment.
+An enterprise biomedical knowledge graph platform for CSL Behring. Two halves that share one Neo4j store:
 
-> **v2.1 — workflow & UI upgrade.** Document processing now runs through a stage-aware pipeline (`fetch → chunk → entities → relationships → finalize`) with bounded **parallel chunk extraction**, process-wide **LLM dedup + embedding caches**, **cooperative cancellation**, structured **per-stage SSE progress events**, and a **`/health/metrics`** endpoint exposing call volume, token usage, latency, and cache hit rates. The frontend renders all of this as a live **stage timeline** with a cancel button, plus a new **Job History** page and a **Pipeline Performance** widget on the dashboard.
+1. **Ingestion** — pulls documents (URLs, PDFs, JSON, plain text) and external sources (Open Targets, PubMed, web crawl) through a stage-aware pipeline that extracts biomedical entities and relationships via LLM, dedupes, verifies, and persists with full provenance.
+2. **RAG Q&A chatbot** — a grounded, citation-emitting biomedical assistant that retrieves from the graph + source chunks via a hybrid Cypher + vector + BM25 + rerank pipeline, runs a per-claim faithfulness check, exposes function-calling tools (read-only + mutating, gated behind curator approval), streams answers over SSE, and remembers users across sessions.
+
+Ships with a FastAPI backend, a Next.js 14 frontend (graph viewer, ingestion stage timeline, curation queue, **and a `/chat` page**), and Docker Compose for one-command deployment.
+
+> **v2.2 — RAG Q&A chatbot (P0–P14 of [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md))**. A grounded chatbot over the knowledge graph. **Hybrid retrieval** (Cypher + vector + BM25 fused via RRF, then cross-encoder rerank, then `NEXT_CHUNK ±1` neighbour expansion). **Four-layer memory** — verbatim working window, rolling LLM summary, per-session episodic recall via `turn_query_vector`, and per-user persona summary that survives across sessions. **Function-calling tools** — read-only (`search_graph` / `get_entity` / `verify_claim`) and mutating (`propose_entity` / `propose_relationship` / `update_entity` / `merge_entities` / `soft_delete_*`), gated behind the existing curation queue. **Per-claim faithfulness** check + lexical-only default with optional LLM escalation. **SSE streaming** with interleaved `tool_call` events. **Eval harness** with gold set, hermetic CI gate, and ablation matrix. See the dedicated [RAG Q&A Chatbot section](#rag-qa-chatbot) below.
+>
+> **v2.1 — workflow & UI upgrade.** Document processing runs through a stage-aware pipeline (`fetch → chunk → entities → relationships → finalize`) with bounded **parallel chunk extraction**, process-wide **LLM dedup + embedding caches**, **cooperative cancellation**, structured **per-stage SSE progress events**, and a **`/health/metrics`** endpoint exposing call volume, token usage, latency, and cache hit rates. The frontend renders all of this as a live **stage timeline** with a cancel button, plus a **Job History** page and a **Pipeline Performance** widget on the dashboard.
 
 ---
 
 ## Table of Contents
 
 1. [Architecture](#architecture)
-2. [Key Features](#key-features)
-3. [Prerequisites](#prerequisites)
-4. [Quick Start](#quick-start)
-5. [Docker Deployment](#docker-deployment)
-6. [Configuration](#configuration)
-7. [CLI Usage](#cli-usage)
-8. [REST API](#rest-api)
-9. [Project Structure](#project-structure)
-10. [Module Responsibilities](#module-responsibilities)
-11. [Testing](#testing)
-12. [Contributing](#contributing)
+2. [RAG Q&A Chatbot](#rag-qa-chatbot)
+3. [Key Features](#key-features)
+4. [Prerequisites](#prerequisites)
+5. [Quick Start](#quick-start)
+6. [Docker Deployment](#docker-deployment)
+7. [Configuration](#configuration)
+8. [Verification Policy](#verification-policy)
+9. [CLI Usage](#cli-usage)
+10. [REST API](#rest-api)
+11. [Project Structure](#project-structure)
+12. [Module Responsibilities](#module-responsibilities)
+13. [Testing](#testing)
+14. [Contributing](#contributing)
 
 ---
 
 ## Architecture
 
+The platform has two halves over one Neo4j store. **Ingestion** (left) writes the graph; the **RAG Q&A chatbot** (right) reads from it.
+
 ```
+─────────────────────  WRITE PATH (ingestion, v2.1)  ─────────────────────
 Input (URL / File / Text / Open Targets API / PubMed / Web Crawl)
         │
         ▼
@@ -41,36 +53,166 @@ DocumentExtractionPipeline           ← ordered stages with progress callbacks 
   Stage 6  finalize      ← persist counts + status to source document
         │
         ▼
-Neo4j Knowledge Graph
+Neo4j Knowledge Graph                  ←─── shared store ───→  READ PATH
   Document → [:FIRST_CHUNK] → Chunk → [:NEXT_CHUNK] → Chunk
   Chunk    → [:HAS_ENTITY]  → Entity
   Entity   → [:REL_TYPE]    → Entity
-  Entity.name_embedding      ← 768-d float[] vector index (cosine, SapBERT default)
-  Relationship.desc_embedding← 768-d float[] vector index (cosine)
+  Entity.name_embedding       ← 768-d vector index (cosine, SapBERT default)
+  Relationship.desc_embedding ← 768-d vector index (cosine)
+  ConversationSession → [:HAS_TURN] → ConversationTurn
+  ConversationTurn.query_embedding ← `turn_query_vector` (episodic recall)
+  User {id, display_name, metadata}     ← persona/embedding for §5.4
         │
         ▼
-Relationship Verification Pipeline (cascading with escalation bands)
-  Stage 1 — TextMatchVerifier     ← regex / exact string pattern match
-  Stage 2 — EmbeddingVerifier     ← cosine similarity + Neo4j vector search
-  Stage 3 — LLMVerifier           ← structured LLM prompt with reasoning trace
-        │
-        ▼
-Conflict Detection + Curation
-  ├── Automatic contradiction detection (INHIBITS vs ACTIVATES)
-  ├── Source trust scoring
-  ├── Pending review queue
-  └── Human-in-the-loop approve / reject / correct
-        │
-        ▼
+Relationship Verification (cascading) + Conflict Detection + Curation Queue
+─────────────────────────────────────────────────────────────────────────
+
+──────────────────  READ PATH (RAG Q&A chatbot, v2.2)  ──────────────────
+User query                                             ┌─────────────────┐
+   │  X-User-Id  X-API-Key                            │  /chat (Next.js)│
+   ▼                                                  │  · MessageBubble│
+POST /qa/ask  |  POST /qa/ask/stream  (SSE)           │  · SourceCard   │
+   │                                                  │  · MutationCard │
+   ▼                                                  │  · DebugPane    │
+QAService.ask                                         └─────────────────┘
+  ├── _resolve_session                ← create / load Conversation       ▲
+  ├── _load_persona (P14)             ← User.metadata.semantic_summary   │
+  ├── _embed_query                                                       │
+  ├── asyncio.gather:                                                    │
+  │   ├── RetrievalOrchestrator                                          │
+  │   │     · Cypher channel (1-hop neighbour by name)                   │
+  │   │     · Vector channel (entity + relationship embeddings)          │
+  │   │     · BM25 channel (Neo4j fulltext)                              │
+  │   │     ──► RRF fusion ──► CrossEncoder rerank ──► chunk hydration   │
+  │   │                                                  + NEXT_CHUNK ±1 │
+  │   └── MemoryService.build         ← working / summary / episodic     │
+  │                                                                       │
+  ├── (optional) agentic loop         ← enable_tools / enable_mutations  │
+  │     · ToolDispatcher    : search_graph / get_entity / verify_claim    │
+  │     · MutationDispatcher: propose_* / update_* / merge_* / soft_del_* │
+  │     ──► curator approval queue at POST /qa/proposals/{id}/apply ─────┘
+  │
+  ├── _generate_answer (system prompt ← persona; user prompt ← memory + sources + question)
+  ├── FaithfulnessChecker             ← per-claim lexical + optional LLM escalation
+  ├── ConversationRepo.append_turn    ← persists turn + query_embedding
+  └── (background) SemanticMemoryService.refresh_persona  ← P14 cross-session
+
+         AskResult: answer, sources, retrieval_trace, memory_trace,
+                    cited_source_indices, tool_calls, faithfulness,
+                    request_id, latency_ms
+─────────────────────────────────────────────────────────────────────────
+
 Cross-cutting
-  ├── PipelineMetrics      ← LLM calls, tokens, latency, cache hit rate
+  ├── PipelineMetrics      ← LLM calls, tokens, latency, cache + faithfulness signals
+  ├── qa_observability     ← per-request id propagation, qa.* loggers, audit log
   ├── LLMDedupCache        ← skip repeat dedup LLM calls within & across runs
   ├── EmbeddingCache       ← skip repeat sentence-transformer encodes
-  └── Job store            ← stage progress, append-only event log, cancel flag
-        │
-        ▼
-REST API (FastAPI, SSE)  ←→  Next.js 14 Frontend (stage timeline, metrics widget)
+  ├── Job store            ← stage progress, event log, cancel flag (ingest side)
+  └── Eval harness         ← gold YAML + ablation matrix + hermetic CI gate
 ```
+
+---
+
+## RAG Q&A Chatbot
+
+A grounded, citation-emitting biomedical assistant that answers questions from the knowledge graph. All 15 phases of [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md) (P0–P14) plus the post-P14 follow-ups (`MutationCard` / `DebugPane` UI, streaming × tool-use combo, gpt-4o-mini QA default) have shipped. The companion roadmap doc is [`docs/RAG_QA_FOLLOWUPS.md`](docs/RAG_QA_FOLLOWUPS.md).
+
+### Design pillars
+
+1. **Hybrid retrieval, fused and reranked** — three channels run in parallel:
+   - **Cypher channel** — 1-hop neighbourhood lookup by name match (preserves graph structure for relational questions).
+   - **Vector channel** — entity-name and relationship-description embeddings (SapBERT default, 768-d cosine).
+   - **BM25 channel** — Neo4j fulltext over chunks + entities (catches identifiers vectors miss).
+
+   Channels are fused via **Reciprocal Rank Fusion**, then a **cross-encoder reranker** (`ms-marco-MiniLM-L-6-v2` by default) reorders the top-N. Hydrated chunks are expanded by **`NEXT_CHUNK ±1`** so a citation always lands in a coherent passage. An **intent classifier** routes questions to per-intent profiles (`lookup` / `relational` / `multi_hop` / `definitional` / `out_of_graph`) that tune top-k + channel weights — the relational profile alone moved recall from 24 % to 36 % on the gold set.
+
+2. **Four memory layers** (§5 of the plan):
+
+   | Layer | Where | Contents |
+   |---|---|---|
+   | Working | in-context, verbatim | Last N=3 user/assistant turns |
+   | Rolling summary | in-context, compressed | LLM-compressed older turns, regenerated on slide |
+   | Episodic | out-of-context, retrievable | Vector-search over `turn_query_vector` index — resolves pronouns like *"what about its side effects?"* |
+   | Persona (P14) | out-of-context, cross-session | Per-user summary on `User.metadata.semantic_summary`; refreshed on session delete + as a background task on new-session create |
+
+3. **Function-calling tool-use** — opt-in per request, both surfaces independent:
+   - **Read-only tools** (`enable_tools=true`): `search_graph`, `get_entity`, `verify_claim`. Validated Pydantic schemas; dispatched against the existing orchestrator + graph repo. Agentic loop capped at `max_tool_calls_per_turn=5`.
+   - **Mutating tools** (`enable_mutations=true`): `propose_entity`, `propose_relationship`, `update_entity`, `merge_entities`, `soft_delete_entity`, `soft_delete_relationship`. **Never apply directly** — every call enqueues a `ProposedMutation` (process-scoped store) that a curator must approve via `POST /qa/proposals/{id}/apply`, which then runs the actual `graph_repo.save_*` paths through `MutationApplier`. Closes §14.6 — "hybrid mutation authority": chat surface, human-in-the-loop apply.
+
+4. **Per-claim faithfulness** — after generation, `FaithfulnessChecker` splits the answer into citation-anchored claims and scores each against its cited chunks. Lexical-only by default (deterministic, latency-free); flip `enable_llm_escalation=True` for stage-3 LLM verdicts on borderline claims. Refusals short-circuit to 1.0 — declining to answer *is* faithful. Aggregate score rides on `AskResponse.faithfulness.overall_score`.
+
+5. **Streaming with tool-use** — `POST /qa/ask/stream` emits `phase` → `retrieval` → `phase("tools")` → `tool_call × N` → `phase("generating")` → `delta × N` → `done`. When tools are off, the streaming path is pure token-by-token; when on, the agentic loop runs to completion first (Option A) and the final answer arrives as a single `delta` — same answer as `/qa/ask`, provider-portable.
+
+6. **Observability + eval-gating** — every turn emits `qa.*` logs tagged with `request_id`, records `qa_request` / `qa_latency` / `qa_context_tokens` / `qa_faithfulness_failure` metrics, and stamps a `RetrievalTrace` (channels run, fusion size, rerank order, hydrated chunks) onto the response. A hermetic CI gate ([`tests/eval/test_eval_smoke.py`](tests/eval/test_eval_smoke.py)) runs the full pipeline against an in-memory mini-graph and asserts floors on precision / recall / F1 / faithfulness; the live counterpart ([`tests/eval/run_rag_eval.py`](tests/eval/run_rag_eval.py)) posts `/qa/ask` and gates on per-intent targets.
+
+### Frontend (`/chat`)
+
+- **Composer toggles** for `enable_tools` / `enable_mutations` (persisted to `localStorage`, off by default).
+- **`MessageBubble`** renders the answer with inline `[n]` citation chips that link to **`SourceCard`** components (per-channel confidence bars + hydrated chunk preview).
+- **`RetrievalTracePane`** (collapsible) shows extracted terms, per-channel hits, RRF→rerank→kept funnel.
+- **`MutationCard`** (inline alongside the bubble whenever a turn proposes a mutation): plain-English summary, pretty-printed args, status pill, inline Approve / Reject buttons, deep-link to `/curation`.
+- **`DebugPane`** (toggled via `?debug=1`): `request_id`, intent, memory trace, tool-calls table, per-claim faithfulness chips. Production users never see it.
+- **`SessionSidebar`** with per-user session list, rename, delete; lightweight browser identity (`X-User-Id` + display name in `localStorage`).
+
+### Quick try
+
+```bash
+# Anonymous one-shot ask
+curl -X POST http://localhost:8000/qa/ask \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"query": "What does Imatinib target?"}'
+
+# Streamed (SSE) with tool-use opted in
+curl -N -X POST http://localhost:8000/qa/ask/stream \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -H "X-User-Id: user_abc123def456" \
+  -d '{
+        "query": "Are there proposed edits to BRCA1?",
+        "enable_tools": true,
+        "enable_mutations": false,
+        "model": "gpt-4o"
+      }'
+
+# A/B the QA LLM against the gold set
+python tests/eval/run_rag_eval.py \
+  --base-url http://localhost:8000 \
+  --gold tests/eval/rag_gold.yaml \
+  --ablations relational_only,vector_only,no_rerank
+```
+
+### Memory + persona refresh triggers
+
+- **Synchronous** on `DELETE /qa/sessions/{id}` — the just-ended session's turns flow into the persona before the session is dropped (`force=True`, `include_session_ids=[...]`).
+- **Background** on new-session creation — `asyncio.create_task` runs `refresh_persona(user_id)`; the freshness gate (`min_new_sessions_to_refresh` + cached `META_COVERS` count) makes it a fast no-op when nothing has changed.
+
+Persona lives at `User.metadata.semantic_summary` (string) + `semantic_embedding` (768-d) + `semantic_summary_covers_sessions` (count) + `semantic_summary_updated_at` (ISO). No schema migration — the `metadata` bag on `:User` was reserved for this in [`user_models.py`](src/graphbuilder/domain/models/user_models.py).
+
+### Phase map
+
+| Phase | Deliverable |
+|---|---|
+| **P0–P2** | Plan + `ConversationRepository` + observability spine |
+| **P3** | Retrieval orchestrator (Cypher + vector + BM25 + RRF + chunk hydration) |
+| **P4** | Cross-encoder rerank + `NEXT_CHUNK ±1` neighbour expansion |
+| **P5** | `/qa/ask` endpoint |
+| **P6** | Working memory + rolling summary |
+| **P7** | Episodic recall via `turn_query_vector` |
+| **P8** | Per-claim faithfulness check + eval plumbing |
+| **P9** | Read-only tool-use (`search_graph` / `get_entity` / `verify_claim`) |
+| **P10** | Mutating tool-use queued into `/curation` |
+| **P11** | SSE streaming endpoint |
+| **P12** | `/chat` page with citations + per-source confidence + retrieval trace |
+| **P13** | Eval harness — gold set, metrics, ablations, hermetic CI gate, live CLI |
+| **P14** | Cross-session semantic memory + per-user persona summary |
+| **+ §9.9** | Intent-aware retrieval routing (relational recall 24 % → 36 %) |
+| **+ Identity** | Lightweight browser identity (`X-User-Id`, ownership rules) — §14.1 |
+| **+ MutationCard / DebugPane** | `/chat` UI for §7 + §8.5 (post-P14 follow-up §1) |
+| **+ Streaming × tool-use** | `/qa/ask/stream` honours `enable_tools` / `enable_mutations` (post-P14 follow-up §3) |
+| **+ Q2 QA model split** | `gpt-4o-mini` default for QA flow + per-request `AskRequest.model` override (post-P14 follow-up §2) |
+
+See [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md) for the full design rationale + the "Implementation refinements" log explaining where the shipped code drifted from the original sketch.
 
 ---
 
@@ -197,7 +339,8 @@ All settings are read from environment variables (loaded from `.env` via `python
 | Variable | Default | Description |
 |---|---|---|
 | `LLM_PROVIDER` | `azure_openai` | `openai` \| `azure_openai` |
-| `LLM_MODEL_NAME` | `gpt-4o` | Model or Azure deployment name |
+| `LLM_MODEL_NAME` | `gpt-4o` | Default model — used by ingestion (entity/relationship extraction, dedup) where quality matters most |
+| `QA_LLM_MODEL_NAME` | `gpt-4o-mini` | **§14 Q2 resolution** — cheaper model used by the QA flow (answer generation, faithfulness escalation, persona summarisation). Per-request override via `AskRequest.model` (e.g. opt into `gpt-4o` for a single ask). |
 | `LLM_API_KEY` | *(required)* | API key |
 | `LLM_API_ENDPOINT` | *(required for Azure)* | `https://<resource>.openai.azure.com` |
 | `LLM_API_VERSION` | `2024-02-01` | Azure API version |
@@ -500,12 +643,31 @@ drug→mechanisms-of-action + indications; variant→transcript consequences;
 study→trait diseases. Re-ingesting the same root is a no-op thanks to
 the cascading dedup in `save_entities_batch`.
 
+### RAG Q&A Chatbot
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/qa/ask` | Single-turn chat. Body: `query`, optional `session_id`, `top_k`, `enable_tools`, `enable_mutations`, `model`, `ablation`. Returns `answer`, `sources`, `cited_source_indices`, `retrieval_trace`, `memory_trace`, `tool_calls`, `faithfulness`, `request_id`, `latency_ms`. |
+| POST | `/qa/ask/stream` | SSE counterpart. Events: `phase` → `retrieval` → (`phase("tools")` → `tool_call × N`) → `phase("generating")` → `delta × N` → `done`. Honours `enable_tools` + `enable_mutations`. Error path emits a single `error` event with a `kind`. |
+| GET | `/qa/sessions` | List sessions (filterable by `user_id`, falls back to header `X-User-Id`). |
+| GET | `/qa/sessions/{id}` | Session + ordered turns. Ownership enforced (mismatch returns 404 to avoid leaking existence). |
+| DELETE | `/qa/sessions/{id}` | Detach-delete. **Synchronously refreshes the user's persona** before drop (P14). |
+| POST | `/qa/turns/{id}/feedback` | Per-turn thumbs (`rating: -1/0/1`, optional `comment`). |
+| GET | `/qa/proposals` | List chatbot-proposed mutations (filterable by status). |
+| POST | `/qa/proposals/{id}/apply` | Curator approves and applies via `MutationApplier`. |
+| POST | `/qa/proposals/{id}/reject` | Curator rejects with optional notes. |
+| POST | `/users` | Mint a new `:User` (lightweight browser identity, §14.1). |
+| GET | `/users/{id}` | Fetch user (id + display_name + metadata incl. persona fields). |
+| PATCH | `/users/{id}` | Rename + metadata patch. |
+
 ### Curation
 
 | Method | Path | Description |
 |---|---|---|
 | POST | `/curation/events` | Submit batch curation events (approve / reject / correct) |
 | GET | `/curation/queue` | View items pending review (filterable by status) |
+| GET | `/curation/queue/counts` | Per-status counts (rejected / flagged / unverified) for entities + relationships |
+| GET | `/curation/audit` | Recent audit log entries (chat-originated rows tagged `actor.kind="chat"`) |
 
 ### Verification
 
@@ -532,11 +694,14 @@ CSLGraphBuilder/
 ├── api/                                # FastAPI application
 │   ├── main.py                         # App factory, CORS, router registration
 │   ├── auth.py                         # X-API-Key guard
-│   ├── dependencies.py                 # FastAPI Depends() factories
+│   ├── dependencies.py                 # FastAPI Depends() factories (+ user_repo, conversation_repo singletons)
 │   ├── job_store.py                    # Job model w/ stages, events, cancel flag
 │   ├── review_store.py                 # In-memory conflict review store
-│   ├── routers/                        # health (+metrics), graph, documents, ingest, curation, verification, export
-│   └── schemas/                        # Pydantic request/response models
+│   ├── proposed_mutation_store.py      # Process-scoped chatbot-mutation queue (P10)
+│   ├── routers/                        # health(+metrics), graph, documents, ingest, curation, verification, export, qa, users, dev
+│   │   ├── qa.py                       # /qa/ask, /qa/ask/stream, /qa/sessions, /qa/proposals/*  (P5 + P9-P11 + P14)
+│   │   └── users.py                    # /users — lightweight browser identity (§14.1)
+│   └── schemas/                        # Pydantic request/response models (incl. AskRequest, AskResponse, ToolCallModel, FaithfulnessModel, ProposedMutationModel)
 ├── frontend/                           # Next.js 14 frontend
 │   ├── app/
 │   │   ├── page.tsx                    # Dashboard (graph stats + Pipeline Performance widget + recent jobs)
@@ -544,20 +709,30 @@ CSLGraphBuilder/
 │   │   ├── process/                    # Document ingestion (stage timeline + cancel + result summary)
 │   │   ├── ingest/                     # Open Targets / PubMed / Web Crawl, all rendered with the shared timeline
 │   │   ├── documents/                  # Job History — split-pane list + live stage timeline
-│   │   ├── curation/                   # Manual curation queue
+│   │   ├── curation/                   # Manual curation queue (incl. chatbot-proposed mutations)
 │   │   ├── verification/               # Verification + conflict detection + pending reviews
+│   │   ├── chat/                       # RAG Q&A — composer with Tools/Mutations toggles + ?debug=1 pane
 │   │   └── export/                     # Graph export
 │   ├── components/
 │   │   ├── Nav.tsx                     # Sidebar navigation
 │   │   ├── JobTimeline.tsx             # Reusable stage timeline + event log + cancel
+│   │   ├── chat/
+│   │   │   ├── MessageBubble.tsx       # Assistant answer + [n] citation chips
+│   │   │   ├── SourceCard.tsx          # Per-channel confidence + chunk preview
+│   │   │   ├── RetrievalTracePane.tsx  # Collapsible "show your work" panel
+│   │   │   ├── MutationCard.tsx        # Inline card for chatbot-proposed mutations (P10)
+│   │   │   ├── DebugPane.tsx           # ?debug=1 developer pane (§8.5)
+│   │   │   ├── SessionSidebar.tsx      # Per-user session list
+│   │   │   └── IdentityPrompt.tsx      # First-visit display-name prompt
 │   │   └── Providers.tsx               # React Query provider
 │   └── lib/
-│       ├── api.ts                      # Typed API client (incl. Job, JobSummary, PipelineMetrics)
+│       ├── api.ts                      # Typed API client (Job, AskResponse, ToolCall, FaithfulnessResult, ProposedMutation, ChatUser)
+│       ├── identity.ts                 # localStorage user_id + display_name
 │       └── useJobStream.ts             # SSE subscription with polling fallback
 ├── src/graphbuilder/                   # Installable Python package
 │   ├── cli/main.py                     # Click CLI entry point
 │   ├── application/use_cases/
-│   │   ├── document_pipeline.py        # NEW: lean stage-aware orchestrator with caches + cancel + parallel chunks
+│   │   ├── document_pipeline.py        # Stage-aware orchestrator with caches + cancel + parallel chunks
 │   │   ├── document_processing.py      # Legacy task-state-machine (still covered by tests)
 │   │   ├── pubmed_ingestion.py
 │   │   ├── open_targets_ingestion.py
@@ -566,25 +741,58 @@ CSLGraphBuilder/
 │   │   ├── conflict_detection.py
 │   │   ├── curation.py
 │   │   └── graph_visualization.py
-│   ├── core/                           # Pure domain algorithms (chunking, transformer, verification cascade)
-│   ├── domain/                         # Models + repository interfaces
+│   ├── core/
+│   │   ├── graph/                      # Chunking, transformer, schema extraction
+│   │   ├── verification/               # Cascading verifier (text → embedding → LLM)
+│   │   ├── retrieval/                  # RAG Q&A stack (P3-P14)
+│   │   │   ├── orchestrator.py         # Hybrid retrieval: cypher + vector + BM25 + RRF + hydration
+│   │   │   ├── channels.py             # Per-channel implementations
+│   │   │   ├── rrf.py                  # Reciprocal Rank Fusion
+│   │   │   ├── reranker.py             # Cross-encoder rerank (ms-marco-MiniLM-L-6-v2)
+│   │   │   ├── intent.py               # Rule-based classifier + per-intent profiles (§9.9)
+│   │   │   ├── memory.py               # Working / rolling-summary / episodic layers (P6 + P7)
+│   │   │   ├── semantic_memory.py      # Cross-session persona summary (P14)
+│   │   │   ├── faithfulness.py         # Per-claim lexical + optional LLM escalation (P8)
+│   │   │   ├── tools.py                # Read-only ToolDispatcher (P9)
+│   │   │   ├── mutation_tools.py       # Mutating dispatcher — enqueues into proposal store (P10)
+│   │   │   ├── mutation_applier.py     # Curator-approved apply path
+│   │   │   ├── term_extraction.py      # Query-term extraction for BM25 + cypher anchors
+│   │   │   ├── models.py               # RetrievalConfig, RetrievedItem, RetrievalTrace
+│   │   │   └── qa_service.py           # ask() + ask_stream() glue — memory + retrieval + LLM + faithfulness + persistence
+│   │   └── eval/                       # P13 eval harness (gold loader, metrics, async runner, CSV/markdown reports)
+│   ├── domain/
+│   │   ├── models/
+│   │   │   ├── graph_models.py
+│   │   │   ├── conversation_models.py  # ConversationSession + ConversationTurn (P1)
+│   │   │   ├── user_models.py          # :User with metadata bag for persona (§14.1 + P14)
+│   │   │   └── processing_models.py
+│   │   └── repository interfaces       # ConversationRepository + UserRepository + GraphRepository
 │   └── infrastructure/
-│       ├── config/settings.py          # GraphBuilderConfig (env-var driven)
+│       ├── config/settings.py          # GraphBuilderConfig (env-var driven; LLMConfiguration.qa_model_name)
 │       ├── crawlers/                   # web crawler (with cache), sync, json, file crawlers
 │       ├── database/neo4j_client.py
 │       ├── external/                   # open_targets_client, pubmed_client
-│       ├── repositories/               # Neo4j + in-memory document/graph repositories (vector search)
+│       ├── repositories/
+│       │   ├── graph_repository.py     # Neo4j + in-memory entity/relationship repos with vector search
+│       │   ├── document_repository.py  # Document + chunk persistence
+│       │   ├── conversation_repository.py  # Sessions + turns + turn_query_vector (P1+P7)
+│       │   └── user_repository.py      # :User CRUD (lightweight browser identity)
 │       └── services/
-│           ├── llm_service.py          # LLM extraction + dedup; records to PipelineMetrics
-│           ├── content_extractor.py
-│           ├── metrics.py              # process-wide PipelineMetrics singleton
+│           ├── llm_service.py          # generate_text / generate_text_stream / generate_with_tools — per-call `model` kwarg (Q2)
+│           ├── qa_observability.py     # request_id propagation, qa.* loggers, audit log
+│           ├── metrics.py              # process-wide PipelineMetrics singleton (incl. qa_request, qa_latency, qa_faithfulness_failure)
 │           ├── cache.py                # LLMDedupCache + EmbeddingCache (async LRU)
 │           ├── embedding_factory.py    # Single source of truth for the embedder; sync + async + batched APIs
-│           └── gpu_embedding_pool.py   # NEW: multi-worker GPU pool (per-worker model + CUDA stream)
+│           └── gpu_embedding_pool.py   # Multi-worker GPU pool (per-worker model + CUDA stream)
+├── scripts/
+│   ├── dedup_entities.py               # Cross-type entity dedup CLI (BRCA1 Concept + Brca1 Gene → merge)
+│   ├── investigate_channels.py         # Per-channel diagnostic over the gold set
+│   └── seed_gold_from_curation.py      # §14 Q5 — mine approved curation rows into a YAML gold draft
 ├── tests/
-│   ├── unit/                           # Unit tests
-│   ├── integration/                    # Includes test_document_pipeline.py covering the new orchestrator
-│   └── e2e/                            # FastAPI TestClient + in-memory graph
+│   ├── unit/                           # Unit tests (incl. test_memory.py, test_semantic_memory.py, test_qa_service.py)
+│   ├── integration/                    # Stage-aware pipeline coverage
+│   ├── eval/                           # Gold set (rag_gold.yaml) + hermetic smoke gate (test_eval_smoke.py) + live runner (run_rag_eval.py)
+│   └── e2e/                            # FastAPI TestClient + in-memory graph (incl. test_curation_queue.py for chatbot proposals)
 ├── Dockerfile.api
 ├── Dockerfile.frontend
 ├── docker-compose.yml
@@ -616,17 +824,17 @@ CSLGraphBuilder/
 | Layer | Responsibility | Allowed dependencies |
 |---|---|---|
 | `cli/` | Argument parsing and output only. No business logic. | Click, Rich |
-| `api/` | HTTP transport, request validation, async job dispatch. | FastAPI, Pydantic |
-| `application/use_cases/` | Orchestrates the full pipeline via interfaces. No direct I/O. | None (calls domain interfaces) |
-| `core/` | Pure domain algorithms: chunking, graph transformation, schema extraction, verification. Stateless. | LangChain (transformer only) |
+| `api/` | HTTP transport, request validation, async job dispatch. The `qa.py` router owns the `QAService` singleton and injects the read + mutating tool dispatchers via setters — `core/` never imports `api/`. | FastAPI, Pydantic |
+| `application/use_cases/` | Orchestrates the full ingestion pipeline via interfaces. No direct I/O. | None (calls domain interfaces) |
+| `core/` | Pure domain algorithms: chunking, graph transformation, schema extraction, verification, **retrieval orchestration + RAG Q&A glue (`core/retrieval/`)**, **eval harness (`core/eval/`)**. Stateless. | LangChain (transformer only), sentence-transformers (rerank model) |
 | `domain/` | Data models and repository interfaces. No implementation. | Pydantic |
-| `infrastructure/` | All external integrations: Neo4j, LLM APIs, crawlers, file parsers, embeddings. | All external libs |
+| `infrastructure/` | All external integrations: Neo4j, LLM APIs, crawlers, file parsers, embeddings, **conversation + user repositories**. | All external libs |
 
 ---
 
 ## Testing
 
-The project has **196 tests** across three tiers:
+The project has **485 tests** across four tiers:
 
 ```bash
 # Run all tests
@@ -636,13 +844,19 @@ python -m pytest tests/ -v
 python -m pytest tests/unit/ -v         # Fast, no external deps
 python -m pytest tests/integration/ -v  # Mocked repos/services
 python -m pytest tests/e2e/ -v          # FastAPI TestClient + in-memory graph
+python -m pytest tests/eval/ -v         # Hermetic eval smoke gate + metric maths
+
+# Live eval (requires running API + Neo4j with ingested gold-set sources)
+python tests/eval/run_rag_eval.py --base-url http://localhost:8000 \
+    --gold tests/eval/rag_gold.yaml --ablations relational_only,vector_only
 ```
 
 | Tier | What it covers |
 |---|---|
-| **Unit** | Verification pipeline (text match, embedding, LLM, cascading), graph transformer, processor, LLM dedup methods, embedding helpers |
-| **Integration** | Legacy document processing use case, LLM service, entity extraction with dedup, relationship extraction with entity resolution, **new `DocumentExtractionPipeline`** (stage emission, cooperative cancel, dedup-cache reuse) |
-| **E2E** | Full API pipeline (health → graph → curation → export), PubMed/OpenTargets ingest, extraction pipeline with dedup |
+| **Unit** | Verification pipeline (text match / embedding / LLM / cascading), graph transformer, processor, LLM dedup methods, embedding helpers, **`MemoryService` (P6+P7)**, **`SemanticMemoryService` (P14)**, **`QAService.ask` + `ask_stream` (P5+P11)**, **`FaithfulnessChecker` (P8)**, **`ToolDispatcher` + `MutationToolDispatcher` (P9+P10)**, intent classifier (§9.9), user identity (§14.1), per-call LLM model override (§14 Q2). |
+| **Integration** | Legacy document processing use case, LLM service, entity extraction with dedup, relationship extraction with entity resolution, `DocumentExtractionPipeline` (stage emission, cooperative cancel, dedup-cache reuse). |
+| **E2E** | Full API pipeline (health → graph → curation → export), PubMed / OpenTargets ingest, extraction pipeline with dedup, **chatbot curation queue (`test_curation_queue.py` — proposal lifecycle from `/qa/ask` through `/qa/proposals/{id}/apply`)**. |
+| **Eval** | Hermetic smoke gate ([`test_eval_smoke.py`](tests/eval/test_eval_smoke.py)) runs the full retrieval + memory + LLM stub + faithfulness pipeline against an in-memory mini-graph and asserts floors on precision / recall / F1 / faithfulness. Metric maths covered by [`test_eval_metrics.py`](tests/eval/test_eval_metrics.py). |
 
 All external dependencies (Neo4j, LLM APIs) are mocked. Tests use `asyncio_mode = "auto"` via pytest-asyncio.
 

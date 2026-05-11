@@ -27,7 +27,7 @@ import {
   ChatSession,
   ChatTurn,
   RetrievalTrace,
-  askQuestion,
+  askQuestionStream,
   formatApiError,
   getChatSession,
   getChatUser,
@@ -39,27 +39,36 @@ import {
   onIdentityChange,
   setStoredIdentity,
 } from '@/lib/identity';
+import DebugPane from '@/components/chat/DebugPane';
 import IdentityPrompt from '@/components/chat/IdentityPrompt';
 import MessageBubble from '@/components/chat/MessageBubble';
+import { MutationCard, isMutationToolCall } from '@/components/chat/MutationCard';
 import SessionSidebar from '@/components/chat/SessionSidebar';
 
 interface UITurn {
   query: string;
-  /** ``null`` while the answer is in flight. */
+  /** ``null`` until retrieval completes; a partial ``AskResponse`` (empty
+   *  ``answer`` growing via SSE deltas, no ``turn_id`` yet) while the
+   *  answer streams; the full response once the stream's ``done`` lands. */
   response: AskResponse | null;
+  /** True while SSE deltas are still arriving for this turn. */
+  streaming?: boolean;
   /** Local-only id used as the React list key for in-flight turns. */
   localId: string;
 }
 
 /** Inflate a persisted ChatTurn (from GET /qa/sessions/{id}) into the
  *  same shape POST /qa/ask returns, so MessageBubble doesn't care which
- *  side of the wall the data came from. */
+ *  side of the wall the data came from.
+ *
+ *  Turns persisted by QAService now carry a `retrieval_snapshot` in
+ *  their metadata (compact source list + cited indices + trace), so a
+ *  reopened session renders the same source cards + trace pane as a
+ *  live ask. Older turns predating that snapshot fall back to an empty
+ *  trace — the answer text + citation markers still render. */
 function turnToUITurn(t: ChatTurn): UITurn {
-  // Persisted turns don't currently round-trip the full source list +
-  // retrieval trace. We synthesise an empty trace so MessageBubble can
-  // still render the answer + citation chips; sources will appear empty
-  // for replayed turns until we extend the schema.
-  const trace: RetrievalTrace = {
+  const snap = t.metadata?.retrieval_snapshot;
+  const trace: RetrievalTrace = snap?.retrieval_trace ?? {
     query: t.user_query,
     extracted_terms: [],
     channels: [] as ChannelTrace[],
@@ -72,8 +81,8 @@ function turnToUITurn(t: ChatTurn): UITurn {
     session_id: t.session_id,
     turn_id: t.id,
     answer: t.llm_answer,
-    sources: [],
-    cited_source_indices: [],
+    sources: snap?.sources ?? [],
+    cited_source_indices: snap?.cited_source_indices ?? [],
     retrieval_trace: trace,
     request_id: t.request_id ?? null,
     latency_ms: t.latency_ms,
@@ -89,12 +98,50 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
+  // The in-flight SSE stream (POST /qa/ask/stream), so we can cancel it
+  // on unmount, on a new submit, or when the user navigates sessions.
+  const streamRef = useRef<AbortController | null>(null);
+
+  function abortInFlight() {
+    if (streamRef.current) {
+      streamRef.current.abort();
+      streamRef.current = null;
+      setSending(false);
+    }
+  }
+  // Cancel any open stream when the page unmounts.
+  useEffect(() => () => streamRef.current?.abort(), []);
 
   // Identity. ``identityChecked`` distinguishes "still hydrating from
   // localStorage on the client" (don't render anything yet) from
   // "definitely no identity, show the prompt".
   const [identity, setIdentity] = useState<ChatIdentity | null>(null);
   const [identityChecked, setIdentityChecked] = useState(false);
+
+  // Tool-use opt-ins (P9 / P10). Off by default — production traffic
+  // answers most questions from the upfront retrieval alone, and the
+  // agentic loop adds latency + LLM cost. Persisted to localStorage so
+  // the SME's last choice survives refreshes.
+  const [enableTools, setEnableTools] = useState<boolean>(false);
+  const [enableMutations, setEnableMutations] = useState<boolean>(false);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    setEnableTools(window.localStorage.getItem('chat:enableTools') === '1');
+    setEnableMutations(window.localStorage.getItem('chat:enableMutations') === '1');
+  }, []);
+  function persistToggle(key: 'enableTools' | 'enableMutations', value: boolean) {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(`chat:${key}`, value ? '1' : '0');
+  }
+
+  // Debug pane (§8.5) — controlled by ``?debug=1`` query param. Done as
+  // a one-time check on mount rather than a route subscription because
+  // toggling it mid-session shouldn't change the rendering retroactively.
+  const [debugMode, setDebugMode] = useState<boolean>(false);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    setDebugMode(new URLSearchParams(window.location.search).get('debug') === '1');
+  }, []);
 
   // Hydrate identity once on mount + listen for storage events so a
   // sign-in or sign-out in another tab updates this one.
@@ -151,8 +198,20 @@ export default function ChatPage() {
   // When the user picks a session from the sidebar, inflate persisted
   // turns. Skipped while sending so we don't overwrite the in-flight
   // turn with stale data from the server.
+  //
+  // CRUCIAL: only reload when the session id change came from
+  // ``handleSelect`` (sidebar click). After the first ask in a new
+  // chat we call ``setSessionId(resp.session_id)`` ourselves — at that
+  // point the in-state turns already hold the FULL response (sources +
+  // retrieval trace), which is strictly richer than what
+  // ``GET /qa/sessions/{id}`` returns (persisted turns don't currently
+  // round-trip sources/trace). Reloading here would clobber that with
+  // empty-trace stubs — that's the "0 sources / 0 channels" bug.
+  const sidebarPickRef = useRef<string | null>(null);
   useEffect(() => {
     if (!sessionId || sending) return;
+    if (sidebarPickRef.current !== sessionId) return;
+    sidebarPickRef.current = null;
     let cancelled = false;
     (async () => {
       try {
@@ -176,6 +235,7 @@ export default function ChatPage() {
   }, [turns]);
 
   function handleNew() {
+    abortInFlight();
     setSessionId(null);
     setTurns([]);
     setError(null);
@@ -183,10 +243,14 @@ export default function ChatPage() {
   }
 
   function handleSelect(id: string) {
+    abortInFlight();
+    // Mark this id as a sidebar pick so the load effect knows to
+    // re-fetch its turns (vs a session id we minted ourselves on an ask).
+    sidebarPickRef.current = id;
     setSessionId(id);
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const q = draft.trim();
     if (!q || sending) return;
@@ -197,31 +261,117 @@ export default function ChatPage() {
     setDraft('');
     setSending(true);
     setError(null);
+    streamRef.current?.abort();
 
-    try {
-      const resp = await askQuestion({
+    // Mutate just this turn in the list.
+    const update = (fn: (t: UITurn) => UITurn) =>
+      setTurns((prev) => prev.map((t) => (t.localId === localId ? fn(t) : t)));
+    // Capture the session id at submit time — used for the partial
+    // response's session_id until `done` carries the real one.
+    const startSessionId = sessionId;
+
+    // Holds the controller for *this* stream so the callbacks can detect
+    // that they've been superseded (a new submit) or cancelled (session
+    // switch / unmount) and bail without touching unrelated state.
+    let controller: AbortController;
+    const isCurrent = () => streamRef.current === controller;
+
+    controller = askQuestionStream(
+      {
         query: q,
-        session_id: sessionId ?? undefined,
-      });
-      // Replace the pending turn with the real response.
-      setTurns((prev) =>
-        prev.map((t) => (t.localId === localId ? { ...t, response: resp } : t)),
-      );
-      // First turn → adopt the new session id. Subsequent turns reuse it.
-      if (!sessionId) setSessionId(resp.session_id);
-      // Refresh the sidebar (turn_count + last_active_at moved).
-      qc.invalidateQueries({ queryKey: ['chat-sessions'] });
-    } catch (err) {
-      setError(formatApiError(err, 'Could not get an answer'));
-      // Drop the pending bubble so the user can retry without an empty turn.
-      setTurns((prev) => prev.filter((t) => t.localId !== localId));
-    } finally {
-      setSending(false);
-    }
+        session_id: startSessionId ?? undefined,
+        enable_tools: enableTools || undefined,
+        enable_mutations: enableMutations || undefined,
+      },
+      {
+        // Retrieval done → swap the "thinking…" pending turn for a partial
+        // response holding the sources + traces. The answer fills in via
+        // deltas; turn_id / cited indices / latency arrive with `done`.
+        onRetrieval: (d) => {
+          if (!isCurrent()) return;
+          update((t) => ({
+            ...t,
+            streaming: true,
+            response: {
+              session_id: startSessionId ?? '',
+              turn_id: '',
+              answer: '',
+              sources: d.sources,
+              cited_source_indices: [],
+              retrieval_trace: d.retrieval_trace,
+              memory_trace: d.memory_trace ?? null,
+              request_id: null,
+              latency_ms: 0,
+              tool_calls: [],
+            },
+          }));
+        },
+        onToolCall: (call) => {
+          if (!isCurrent()) return;
+          update((t) =>
+            t.response
+              ? {
+                  ...t,
+                  response: {
+                    ...t.response,
+                    tool_calls: [...(t.response.tool_calls ?? []), call],
+                  },
+                }
+              : t,
+          );
+        },
+        onDelta: (text) => {
+          if (!isCurrent()) return;
+          update((t) =>
+            t.response
+              ? { ...t, response: { ...t.response, answer: t.response.answer + text } }
+              : t,
+          );
+        },
+        onDone: (d) => {
+          if (!isCurrent()) return;
+          update((t) =>
+            t.response
+              ? {
+                  ...t,
+                  streaming: false,
+                  response: {
+                    ...t.response,
+                    session_id: d.session_id,
+                    turn_id: d.turn_id,
+                    answer: d.answer,
+                    cited_source_indices: d.cited_source_indices,
+                    faithfulness: d.faithfulness ?? null,
+                    tool_calls: d.tool_calls ?? t.response.tool_calls ?? [],
+                    request_id: d.request_id ?? null,
+                    latency_ms: d.latency_ms,
+                  },
+                }
+              : t,
+          );
+          if (!startSessionId) setSessionId(d.session_id);
+          qc.invalidateQueries({ queryKey: ['chat-sessions'] });
+          setSending(false);
+          streamRef.current = null;
+        },
+        onError: (msg) => {
+          if (!isCurrent()) return;
+          // The SSE client already normalised the error to a readable
+          // string (HTTP `detail`, transport error, or server `error` event).
+          setError(msg || 'Could not get an answer');
+          // Drop the pending bubble so the user can retry without an empty turn.
+          setTurns((prev) => prev.filter((t) => t.localId !== localId));
+          setSending(false);
+          streamRef.current = null;
+        },
+      },
+    );
+    streamRef.current = controller;
   }
 
   function handleDeleted(id: string) {
     if (id === sessionId) {
+      abortInFlight();
       setSessionId(null);
       setTurns([]);
     }
@@ -305,14 +455,27 @@ export default function ChatPage() {
               </div>
             )}
 
-            {turns.map((t) => (
-              <MessageBubble
-                key={t.localId}
-                query={t.query}
-                response={t.response}
-                pending={t.response === null}
-              />
-            ))}
+            {turns.map((t) => {
+              const mutationCalls = (t.response?.tool_calls ?? []).filter(
+                isMutationToolCall,
+              );
+              return (
+                <div key={t.localId}>
+                  <MessageBubble
+                    query={t.query}
+                    response={t.response}
+                    pending={t.response === null}
+                    streaming={t.streaming}
+                  />
+                  {mutationCalls.map((call, i) => (
+                    <MutationCard key={`mut-${t.localId}-${i}`} call={call} />
+                  ))}
+                  {debugMode && t.response && !t.streaming && (
+                    <DebugPane response={t.response} forceOpen={false} />
+                  )}
+                </div>
+              );
+            })}
 
             {error && (
               <div
@@ -364,12 +527,44 @@ export default function ChatPage() {
                   <span className="hidden sm:inline">Send</span>
                 </button>
               </div>
-              <p
-                className="text-[10px] mt-1.5"
-                style={{ color: 'var(--text-muted)' }}
-              >
-                Enter to send · Shift+Enter for newline · Citations like [1] in the answer link to the matching source card.
-              </p>
+              <div className="flex items-center justify-between gap-2 mt-1.5">
+                <p
+                  className="text-[10px]"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  Enter to send · Shift+Enter for newline · Citations like [1] in the answer link to the matching source card.
+                </p>
+                <div className="flex items-center gap-3 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                  <label className="inline-flex items-center gap-1 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={enableTools}
+                      onChange={(e) => {
+                        setEnableTools(e.target.checked);
+                        persistToggle('enableTools', e.target.checked);
+                      }}
+                      className="w-3 h-3"
+                    />
+                    <span title="Let the LLM call search_graph / get_entity / verify_claim before answering">
+                      Tools
+                    </span>
+                  </label>
+                  <label className="inline-flex items-center gap-1 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={enableMutations}
+                      onChange={(e) => {
+                        setEnableMutations(e.target.checked);
+                        persistToggle('enableMutations', e.target.checked);
+                      }}
+                      className="w-3 h-3"
+                    />
+                    <span title="Let the LLM propose graph mutations — each call queues a proposal in /curation, nothing applies automatically">
+                      Mutations
+                    </span>
+                  </label>
+                </div>
+              </div>
             </form>
           )}
         </div>
@@ -380,11 +575,15 @@ export default function ChatPage() {
 
 function WelcomeCard({ onUseExample }: { onUseExample: (q: string) => void }) {
   // Examples are wired to clicks, not auto-submitted, so the user can
-  // tweak before sending.
+  // tweak before sending. These map onto Open-Targets-ingested entities
+  // that carry a real description (EGFR, KRAS, Parkinson's disease) so
+  // the bot has citable prose even though those nodes have no source
+  // chunks. Topics absent from the corpus get an honest "I cannot find
+  // this" refusal.
   const examples = [
-    'What does Imatinib target?',
-    'Tell me about BCR-ABL.',
-    'Which drugs treat chronic myeloid leukaemia?',
+    'What is EGFR?',
+    'Tell me about KRAS.',
+    "What is Parkinson's disease?",
   ];
   return (
     <div

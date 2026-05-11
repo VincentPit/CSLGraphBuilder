@@ -16,10 +16,17 @@ import RetrievalTracePane from './RetrievalTracePane';
 
 interface Props {
   query: string;
-  /** ``null`` while the answer is still streaming back. */
+  /** ``null`` before retrieval completes; a partial ``AskResponse`` (empty
+   *  ``answer`` accreting via SSE deltas, ``turn_id`` not yet assigned)
+   *  while streaming; the full response once ``done`` lands. */
   response: AskResponse | null;
-  /** When true, render a "thinking…" state instead of the answer body. */
+  /** When true, render a "thinking…" state instead of the answer body.
+   *  (No retrieval result yet — nothing to show.) */
   pending?: boolean;
+  /** When true, the answer is mid-stream: sources are already populated,
+   *  the answer text is growing, ``cited_source_indices`` + ``turn_id``
+   *  + ``latency_ms`` aren't final yet. */
+  streaming?: boolean;
   /** Optional override of where citations scroll to (for embedded views). */
   scrollToSource?: (sourceId: string) => void;
 }
@@ -122,16 +129,33 @@ function FeedbackButtons({ turnId }: { turnId: string }) {
   );
 }
 
-export default function MessageBubble({ query, response, pending, scrollToSource }: Props) {
+export default function MessageBubble({ query, response, pending, streaming, scrollToSource }: Props) {
   const sources = response?.sources ?? [];
   const cited = new Set(response?.cited_source_indices ?? []);
+  // DOM ids for the source cards must be unique across the whole thread,
+  // otherwise getElementById(`source-1`) always resolves to the FIRST
+  // turn's card. Namespace by turn id so a `[1]` chip on turn 3 scrolls
+  // to turn 3's source #1, not turn 1's.
+  const domNs = response?.turn_id ?? 'pending';
+  const sourceDomId = (n: number) => `source-${domNs}-${n}`;
+
+  // Source rows split into "cited in the answer" vs "retrieved but not
+  // cited". By default we only render the cited ones — the rest are a
+  // noisy tail (rerank still keeps low-relevance hits to give the LLM
+  // options) so they go behind a toggle. On a refusal nothing is cited,
+  // so the default view is empty (just the header + a "show N" toggle).
+  const rows = sources.map((s, i) => ({ s, n: i + 1 }));
+  const citedRows = rows.filter((r) => cited.has(r.n));
+  const uncitedRows = rows.filter((r) => !cited.has(r.n));
+  const [sourcesExpanded, setSourcesExpanded] = useState(false);
+  const visibleRows = sourcesExpanded ? rows : citedRows;
 
   function handleCitationClick(idx: number) {
     if (scrollToSource && sources[idx - 1]) {
       scrollToSource(sources[idx - 1].id);
       return;
     }
-    const el = document.getElementById(`source-${idx}`);
+    const el = document.getElementById(sourceDomId(idx));
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
@@ -200,6 +224,22 @@ export default function MessageBubble({ query, response, pending, scrollToSource
                     />
                   ),
                 )}
+                {/* Streaming: blinking caret after the partial answer, or a
+                    "generating…" hint if the first delta hasn't landed yet
+                    (retrieval finished but the LLM hasn't emitted a token). */}
+                {streaming &&
+                  (tokens.length === 0 ? (
+                    <span
+                      className="inline-flex items-center gap-2"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      <Loader2 size={14} className="animate-spin" /> generating…
+                    </span>
+                  ) : (
+                    <span className="animate-pulse" aria-hidden="true">
+                      ▍
+                    </span>
+                  ))}
               </>
             )}
           </div>
@@ -210,33 +250,56 @@ export default function MessageBubble({ query, response, pending, scrollToSource
               style={{ color: 'var(--text-muted)' }}
             >
               <span>
-                {response.sources.length} source{response.sources.length === 1 ? '' : 's'} ·{' '}
-                {response.latency_ms}ms
-                {response.request_id && ` · ${response.request_id}`}
+                {response.sources.length} source{response.sources.length === 1 ? '' : 's'}
+                {streaming ? (
+                  ' · streaming…'
+                ) : (
+                  <>
+                    {' · '}
+                    {response.latency_ms}ms
+                    {response.request_id && ` · ${response.request_id}`}
+                  </>
+                )}
               </span>
-              <FeedbackButtons turnId={response.turn_id} />
+              {/* Feedback needs a real turn id — only available once the
+                  stream's `done` event has assigned one. */}
+              {response.turn_id && <FeedbackButtons turnId={response.turn_id} />}
             </div>
           )}
 
           {response && sources.length > 0 && (
             <div className="space-y-2">
-              <p
-                className="text-[10px] font-bold uppercase tracking-widest"
-                style={{ color: 'var(--text-muted)' }}
-              >
-                Sources
-              </p>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
-                {sources.map((s, i) => (
-                  <div key={s.id + ':' + i} id={`source-${i + 1}`}>
-                    <SourceCard
-                      index={i + 1}
-                      source={s}
-                      cited={cited.has(i + 1)}
-                    />
-                  </div>
-                ))}
+              <div className="flex items-center justify-between gap-2">
+                <p
+                  className="text-[10px] font-bold uppercase tracking-widest"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {citedRows.length > 0 ? 'Cited sources' : 'Retrieved sources'}
+                </p>
+                {uncitedRows.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setSourcesExpanded((v) => !v)}
+                    className="text-[10px] hover:underline shrink-0"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    {sourcesExpanded
+                      ? 'Hide retrieved'
+                      : citedRows.length > 0
+                        ? `+ ${uncitedRows.length} more retrieved`
+                        : `Show ${uncitedRows.length} retrieved sources`}
+                  </button>
+                )}
               </div>
+              {visibleRows.length > 0 && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
+                  {visibleRows.map(({ s, n }) => (
+                    <div key={s.id + ':' + n} id={sourceDomId(n)}>
+                      <SourceCard index={n} source={s} cited={cited.has(n)} />
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

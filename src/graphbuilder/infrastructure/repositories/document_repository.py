@@ -413,7 +413,10 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
                 try:
                     chunks.append(self._create_chunk_from_data(dict(record["c"])))
                 except Exception as exc:
-                    self.logger.debug("Skipping malformed chunk: %s", exc)
+                    # bumped from debug → warning: this exact swallow hid
+                    # the long-standing `DocumentChunk(id=...)` TypeError
+                    # that broke /qa/ask hydration end-to-end.
+                    self.logger.warning("Skipping malformed chunk: %s", exc)
             return chunks
 
     async def get_chunk_with_neighbours(
@@ -453,7 +456,7 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
                 try:
                     chunks.append(self._create_chunk_from_data(dict(record["chunk"])))
                 except Exception as exc:
-                    self.logger.debug("Skipping malformed neighbour chunk: %s", exc)
+                    self.logger.warning("Skipping malformed neighbour chunk: %s", exc)
             return chunks
 
     async def find_documents_by_url_pattern(self, url_pattern: str) -> List[SourceDocument]:
@@ -572,15 +575,19 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
     
     def _create_chunk_from_data(self, data: Dict[str, Any]) -> DocumentChunk:
         """Create DocumentChunk from database data."""
-        
+
         # Handle datetime conversion
         for field in ['created_at', 'updated_at']:
             if field in data and data[field]:
                 if isinstance(data[field], str):
                     data[field] = datetime.fromisoformat(data[field].replace('Z', '+00:00'))
-        
+
+        # ``DocumentChunk`` is a @dataclass over an ABC base; the
+        # generated __init__ does NOT accept an ``id`` kwarg (id is
+        # auto-set inside DomainEntity.__init__ via __post_init__).
+        # We assign the persisted id after construction so chunks
+        # round-trip with the same id the orchestrator looked up.
         chunk = DocumentChunk(
-            id=data.get('id'),
             content=data.get('content', ''),
             document_id=data.get('document_id', ''),
             chunk_index=data.get('chunk_index', 0),
@@ -590,9 +597,11 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
             end_position=data.get('end_position', 0),
             language=data.get('language'),
             content_type=data.get('content_type', 'text/plain'),
-            processing_metadata=data.get('processing_metadata', {})
+            processing_metadata=data.get('processing_metadata', {}),
         )
-        
+        if data.get('id'):
+            chunk.id = data['id']
+
         # Restore metadata if available
         if 'created_at' in data:
             chunk.metadata.created_at = data['created_at']
@@ -600,7 +609,7 @@ class Neo4jDocumentRepository(DocumentRepositoryInterface):
             chunk.metadata.updated_at = data['updated_at']
         if 'version' in data:
             chunk.metadata.version = data['version']
-        
+
         return chunk
 
 

@@ -49,6 +49,7 @@ from .memory import MemoryConfig, MemoryContext, MemoryService
 from .models import RetrievalConfig, RetrievalTrace, RetrievedItem
 from .orchestrator import RetrievalOrchestrator
 from .mutation_tools import MutationToolDispatcher, is_mutation
+from .semantic_memory import SemanticMemoryConfig, SemanticMemoryService
 from .tools import ToolCallRecord, ToolDispatcher
 
 
@@ -75,6 +76,19 @@ Rules:
   for "tell me about" requests.
 - When the user asks for a list, return a bulleted list. Otherwise prose.
 """
+
+
+_PERSONA_HEADER = "USER SEMANTIC SUMMARY (cross-session, for tone/depth only — never cite)"
+
+
+def _render_system_prompt(persona: str = "") -> str:
+    """Attach the per-user persona summary (§5.4 / P14) to the system
+    prompt. The persona is for tone/depth/topic priors only — the
+    explicit "never cite" caveat keeps the model from treating it as
+    grounded evidence."""
+    if not persona:
+        return _SYSTEM_PROMPT
+    return f"{_SYSTEM_PROMPT}\n{_PERSONA_HEADER}\n{persona}\n"
 
 _TOOLS_PROMPT_SUFFIX = """
 
@@ -149,6 +163,52 @@ def _render_user_prompt(
     return "\n\n".join(parts)
 
 
+# How many source rows + how much chunk text to persist on a turn so
+# reopened sessions can re-render the same UI as a live ask. Bounded so
+# a chatty session doesn't bloat the Neo4j node — the orchestrator's
+# final_top_k is ≤16 in every shipped profile, and SourceCard truncates
+# the preview to ~400 chars when rendering anyway.
+_SNAPSHOT_MAX_SOURCES = 24
+_SNAPSHOT_MAX_PREVIEW_CHARS = 600
+
+
+def _snapshot_sources(
+    items: List[RetrievedItem],
+    trace: Optional[RetrievalTrace],
+    cited_indices: List[int],
+) -> Dict[str, Any]:
+    """Build a compact, JSON-safe snapshot of a turn's retrieval result.
+
+    Stored on ``ConversationTurn.metadata`` so ``GET /qa/sessions/{id}``
+    can hand the frontend enough to re-render the source cards + the
+    retrieval-trace pane for a reopened session — matching what a live
+    ``/qa/ask`` shows. We drop each item's nested ``metadata`` sub-dict
+    (unused by the UI) and truncate ``chunk_preview`` to keep the node
+    small.
+    """
+    src_dicts: List[Dict[str, Any]] = []
+    for item in items[:_SNAPSHOT_MAX_SOURCES]:
+        d = item.to_dict()
+        meta = d.pop("metadata", None) or {}
+        # Keep the entity/relationship description (often the only prose
+        # for Open-Targets-ingested entities) so a reopened session's
+        # SourceCard can show it; drop the rest of the metadata bag.
+        desc = meta.get("description")
+        if isinstance(desc, str) and desc.strip():
+            d["description"] = desc.strip()
+        preview = d.get("chunk_preview")
+        if isinstance(preview, str) and len(preview) > _SNAPSHOT_MAX_PREVIEW_CHARS:
+            d["chunk_preview"] = preview[:_SNAPSHOT_MAX_PREVIEW_CHARS].rstrip() + "…"
+        src_dicts.append(d)
+    snap: Dict[str, Any] = {
+        "sources": src_dicts,
+        "cited_source_indices": list(cited_indices),
+    }
+    if trace is not None:
+        snap["retrieval_trace"] = trace.to_dict()
+    return snap
+
+
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
 
@@ -219,16 +279,27 @@ class QAService:
         faithfulness_config: Optional[FaithfulnessConfig] = None,
         tool_dispatcher: Optional[ToolDispatcher] = None,
         max_tool_calls_per_turn: int = 5,
+        semantic_memory: Optional[SemanticMemoryService] = None,
+        default_qa_model: Optional[str] = None,
     ):
         self._orch = orchestrator
         self._conv = conversation_repo
         self._llm = llm_service
         self._cfg = config or RetrievalConfig()
+        # Per §14 Q2 — the QA flow defaults to a cheaper model than
+        # ingestion. ``None`` falls back to whatever the LLM service was
+        # configured with (single-model deployments).
+        self._default_qa_model = default_qa_model
         self._memory = memory or MemoryService(
             conversation_repo=conversation_repo,
             llm_service=llm_service,
             config=memory_config or MemoryConfig(),
         )
+        # P14 — cross-session persona. Optional: when not wired the
+        # ``load_persona`` call returns "" and we render the un-decorated
+        # system prompt. The router injects this in production; tests
+        # that don't care about persona pass nothing.
+        self._semantic_memory = semantic_memory
         # Faithfulness checker is constructed eagerly so production
         # traffic never pays the import on the hot path. The default
         # config is lexical-only; flip ``enable_llm_escalation`` on
@@ -262,6 +333,25 @@ class QAService:
         """
         self._mutation_tools = dispatcher
 
+    def set_semantic_memory(
+        self, service: Optional[SemanticMemoryService],
+    ) -> None:
+        """Wire the cross-session persona service post-construction (P14).
+
+        Mirrors :meth:`set_mutation_dispatcher` so the router can keep
+        the QAService factory side-effect-free: build the service, then
+        attach optional surfaces.
+        """
+        self._semantic_memory = service
+
+    @property
+    def semantic_memory(self) -> Optional[SemanticMemoryService]:
+        """Read-only handle so the API layer can run an *immediate*
+        persona refresh on explicit "session ended" events (the DELETE
+        /qa/sessions/{id} route) without round-tripping through ask().
+        """
+        return self._semantic_memory
+
     async def ask(
         self,
         *,
@@ -272,6 +362,7 @@ class QAService:
         retrieval_override: Optional[RetrievalConfig] = None,
         enable_tools: bool = False,
         enable_mutations: bool = False,
+        model: Optional[str] = None,
     ) -> AskResult:
         wall_start = time.perf_counter()
         if not (query or "").strip():
@@ -284,9 +375,17 @@ class QAService:
 
         session = await self._resolve_session(session_id, user_id)
 
-        # Embed once and share across retrieval + memory recall so we
-        # don't pay the model cost twice on a single turn.
-        query_embedding = await self._embed_query(query)
+        # Kick off the query embedding now and hand the *task* (not the
+        # vector) to retrieval + memory: each awaits it only at the point
+        # it needs a vector, so the BM25 channel, term extraction, the
+        # working-memory load, and the persona read all overlap the
+        # embedder instead of queuing behind it. We await it ourselves
+        # below (for the persisted turn) — by then it's already done.
+        embed_task = asyncio.create_task(self._embed_query(query))
+
+        # Persona (P14) — cheap dict read. Load before retrieval starts
+        # so we can hand it straight to the LLM step.
+        persona = await self._load_persona(user_id)
 
         # Pick the per-intent retrieval config. An explicit
         # ``retrieval_override`` wins so the eval harness's ablation
@@ -300,19 +399,25 @@ class QAService:
             intent_label = classify_intent(query)
             cfg_for_turn = apply_profile(self._cfg, INTENT_PROFILES[intent_label])
 
-        # Retrieval and memory build are independent — gather them.
+        # Retrieval and memory build are independent — gather them. Both
+        # get the embed *task*; they await it lazily (vector channel,
+        # Cypher anchors, episodic recall) so the rest of their work runs
+        # while the embedder is still in flight.
         items_trace_task = self._orch.retrieve(
-            query, top_k=top_k, query_embedding=query_embedding,
+            query, top_k=top_k, query_embedding=embed_task,
             config_override=cfg_for_turn,
         )
         memory_task = self._memory.build(
             session_id=session.id,
             query=query,
-            query_embedding=query_embedding,
+            query_embedding=embed_task,
         )
         (items, trace), memory_ctx = await asyncio.gather(
             items_trace_task, memory_task,
         )
+        # Resolve the embedding for the turn we'll persist; the task is
+        # done by now (every consumer above already awaited it).
+        query_embedding = await embed_task
 
         # Stamp the chosen intent on the trace so the eval harness, the
         # debug pane, and structured logs can all see which profile
@@ -331,15 +436,21 @@ class QAService:
             (enable_tools and self._tools is not None)
             or (enable_mutations and self._mutation_tools is not None)
         )
+        effective_model = self._resolve_model(model)
         if agentic_active:
             answer, tool_calls = await self._generate_answer_agentic(
                 query, items, memory_ctx,
                 enable_tools=enable_tools,
                 enable_mutations=enable_mutations,
                 proposer_user_id=user_id,
+                persona=persona,
+                model=effective_model,
             )
         else:
-            answer = await self._generate_answer(query, items, memory_ctx)
+            answer = await self._generate_answer(
+                query, items, memory_ctx,
+                persona=persona, model=effective_model,
+            )
 
         cited_indices = [
             i for i in _extract_cited_indices(answer)
@@ -356,6 +467,8 @@ class QAService:
         # via FaithfulnessConfig.enable_llm_escalation.
         faithfulness_result = await self._check_faithfulness(answer, items)
 
+        latency_ms = int((time.perf_counter() - wall_start) * 1000)
+
         turn = await self._append_turn(
             session_id=session.id,
             query=query,
@@ -365,9 +478,11 @@ class QAService:
             cited_rel_ids=cited_rel_ids,
             cited_chunk_ids=cited_chunk_ids,
             query_embedding=query_embedding,
+            sources=items,
+            trace=trace,
+            cited_indices=cited_indices,
+            latency_ms=latency_ms,
         )
-
-        latency_ms = int((time.perf_counter() - wall_start) * 1000)
 
         # qa_request metric: now labeled by chosen intent (or "any" when
         # routing was bypassed via retrieval_override). Cardinality is
@@ -443,6 +558,9 @@ class QAService:
         user_id: Optional[str] = ANONYMOUS_USER_ID,
         top_k: Optional[int] = None,
         retrieval_override: Optional[RetrievalConfig] = None,
+        model: Optional[str] = None,
+        enable_tools: bool = False,
+        enable_mutations: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Yield streaming events for a single ``/qa/ask/stream`` turn."""
         wall_start = time.perf_counter()
@@ -462,7 +580,13 @@ class QAService:
         # expensive — keeps the spinner snappy.
         yield {"event": "phase", "data": {"phase": "retrieving", "request_id": request_id}}
 
-        query_embedding = await self._embed_query(query)
+        # Kick off the embedding now; retrieval + memory await the task
+        # lazily so their non-vector work overlaps the embedder (see the
+        # equivalent comment in ``ask``).
+        embed_task = asyncio.create_task(self._embed_query(query))
+
+        # Persona (P14) — small dict read; resolved before retrieval.
+        persona = await self._load_persona(user_id)
 
         if retrieval_override is not None:
             intent_label: Optional[str] = None
@@ -472,13 +596,13 @@ class QAService:
             cfg_for_turn = apply_profile(self._cfg, INTENT_PROFILES[intent_label])
 
         items_trace_task = self._orch.retrieve(
-            query, top_k=top_k, query_embedding=query_embedding,
+            query, top_k=top_k, query_embedding=embed_task,
             config_override=cfg_for_turn,
         )
         memory_task = self._memory.build(
             session_id=session.id,
             query=query,
-            query_embedding=query_embedding,
+            query_embedding=embed_task,
         )
         try:
             (items, trace), memory_ctx = await asyncio.gather(
@@ -486,8 +610,11 @@ class QAService:
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("ask_stream retrieval failed: %s", exc, exc_info=True)
+            embed_task.cancel()
             yield {"event": "error", "data": {"message": str(exc), "kind": "retrieval_failed"}}
             return
+        # Resolve the embedding for the persisted turn (task already done).
+        query_embedding = await embed_task
 
         if intent_label is not None:
             trace.intent = intent_label
@@ -504,24 +631,61 @@ class QAService:
             },
         }
 
-        # Generation phase — actual token streaming below.
-        yield {"event": "phase", "data": {"phase": "generating"}}
-
-        answer_chunks: List[str] = []
+        effective_model = self._resolve_model(model)
         prompt = _render_user_prompt(query, items, memory_ctx.rendered_block)
         gen_start = time.perf_counter()
 
-        try:
-            async for chunk in self._stream_answer(prompt):
-                answer_chunks.append(chunk)
-                yield {"event": "delta", "data": {"text": chunk}}
-        except Exception as exc:  # noqa: BLE001
-            logger.error("ask_stream generation failed: %s", exc, exc_info=True)
-            # Still record the (partial) answer so the turn isn't lost.
-            answer = "".join(answer_chunks) or f"(LLM stream failed: {exc})"
-            yield {"event": "error", "data": {"message": str(exc), "kind": "llm_failed"}}
-            await self._record_llm_latency(time.perf_counter() - gen_start)
-            return
+        # P11 + tool-use combo (FOLLOWUPS §3, Option A) — if either tool
+        # surface is enabled we run the agentic loop to completion FIRST,
+        # then stream the final answer. Tool-call activity is surfaced as
+        # ``tool_call`` events between phase("tools") and phase("generating")
+        # so the frontend can render the activity log even though the
+        # final answer arrives as one chunk.
+        agentic_active = self._llm is not None and (
+            (enable_tools and self._tools is not None)
+            or (enable_mutations and self._mutation_tools is not None)
+        )
+        tool_calls: List[ToolCallRecord] = []
+        prefilled_answer: Optional[str] = None
+        if agentic_active:
+            yield {"event": "phase", "data": {"phase": "tools"}}
+            try:
+                prefilled_answer, tool_calls = await self._generate_answer_agentic(
+                    query, items, memory_ctx,
+                    enable_tools=enable_tools,
+                    enable_mutations=enable_mutations,
+                    proposer_user_id=user_id,
+                    persona=persona,
+                    model=effective_model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("ask_stream agentic loop failed: %s", exc, exc_info=True)
+                yield {"event": "error", "data": {"message": str(exc), "kind": "llm_failed"}}
+                await self._record_llm_latency(time.perf_counter() - gen_start)
+                return
+            for rec in tool_calls:
+                yield {"event": "tool_call", "data": rec.to_dict()}
+
+        # Generation phase — actual token streaming below (or a single
+        # delta carrying the agentic-loop's final answer).
+        yield {"event": "phase", "data": {"phase": "generating"}}
+
+        answer_chunks: List[str] = []
+        if prefilled_answer is not None:
+            answer_chunks.append(prefilled_answer)
+            yield {"event": "delta", "data": {"text": prefilled_answer}}
+        else:
+            try:
+                async for chunk in self._stream_answer(prompt, persona=persona, model=effective_model):
+                    answer_chunks.append(chunk)
+                    yield {"event": "delta", "data": {"text": chunk}}
+            except Exception as exc:  # noqa: BLE001
+                logger.error("ask_stream generation failed: %s", exc, exc_info=True)
+                # Still record the (partial) answer so the turn isn't lost.
+                answer = "".join(answer_chunks) or f"(LLM stream failed: {exc})"
+                yield {"event": "error", "data": {"message": str(exc), "kind": "llm_failed"}}
+                await self._record_llm_latency(time.perf_counter() - gen_start)
+                return
 
         await self._record_llm_latency(time.perf_counter() - gen_start)
 
@@ -536,6 +700,8 @@ class QAService:
 
         faithfulness_result = await self._check_faithfulness(answer, items)
 
+        latency_ms = int((time.perf_counter() - wall_start) * 1000)
+
         turn = await self._append_turn(
             session_id=session.id,
             query=query,
@@ -545,9 +711,11 @@ class QAService:
             cited_rel_ids=cited_rel_ids,
             cited_chunk_ids=cited_chunk_ids,
             query_embedding=query_embedding,
+            sources=items,
+            trace=trace,
+            cited_indices=cited_indices,
+            latency_ms=latency_ms,
         )
-
-        latency_ms = int((time.perf_counter() - wall_start) * 1000)
 
         await self._record_request_metric(status="ok", intent=intent_label or "any")
         await self._record_total_latency(latency_ms)
@@ -578,12 +746,15 @@ class QAService:
                 "faithfulness": (
                     faithfulness_result.to_dict() if faithfulness_result else None
                 ),
+                "tool_calls": [r.to_dict() for r in tool_calls],
                 "request_id": request_id,
                 "latency_ms": latency_ms,
             },
         }
 
-    async def _stream_answer(self, prompt: str) -> AsyncIterator[str]:
+    async def _stream_answer(
+        self, prompt: str, *, persona: str = "", model: Optional[str] = None,
+    ) -> AsyncIterator[str]:
         """Yield answer chunks. Falls back to a single chunk when the LLM
         service doesn't expose a streaming method (e.g. test fakes or a
         provider without ``stream=True`` support)."""
@@ -592,6 +763,7 @@ class QAService:
                 "(no LLM configured — retrieval already streamed; see Sources panel)"
             )
             return
+        system_prompt = _render_system_prompt(persona)
         stream_fn = getattr(self._llm, "generate_text_stream", None)
         if stream_fn is None:
             # Graceful fallback: call the non-streaming method and emit
@@ -599,18 +771,20 @@ class QAService:
             # same shape regardless of provider capability.
             answer = await self._llm.generate_text(
                 prompt=prompt,
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 temperature=0.1,
                 max_tokens=1024,
+                **({"model": model} if model else {}),
             )
             yield answer
             return
 
         async for chunk in stream_fn(
             prompt=prompt,
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             temperature=0.1,
             max_tokens=1024,
+            **({"model": model} if model else {}),
         ):
             if chunk:
                 yield chunk
@@ -628,6 +802,8 @@ class QAService:
         enable_tools: bool = True,
         enable_mutations: bool = False,
         proposer_user_id: Optional[str] = None,
+        persona: str = "",
+        model: Optional[str] = None,
     ) -> tuple[str, List[ToolCallRecord]]:
         """Run the tool-using loop and return ``(answer, tool_calls)``.
 
@@ -644,17 +820,17 @@ class QAService:
         read_active = enable_tools and self._tools is not None
         mut_active = enable_mutations and self._mutation_tools is not None
         if not (read_active or mut_active) or self._llm is None:
-            return await self._generate_answer(query, items, memory_ctx), []
+            return await self._generate_answer(query, items, memory_ctx, persona=persona, model=model), []
 
         tools_fn = getattr(self._llm, "generate_with_tools", None)
         if tools_fn is None:
             # Provider can't function-call — degrade silently so the
             # eval harness and tests with a non-streaming fake LLM
             # don't break.
-            return await self._generate_answer(query, items, memory_ctx), []
+            return await self._generate_answer(query, items, memory_ctx, persona=persona, model=model), []
 
         user_prompt = _render_user_prompt(query, items, memory_ctx.rendered_block)
-        system_prompt = _SYSTEM_PROMPT + _TOOLS_PROMPT_SUFFIX
+        system_prompt = _render_system_prompt(persona) + _TOOLS_PROMPT_SUFFIX
         if mut_active:
             system_prompt += _MUTATION_PROMPT_SUFFIX
         messages: List[Dict[str, Any]] = [
@@ -667,6 +843,7 @@ class QAService:
         if mut_active:
             tools_schema += self._mutation_tools.openai_tool_schemas()
         records: List[ToolCallRecord] = []
+        model_kw: Dict[str, Any] = {"model": model} if model else {}
 
         for _ in range(self._max_tool_calls + 1):
             response = await tools_fn(
@@ -674,6 +851,7 @@ class QAService:
                 tools=tools_schema,
                 temperature=0.1,
                 max_tokens=1024,
+                **model_kw,
             )
             tool_calls = response.get("tool_calls") or []
             content = response.get("content")
@@ -687,7 +865,7 @@ class QAService:
                 logger.warning(
                     "agentic loop: empty content + no tool calls; falling back",
                 )
-                return await self._generate_answer(query, items, memory_ctx), records
+                return await self._generate_answer(query, items, memory_ctx, persona=persona, model=model), records
 
             # Append the model's tool_call turn to the conversation
             # before executing — OpenAI's protocol requires the
@@ -725,6 +903,7 @@ class QAService:
                     tools=[],
                     temperature=0.1,
                     max_tokens=1024,
+                    **model_kw,
                 )
                 return final.get("content") or "(no answer generated)", records
 
@@ -749,7 +928,9 @@ class QAService:
         # Loop exit without an answer — shouldn't happen given the cap
         # check above, but stay defensive.
         logger.warning("agentic loop fell through without an answer")
-        return await self._generate_answer(query, items, memory_ctx), records
+        return await self._generate_answer(
+            query, items, memory_ctx, persona=persona, model=model,
+        ), records
 
     async def _dispatch_tool_call(
         self,
@@ -817,6 +998,63 @@ class QAService:
         return cited_entity_ids, cited_rel_ids, cited_chunk_ids
 
     # ------------------------------------------------------------------
+    # Model resolution (§14 Q2)
+    # ------------------------------------------------------------------
+
+    def _resolve_model(self, request_override: Optional[str]) -> Optional[str]:
+        """Pick the LLM model id for this turn.
+
+        Precedence: explicit per-request override > service-level default
+        (``QA_LLM_MODEL_NAME``) > ``None`` (means: let the LLM service
+        fall back to ``config.llm.model_name``, the ingestion default).
+        Blank strings on the request override are treated as "no override"
+        so frontend defaults don't accidentally pin a meaningless value.
+        """
+        cleaned = (request_override or "").strip()
+        if cleaned:
+            return cleaned
+        return self._default_qa_model
+
+    # ------------------------------------------------------------------
+    # Semantic-memory helpers (P14)
+    # ------------------------------------------------------------------
+
+    async def _load_persona(self, user_id: Optional[str]) -> str:
+        """Fetch the cached persona summary for ``user_id`` if we have a
+        semantic-memory service wired. Returns ``""`` when missing,
+        anonymous, or on failure — caller renders no persona block."""
+        if self._semantic_memory is None or not user_id:
+            return ""
+        try:
+            return await self._semantic_memory.load_persona(user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("load_persona failed: %s", exc)
+            return ""
+
+    def _schedule_persona_refresh(self, user_id: Optional[str]) -> None:
+        """Fire-and-forget a persona refresh for ``user_id``. Used when
+        a new session is created — the refresh runs against past
+        sessions while the new one starts, so the next /qa/ask sees a
+        fresh persona without blocking the current turn."""
+        if self._semantic_memory is None or not user_id:
+            return
+        try:
+            task = asyncio.create_task(
+                self._semantic_memory.refresh_persona(user_id),
+            )
+            task.add_done_callback(self._on_persona_refresh_done)
+        except RuntimeError:
+            # No running loop (e.g. service constructed outside FastAPI
+            # in a sync context) — just skip.
+            return
+
+    @staticmethod
+    def _on_persona_refresh_done(task: "asyncio.Task[Any]") -> None:
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("background persona refresh failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Embedding helper
     # ------------------------------------------------------------------
 
@@ -851,7 +1089,12 @@ class QAService:
             id=f"session_{uuid.uuid4().hex[:16]}",
             user_id=user_id if user_id is not None else ANONYMOUS_USER_ID,
         )
-        return await self._conv.create_session(new_session)
+        created = await self._conv.create_session(new_session)
+        # P14 — kick off a background persona refresh for this user.
+        # The semantic-memory service no-ops when nothing has changed
+        # since the cached summary, so this is cheap on repeat starts.
+        self._schedule_persona_refresh(user_id)
+        return created
 
     async def _append_turn(
         self,
@@ -864,12 +1107,24 @@ class QAService:
         cited_rel_ids: List[str],
         cited_chunk_ids: List[str],
         query_embedding: Optional[List[float]] = None,
+        sources: Optional[List[RetrievedItem]] = None,
+        trace: Optional[RetrievalTrace] = None,
+        cited_indices: Optional[List[int]] = None,
+        latency_ms: int = 0,
     ):
         from ...domain.models.conversation_models import ConversationTurn
 
         # idx = current turn count (atomic enough for v1 single-instance API).
         session = await self._conv.get_session(session_id)
         idx = session.turn_count if session else 0
+        # Stash a compact retrieval snapshot on the turn's metadata so a
+        # reopened session re-renders the same source cards + trace as a
+        # live ask (GET /qa/sessions/{id} surfaces metadata verbatim).
+        metadata: Dict[str, Any] = {}
+        if sources is not None:
+            metadata["retrieval_snapshot"] = _snapshot_sources(
+                sources, trace, cited_indices or [],
+            )
         turn = ConversationTurn(
             session_id=session_id,
             idx=idx,
@@ -880,6 +1135,8 @@ class QAService:
             cited_relationship_ids=cited_rel_ids,
             cited_chunk_ids=cited_chunk_ids,
             query_embedding=query_embedding,
+            latency_ms=latency_ms,
+            metadata=metadata,
         )
         return await self._conv.append_turn(turn)
 
@@ -892,6 +1149,9 @@ class QAService:
         query: str,
         items: List[RetrievedItem],
         memory_ctx: MemoryContext,
+        *,
+        persona: str = "",
+        model: Optional[str] = None,
     ) -> str:
         if self._llm is None:
             # Graceful degradation — if no LLM is configured, surface the
@@ -906,9 +1166,10 @@ class QAService:
         try:
             answer = await self._llm.generate_text(
                 prompt=prompt,
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=_render_system_prompt(persona),
                 temperature=0.1,
                 max_tokens=1024,
+                **({"model": model} if model else {}),
             )
         except Exception as exc:
             logger.error("LLM call failed: %s", exc, exc_info=True)
@@ -995,6 +1256,8 @@ __all__ = [
     "MemoryService",
     "MutationToolDispatcher",
     "QAService",
+    "SemanticMemoryConfig",
+    "SemanticMemoryService",
     "ToolCallRecord",
     "ToolDispatcher",
 ]

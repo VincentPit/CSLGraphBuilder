@@ -18,9 +18,10 @@ export const apiClient = axios.create({
 apiClient.interceptors.request.use((config) => {
   const identity = getStoredIdentity();
   if (identity) {
-    config.headers = config.headers ?? {};
-    // axios v1 typing accepts setting via direct assignment.
-    (config.headers as Record<string, string>)['X-User-Id'] = identity.id;
+    // `config.headers` is an `AxiosHeaders` instance in request
+    // interceptors (axios v1) — use its `.set()` rather than index
+    // assignment so the types line up under every tsconfig.
+    config.headers.set('X-User-Id', identity.id);
   }
   return config;
 });
@@ -508,6 +509,10 @@ export interface ChatSource {
   source_chunk_id?: string | null;
   source_chunk_ids: string[];
   chunk_preview?: string | null;
+  /** The entity/relationship's own description from the graph node.
+   *  Often the only prose for Open-Targets-ingested entities — shown as
+   *  a fallback when there's no hydrated chunk preview. */
+  description?: string | null;
   contributing_channels: RetrievalChannel[];
   reasoning: string;
 }
@@ -539,6 +544,31 @@ export interface MemoryTrace {
   summary_regenerated: boolean;
 }
 
+/** One read-only or mutating tool call the LLM made during a turn (P9/P10). */
+export interface ToolCall {
+  tool: string;
+  args: Record<string, unknown>;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+  latency_ms: number;
+  tool_call_id?: string | null;
+}
+
+/** Per-claim faithfulness verdict from the post-generation check (P8). */
+export interface ClaimVerification {
+  claim_text: string;
+  source_indices: number[];
+  score: number;
+  verdict: 'supported' | 'borderline' | 'unsupported' | string;
+  matched_chunk?: string | null;
+}
+
+export interface FaithfulnessResult {
+  overall_score?: number | null;
+  claims: ClaimVerification[];
+  failed_claims: number;
+}
+
 export interface AskResponse {
   session_id: string;
   turn_id: string;
@@ -549,6 +579,20 @@ export interface AskResponse {
   memory_trace?: MemoryTrace | null;
   request_id?: string | null;
   latency_ms: number;
+  /** Tool calls the LLM made during this turn (P9 read / P10 write).
+   *  Empty when enable_tools + enable_mutations are both off. */
+  tool_calls?: ToolCall[];
+  /** Per-claim verdicts + aggregate score (P8). */
+  faithfulness?: FaithfulnessResult | null;
+}
+
+/** Compact retrieval snapshot persisted on a turn's metadata so a
+ *  reopened session re-renders the same source cards + trace pane as a
+ *  live ask. Written by QAService._append_turn → _snapshot_sources. */
+export interface RetrievalSnapshot {
+  sources: ChatSource[];
+  cited_source_indices: number[];
+  retrieval_trace?: RetrievalTrace;
 }
 
 export interface ChatTurn {
@@ -567,6 +611,7 @@ export interface ChatTurn {
   completion_tokens: number;
   latency_ms: number;
   created_at: string;
+  metadata?: { retrieval_snapshot?: RetrievalSnapshot } & Record<string, unknown>;
 }
 
 export interface ChatSession {
@@ -579,12 +624,244 @@ export interface ChatSession {
   last_active_at: string;
 }
 
-export const askQuestion = (body: {
+export interface AskRequestBody {
   query: string;
   session_id?: string;
   user_id?: string | null;
   top_k?: number;
-}) => apiClient.post<AskResponse>('/qa/ask', body).then((r) => r.data);
+  enable_tools?: boolean;
+  enable_mutations?: boolean;
+  model?: string | null;
+}
+
+export const askQuestion = (body: AskRequestBody) =>
+  apiClient.post<AskResponse>('/qa/ask', body).then((r) => r.data);
+
+// ── Streaming /qa/ask (SSE, P11) ─────────────────────────────────────────
+//
+// `/qa/ask/stream` is a POST with a JSON body, so `EventSource` (GET-only,
+// can't set headers) is out — we drive it with `fetch()` + a manual SSE
+// frame parser over the response body's ReadableStream. The auth headers
+// are constructed by hand here to mirror the axios `apiClient` interceptor
+// above (X-API-Key from env, X-User-Id from localStorage); keep them in
+// sync if either changes.
+
+/** Payload of the `retrieval` SSE event — sources + traces, emitted once
+ *  retrieval + memory complete, *before* the first answer `delta`. */
+export interface AskStreamRetrieval {
+  sources: ChatSource[];
+  retrieval_trace: RetrievalTrace;
+  memory_trace?: MemoryTrace | null;
+  intent?: string | null;
+}
+
+/** Payload of the terminal `done` SSE event. */
+export interface AskStreamDone {
+  session_id: string;
+  turn_id: string;
+  answer: string;
+  cited_source_indices: number[];
+  faithfulness?: FaithfulnessResult | null;
+  tool_calls?: ToolCall[];
+  request_id?: string | null;
+  latency_ms: number;
+}
+
+export interface AskStreamHandlers {
+  /** Coarse progress signal: "retrieving" | "tools" | "generating". */
+  onPhase?(phase: string, requestId?: string): void;
+  /** Sources + retrieval/memory traces — fires once, before any delta. */
+  onRetrieval?(d: AskStreamRetrieval): void;
+  /** One read-only or mutating tool call (only when tools are enabled). */
+  onToolCall?(call: ToolCall): void;
+  /** A chunk of answer text — append to the running answer. May fire many
+   *  times; with tool-use enabled, fires once with the full final answer. */
+  onDelta?(text: string): void;
+  /** Stream finished cleanly. */
+  onDone?(d: AskStreamDone): void;
+  /** Stream failed (or never started). `kind` ∈ session_not_found |
+   *  retrieval_failed | llm_failed | internal_error | http_error | network. */
+  onError?(message: string, kind: string): void;
+}
+
+/** One parsed SSE frame. */
+interface SseEvent {
+  event: string;
+  data: string;
+}
+
+/** Parse a (possibly partial) chunk of SSE wire text. Returns the complete
+ *  events found plus the leftover incomplete tail to prepend to the next
+ *  chunk. Skips comment lines (`: ping …` heartbeats from sse-starlette).
+ *
+ *  Exported for unit testing — the streaming client uses it internally.
+ */
+export function parseSseChunk(buffer: string): { events: SseEvent[]; rest: string } {
+  // Normalise CRLF so frame splitting on "\n\n" works regardless of how
+  // the server (or an intermediary) terminates lines.
+  buffer = buffer.replace(/\r\n/g, '\n');
+  const events: SseEvent[] = [];
+  let idx: number;
+  while ((idx = buffer.indexOf('\n\n')) !== -1) {
+    const frame = buffer.slice(0, idx);
+    buffer = buffer.slice(idx + 2);
+    const parsed = parseSseFrame(frame);
+    if (parsed) events.push(parsed);
+  }
+  return { events, rest: buffer };
+}
+
+function parseSseFrame(frame: string): SseEvent | null {
+  let event = 'message';
+  const dataLines: string[] = [];
+  for (const line of frame.split('\n')) {
+    // Blank line (shouldn't happen post-split) or comment / heartbeat.
+    if (!line || line.startsWith(':')) continue;
+    const colon = line.indexOf(':');
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'event') event = value;
+    else if (field === 'data') dataLines.push(value);
+  }
+  if (dataLines.length === 0) return null;
+  return { event, data: dataLines.join('\n') };
+}
+
+function dispatchSseEvent(ev: SseEvent, h: AskStreamHandlers): boolean {
+  let data: any;
+  try {
+    data = JSON.parse(ev.data);
+  } catch {
+    return false; // malformed frame — ignore, keep reading
+  }
+  switch (ev.event) {
+    case 'phase':
+      h.onPhase?.(data.phase, data.request_id);
+      return false;
+    case 'retrieval':
+      h.onRetrieval?.({
+        sources: data.sources ?? [],
+        retrieval_trace: data.retrieval_trace,
+        memory_trace: data.memory_trace ?? null,
+        intent: data.intent ?? null,
+      });
+      return false;
+    case 'tool_call':
+      h.onToolCall?.(data as ToolCall);
+      return false;
+    case 'delta':
+      if (typeof data.text === 'string' && data.text) h.onDelta?.(data.text);
+      return false;
+    case 'done':
+      h.onDone?.(data as AskStreamDone);
+      return true;
+    case 'error':
+      h.onError?.(
+        typeof data.message === 'string' ? data.message : 'Stream error',
+        typeof data.kind === 'string' ? data.kind : 'unknown',
+      );
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** Open a streaming `/qa/ask/stream` request. Returns an `AbortController`
+ *  the caller can use to cancel the in-flight stream (e.g. on unmount or a
+ *  new submit). All callbacks are optional; `onError` is invoked for both
+ *  transport failures and server-emitted `error` events. */
+export function askQuestionStream(
+  body: AskRequestBody,
+  handlers: AskStreamHandlers,
+): AbortController {
+  const controller = new AbortController();
+  void runAskStream(body, handlers, controller.signal);
+  return controller;
+}
+
+async function runAskStream(
+  body: AskRequestBody,
+  handlers: AskStreamHandlers,
+  signal: AbortSignal,
+): Promise<void> {
+  let res: Response;
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (API_KEY) headers['X-API-Key'] = API_KEY;
+    const identity = getStoredIdentity();
+    if (identity) headers['X-User-Id'] = identity.id;
+    res = await fetch(`${BASE_URL}/qa/ask/stream`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    });
+  } catch (err: any) {
+    if (signal.aborted) return;
+    handlers.onError?.(err?.message ?? 'Network error', 'network');
+    return;
+  }
+
+  if (!res.ok || !res.body) {
+    // FastAPI returns { detail: ... } on validation / auth errors. Reuse
+    // the same normaliser the axios path uses so the message is readable.
+    let msg = `Request failed (${res.status})`;
+    try {
+      const data = await res.json();
+      msg = formatApiError({ response: { data } }, msg);
+    } catch {
+      /* non-JSON body — keep the status-code fallback */
+    }
+    handlers.onError?.(msg, 'http_error');
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let closed = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const { events, rest } = parseSseChunk(buffer);
+      buffer = rest;
+      for (const ev of events) {
+        if (dispatchSseEvent(ev, handlers)) {
+          closed = true;
+          break;
+        }
+      }
+      if (closed) break;
+    }
+    // Flush any trailing frame the server sent without a final blank line.
+    if (!closed && buffer.trim()) {
+      const { events } = parseSseChunk(buffer + '\n\n');
+      for (const ev of events) {
+        if (dispatchSseEvent(ev, handlers)) {
+          closed = true;
+          break;
+        }
+      }
+    }
+    if (!closed) {
+      // Stream ended without a `done`/`error` event — surface it so the
+      // caller stops the spinner instead of hanging forever.
+      handlers.onError?.('Stream ended unexpectedly', 'incomplete');
+    }
+  } catch (err: any) {
+    if (signal.aborted) return; // caller cancelled — not an error
+    handlers.onError?.(err?.message ?? 'Stream read failed', 'network');
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* already closed */
+    }
+  }
+}
 
 export const getChatSession = (sessionId: string) =>
   apiClient
@@ -627,3 +904,39 @@ export const updateChatUser = (
   userId: string,
   body: { display_name?: string; metadata?: Record<string, unknown> },
 ) => apiClient.patch<ChatUser>(`/users/${userId}`, body).then((r) => r.data);
+
+// ── Chatbot mutation proposals (P10) ─────────────────────────────────────
+
+export interface ProposedMutation {
+  id: string;
+  tool: string;
+  args: Record<string, unknown>;
+  proposer_user_id?: string | null;
+  status: 'pending' | 'approved' | 'rejected';
+  created_at: string;
+  decided_at?: string | null;
+  applied_target_id?: string | null;
+  error?: string | null;
+  notes?: string | null;
+}
+
+export const listProposals = (params?: { status?: string; limit?: number }) =>
+  apiClient
+    .get<{ total: number; items: ProposedMutation[] }>('/qa/proposals', { params })
+    .then((r) => r.data);
+
+export const applyProposal = (proposalId: string, body?: { notes?: string }) =>
+  apiClient
+    .post<{ proposal_id: string; status: string; target_id?: string | null; error?: string | null }>(
+      `/qa/proposals/${proposalId}/apply`,
+      body ?? {},
+    )
+    .then((r) => r.data);
+
+export const rejectProposal = (proposalId: string, body?: { notes?: string }) =>
+  apiClient
+    .post<{ proposal_id: string; status: string }>(
+      `/qa/proposals/${proposalId}/reject`,
+      body ?? {},
+    )
+    .then((r) => r.data);

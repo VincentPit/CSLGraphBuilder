@@ -59,7 +59,10 @@ function transpileForRuntime() {
       types: ['node'],
       lib: ['ES2022', 'DOM'],
     },
-    include: ['lib/api.ts', '__mocks__/api-fixtures.ts'],
+    // `lib/api.ts` imports `./identity` (SSR-safe — no-ops without a
+    // `window`), so it has to be transpiled alongside or the runtime
+    // import below can't resolve it.
+    include: ['lib/api.ts', 'lib/identity.ts', '__mocks__/api-fixtures.ts'],
   };
   writeFileSync(`${repoRoot}/tsconfig.contract.json`, JSON.stringify(tsconfig, null, 2));
 
@@ -100,13 +103,18 @@ async function main() {
 
   // We can't import api.ts directly because it imports `axios`, which
   // imports browser-only assumptions in some paths. Stub the axios
-  // module with an empty object before importing.
+  // module before importing — the stub needs `interceptors` because
+  // api.ts registers a request interceptor at module load. Also rewrite
+  // the extensionless `./identity` import so Node ESM can resolve it.
   const apiPath = `${outDir}/lib/api.js`;
   const apiOriginal = fs.readFileSync(apiPath, 'utf-8');
-  const apiPatched = apiOriginal.replace(
-    /import\s+axios.*?from\s+['"]axios['"]/,
-    "const axios = { create: () => ({ defaults: {} }) };"
-  );
+  const apiPatched = apiOriginal
+    .replace(
+      /import\s+axios.*?from\s+['"]axios['"]/,
+      "const axios = { create: () => ({ defaults: {}, " +
+        "interceptors: { request: { use() {} }, response: { use() {} } } }) };",
+    )
+    .replace(/from\s+['"]\.\/identity['"]/g, "from './identity.js'");
   fs.writeFileSync(apiPath, apiPatched);
 
   const api = await import(apiUrl);
@@ -154,6 +162,63 @@ async function main() {
       }
     }
     if (failures.length === 0) console.log(`  ✓ ${name} shape valid`);
+  }
+
+  // ────────────────────────────────────────────────────────────────
+  // Assertion 3: parseSseChunk (the /qa/ask/stream client's frame
+  // parser) handles framing, sse-starlette heartbeat comments, CRLF
+  // line endings, and frames split across read() chunks.
+  // ────────────────────────────────────────────────────────────────
+  {
+    const wire =
+      ': ping - keepalive\r\n\r\n' +
+      'event: phase\r\n' +
+      'data: {"phase":"retrieving","request_id":"req_1"}\r\n\r\n' +
+      'event: retrieval\r\n' +
+      'data: {"sources":[],"retrieval_trace":{"query":"q"}}\r\n\r\n' +
+      'event: delta\r\ndata: {"text":"Hello "}\r\n\r\n' +
+      'event: delta\r\ndata: {"text":"world"}\r\n\r\n' +
+      'event: done\r\ndata: {"session_id":"s1","turn_id":"t1",' +
+      '"answer":"Hello world","cited_source_indices":[1],"latency_ms":42}\r\n\r\n';
+
+    // Feed it in two arbitrary slices to exercise the leftover-tail buffer.
+    const cut = Math.floor(wire.length / 3);
+    let buf = '';
+    const collected = [];
+    for (const part of [wire.slice(0, cut), wire.slice(cut)]) {
+      buf += part;
+      const { events, rest } = api.parseSseChunk(buf);
+      buf = rest;
+      collected.push(...events);
+    }
+    if (buf.trim().length !== 0) {
+      failures.push(`  ✗ parseSseChunk left an unconsumed tail: ${JSON.stringify(buf)}`);
+    }
+    const names = collected.map((e) => e.event);
+    const want = ['phase', 'retrieval', 'delta', 'delta', 'done'];
+    if (JSON.stringify(names) !== JSON.stringify(want)) {
+      failures.push(`  ✗ parseSseChunk events ${JSON.stringify(names)} ≠ ${JSON.stringify(want)}`);
+    } else {
+      let ok = true;
+      try {
+        const phase = JSON.parse(collected[0].data);
+        const d1 = JSON.parse(collected[2].data);
+        const done = JSON.parse(collected[4].data);
+        ok =
+          phase.phase === 'retrieving' &&
+          d1.text === 'Hello ' &&
+          done.turn_id === 't1' &&
+          done.cited_source_indices[0] === 1;
+      } catch {
+        ok = false;
+      }
+      if (!ok) failures.push('  ✗ parseSseChunk payload spot-check failed');
+      else console.log('  ✓ parseSseChunk framing / heartbeat / CRLF / split-chunk buffering');
+    }
+    // A frame carrying only a comment / no data: line yields no event.
+    const { events: noData } = api.parseSseChunk('event: phase\r\n\r\n');
+    if (noData.length !== 0) failures.push('  ✗ parseSseChunk emitted an event for a data-less frame');
+    else console.log('  ✓ parseSseChunk drops data-less frames');
   }
 
   // ────────────────────────────────────────────────────────────────

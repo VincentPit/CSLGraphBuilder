@@ -7,7 +7,9 @@ An enterprise biomedical knowledge graph platform for CSL Behring. Two halves th
 
 Ships with a FastAPI backend, a Next.js 14 frontend (graph viewer, ingestion stage timeline, curation queue, **and a `/chat` page**), and Docker Compose for one-command deployment.
 
-> **v2.2 — RAG Q&A chatbot (P0–P14 of [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md))**. A grounded chatbot over the knowledge graph. **Hybrid retrieval** (Cypher + vector + BM25 fused via RRF, then cross-encoder rerank, then `NEXT_CHUNK ±1` neighbour expansion). **Four-layer memory** — verbatim working window, rolling LLM summary, per-session episodic recall via `turn_query_vector`, and per-user persona summary that survives across sessions. **Function-calling tools** — read-only (`search_graph` / `get_entity` / `verify_claim`) and mutating (`propose_entity` / `propose_relationship` / `update_entity` / `merge_entities` / `soft_delete_*`), gated behind the existing curation queue. **Per-claim faithfulness** check + lexical-only default with optional LLM escalation. **SSE streaming** with interleaved `tool_call` events. **Eval harness** with gold set, hermetic CI gate, and ablation matrix. See the dedicated [RAG Q&A Chatbot section](#rag-qa-chatbot) below.
+> **v2.3 — chat latency.** The `/chat` page now consumes `POST /qa/ask/stream` directly: the answer renders **token-by-token** (first token in ~½ s instead of a multi-second "thinking…" stall), and the source cards + retrieval trace paint the moment retrieval lands. Backend: the rolling-summary regeneration is **backgrounded** — a stale summary is refreshed in a detached task and the turn is served the previous (cached) one, so a long conversation never pays a serial second LLM call before answering — and the per-turn **query embedding is kicked off as a task** so the BM25 channel, term extraction, and working-memory load overlap it instead of queuing behind it. See [`docs/RAG_QA_PERF.md`](docs/RAG_QA_PERF.md).
+>
+> **v2.2 — RAG Q&A chatbot (P0–P14 of [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md))**. A grounded chatbot over the knowledge graph. **Hybrid retrieval** (Cypher + vector + BM25 fused via RRF, then cross-encoder rerank, then `NEXT_CHUNK ±1` neighbour expansion). **Four-layer memory** — verbatim working window, rolling LLM summary, per-session episodic recall via `turn_query_vector`, and per-user persona summary that survives across sessions. **Function-calling tools** — read-only (`search_graph` / `get_entity` / `verify_claim`) and mutating (`propose_entity` / `propose_relationship` / `update_entity` / `merge_entities` / `soft_delete_*`), gated behind the existing curation queue. **Per-claim faithfulness** check + lexical-only default with optional LLM escalation. **SSE streaming** with interleaved `tool_call` events, consumed end-to-end by `/chat`. **Eval harness** with gold set, hermetic CI gate, and ablation matrix. See the dedicated [RAG Q&A Chatbot section](#rag-qa-chatbot) below.
 >
 > **v2.1 — workflow & UI upgrade.** Document processing runs through a stage-aware pipeline (`fetch → chunk → entities → relationships → finalize`) with bounded **parallel chunk extraction**, process-wide **LLM dedup + embedding caches**, **cooperative cancellation**, structured **per-stage SSE progress events**, and a **`/health/metrics`** endpoint exposing call volume, token usage, latency, and cache hit rates. The frontend renders all of this as a live **stage timeline** with a cancel button, plus a **Job History** page and a **Pipeline Performance** widget on the dashboard.
 
@@ -115,7 +117,7 @@ Cross-cutting
 
 ## RAG Q&A Chatbot
 
-A grounded, citation-emitting biomedical assistant that answers questions from the knowledge graph. All 15 phases of [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md) (P0–P14) plus the post-P14 follow-ups (`MutationCard` / `DebugPane` UI, streaming × tool-use combo, gpt-4o-mini QA default) have shipped. The companion roadmap doc is [`docs/RAG_QA_FOLLOWUPS.md`](docs/RAG_QA_FOLLOWUPS.md).
+A grounded, citation-emitting biomedical assistant that answers questions from the knowledge graph. All 15 phases of [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md) (P0–P14), the post-P14 follow-ups (`MutationCard` / `DebugPane` UI, streaming × tool-use combo, gpt-4o-mini QA default), and the chat-latency round (streaming `/chat`, backgrounded summary regen, non-blocking query embedding) have shipped. Companion docs: [`docs/RAG_QA_FOLLOWUPS.md`](docs/RAG_QA_FOLLOWUPS.md) (post-P14 roadmap) and [`docs/RAG_QA_PERF.md`](docs/RAG_QA_PERF.md) (latency work).
 
 ### Design pillars
 
@@ -131,7 +133,7 @@ A grounded, citation-emitting biomedical assistant that answers questions from t
    | Layer | Where | Contents |
    |---|---|---|
    | Working | in-context, verbatim | Last N=3 user/assistant turns |
-   | Rolling summary | in-context, compressed | LLM-compressed older turns, regenerated on slide |
+   | Rolling summary | in-context, compressed | LLM-compressed older turns. Regenerated **in a detached task** when the window slides; the turn is served the previous (cached) summary — so the answer never blocks on the summariser LLM. (`MemoryConfig.background_summary_refresh`, on by default; flip off for deterministic eval/tests.) |
    | Episodic | out-of-context, retrievable | Vector-search over `turn_query_vector` index — resolves pronouns like *"what about its side effects?"* |
    | Persona (P14) | out-of-context, cross-session | Per-user summary on `User.metadata.semantic_summary`; refreshed on session delete + as a background task on new-session create |
 
@@ -141,14 +143,14 @@ A grounded, citation-emitting biomedical assistant that answers questions from t
 
 4. **Per-claim faithfulness** — after generation, `FaithfulnessChecker` splits the answer into citation-anchored claims and scores each against its cited chunks. Lexical-only by default (deterministic, latency-free); flip `enable_llm_escalation=True` for stage-3 LLM verdicts on borderline claims. Refusals short-circuit to 1.0 — declining to answer *is* faithful. Aggregate score rides on `AskResponse.faithfulness.overall_score`.
 
-5. **Streaming with tool-use** — `POST /qa/ask/stream` emits `phase` → `retrieval` → `phase("tools")` → `tool_call × N` → `phase("generating")` → `delta × N` → `done`. When tools are off, the streaming path is pure token-by-token; when on, the agentic loop runs to completion first (Option A) and the final answer arrives as a single `delta` — same answer as `/qa/ask`, provider-portable.
+5. **Streaming with tool-use** — `POST /qa/ask/stream` emits `phase` → `retrieval` → `phase("tools")` → `tool_call × N` → `phase("generating")` → `delta × N` → `done`. When tools are off, the streaming path is pure token-by-token; when on, the agentic loop runs to completion first (Option A) and the final answer arrives as a single `delta` — same answer as `/qa/ask`, provider-portable. The `/chat` frontend consumes this directly via a `fetch` + `ReadableStream` SSE client (not `EventSource` — the endpoint is a `POST` and needs auth headers): source cards + retrieval trace paint on the `retrieval` event, answer text accretes on each `delta`, and the in-flight stream is cancellable (`AbortController`) on unmount / new submit / session switch.
 
 6. **Observability + eval-gating** — every turn emits `qa.*` logs tagged with `request_id`, records `qa_request` / `qa_latency` / `qa_context_tokens` / `qa_faithfulness_failure` metrics, and stamps a `RetrievalTrace` (channels run, fusion size, rerank order, hydrated chunks) onto the response. A hermetic CI gate ([`tests/eval/test_eval_smoke.py`](tests/eval/test_eval_smoke.py)) runs the full pipeline against an in-memory mini-graph and asserts floors on precision / recall / F1 / faithfulness; the live counterpart ([`tests/eval/run_rag_eval.py`](tests/eval/run_rag_eval.py)) posts `/qa/ask` and gates on per-intent targets.
 
 ### Frontend (`/chat`)
 
 - **Composer toggles** for `enable_tools` / `enable_mutations` (persisted to `localStorage`, off by default).
-- **`MessageBubble`** renders the answer with inline `[n]` citation chips that link to **`SourceCard`** components (per-channel confidence bars + hydrated chunk preview).
+- **`MessageBubble`** renders the answer with inline `[n]` citation chips that link to **`SourceCard`** components (per-channel confidence bars + hydrated chunk preview). While the SSE stream is live the answer fills in incrementally with a blinking caret; citation chips light up once the `done` event carries `cited_source_indices`.
 - **`RetrievalTracePane`** (collapsible) shows extracted terms, per-channel hits, RRF→rerank→kept funnel.
 - **`MutationCard`** (inline alongside the bubble whenever a turn proposes a mutation): plain-English summary, pretty-printed args, status pill, inline Approve / Reject buttons, deep-link to `/curation`.
 - **`DebugPane`** (toggled via `?debug=1`): `request_id`, intent, memory trace, tool-calls table, per-claim faithfulness chips. Production users never see it.
@@ -211,6 +213,7 @@ Persona lives at `User.metadata.semantic_summary` (string) + `semantic_embedding
 | **+ MutationCard / DebugPane** | `/chat` UI for §7 + §8.5 (post-P14 follow-up §1) |
 | **+ Streaming × tool-use** | `/qa/ask/stream` honours `enable_tools` / `enable_mutations` (post-P14 follow-up §3) |
 | **+ Q2 QA model split** | `gpt-4o-mini` default for QA flow + per-request `AskRequest.model` override (post-P14 follow-up §2) |
+| **+ Chat latency** | `/chat` consumes `/qa/ask/stream` (token-by-token render), backgrounded rolling-summary regen, non-blocking query embedding ([`docs/RAG_QA_PERF.md`](docs/RAG_QA_PERF.md)) |
 
 See [`docs/RAG_QA_PLAN.md`](docs/RAG_QA_PLAN.md) for the full design rationale + the "Implementation refinements" log explaining where the shipped code drifted from the original sketch.
 
@@ -834,7 +837,7 @@ CSLGraphBuilder/
 
 ## Testing
 
-The project has **485 tests** across four tiers:
+The project has **578 tests** across four tiers:
 
 ```bash
 # Run all tests
